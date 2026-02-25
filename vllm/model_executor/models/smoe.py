@@ -8,6 +8,7 @@ from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
 
 import os
 VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
+VLLM_ROCM_USE_AITER_MOE = os.getenv("VLLM_ROCM_USE_AITER_MOE", "0") == "1"
 
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -29,6 +30,14 @@ from vllm.config import get_current_vllm_config
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
+if VLLM_ROCM_USE_AITER_MOE:
+    try:
+        import aiter  # noqa: F401
+        from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+            rocm_aiter_fused_experts,
+        )
+    except ImportError:
+        VLLM_ROCM_USE_AITER_MOE = False
 from vllm.model_executor.layers.linear import (QKVParallelLinear,
                                                ColumnParallelLinear,
                                                MergedColumnParallelLinear,
@@ -48,9 +57,6 @@ from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 from vllm.transformers_utils.configs import SMoEConfig
-
-import logging
-logger = logging.getLogger(__name__)
 
 class ResidualScaling(nn.Module):
     def __init__(
@@ -500,14 +506,23 @@ class SMoExperts(nn.Module):
 
 
     def forward(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
-        hidden_states = fused_experts(
-            hidden_states,
-            self.ws,
-            self.w2s,
-            topk_weights,
-            topk_ids,
-            global_num_experts=self.global_num_experts,
-            expert_map=self.expert_map)
+        if VLLM_ROCM_USE_AITER_MOE:
+            hidden_states = rocm_aiter_fused_experts(
+                hidden_states, self.ws, self.w2s,
+                topk_weights, topk_ids,
+                activation="silu",
+                expert_map=self.expert_map,
+                output_dtype=hidden_states.dtype,
+            )
+        else:
+            hidden_states = fused_experts(
+                hidden_states,
+                self.ws,
+                self.w2s,
+                topk_weights,
+                topk_ids,
+                global_num_experts=self.global_num_experts,
+                expert_map=self.expert_map)
         if self.tp_size > 1 or self.ep_size > 1:
             hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         return hidden_states
@@ -830,11 +845,6 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 "please use '--mamba-cache-mode=align' instead"
             )
 
-        if VLLM_CCA_TRITON:
-            logger.info("Using Triton backend for CCA")
-        else:
-            logger.info("Using pytorch backend for CCA")
-
         super().__init__()
         self.config = config
         self.lora_config = lora_config
@@ -964,5 +974,15 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
-            loaded_params.add(chkpt_weight_name)            
+            loaded_params.add(chkpt_weight_name)
+
+        if VLLM_ROCM_USE_AITER_MOE:
+            from vllm._aiter_ops import rocm_aiter_ops
+            for module in self.modules():
+                if isinstance(module, SMoExperts):
+                    ws_shuf, w2s_shuf = rocm_aiter_ops.shuffle_weights(
+                        module.ws.data, module.w2s.data)
+                    module.ws = nn.Parameter(ws_shuf, requires_grad=False)
+                    module.w2s = nn.Parameter(w2s_shuf, requires_grad=False)
+
         return loaded_params
