@@ -190,6 +190,7 @@ _TEXT_GENERATION_MODELS = {
     "RWForCausalLM": ("falcon", "FalconForCausalLM"),
     "SeedOssForCausalLM": ("seed_oss", "SeedOssForCausalLM"),
     "Step1ForCausalLM": ("step1", "Step1ForCausalLM"),
+    "SMoEForCausalLM": ("smoe", "SMoEForCausalLM"),
     "Step3TextForCausalLM": ("step3_text", "Step3TextForCausalLM"),
     "Step3p5ForCausalLM": ("step3p5", "Step3p5ForCausalLM"),
     "StableLMEpochForCausalLM": ("stablelm", "StablelmForCausalLM"),

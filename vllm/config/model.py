@@ -994,6 +994,24 @@ class ModelConfig:
             self.enforce_eager = True
 
     def _verify_with_expert_parallelism(self) -> None:
+        # num_expert_names = [
+        #     "moe_num_experts",  # Dbrx
+        #     "num_experts",  # Jamba
+        #     "n_routed_experts",  # DeepSeek
+        #     "num_local_experts",  # Mixtral
+        #     "smoe_layers",  # SMoE
+        # ]
+        # num_experts = 0
+        # for name in num_expert_names:
+        #     if name == "smoe_layers":
+        #         smoe_layers = getattr(self.hf_text_config, name, [])
+        #         if len(smoe_layers) > 2:
+        #             num_experts = smoe_layers[1]
+        #         break
+        #     num_experts = getattr(self.hf_text_config, name, 0)
+        #     if num_experts > 0:
+        #         break
+        # if num_experts < 1:
         if not self.is_moe:
             raise ValueError(
                 "Number of experts in the model must be greater than 0 "
@@ -1143,7 +1161,10 @@ class ModelConfig:
         # the tensor parallel size. We will replicate the KV heads in the
         # case where the number of KV heads is smaller than the tensor
         # parallel size so each GPU has at least one KV head.
+        if self.model_arch_config.text_model_type == "smoe":
+            return total_num_kv_heads
         return max(1, total_num_kv_heads // parallel_config.tensor_parallel_size)
+
 
     def get_num_attention_heads(self, parallel_config: ParallelConfig) -> int:
         num_heads = self.model_arch_config.total_num_attention_heads
@@ -1212,6 +1233,14 @@ class ModelConfig:
                     else:
                         return self.get_num_layers(parallel_config)
                 return sum(t == block_type for t in layers_block_type_value[start:end])
+
+            if self.model_arch_config.text_model_type == "smoe":
+                smoe_layers = getattr(self.hf_text_config, "smoe_layers", None)
+                assert smoe_layers is not None
+                if attn_block_type:
+                    return sum(not isinstance(l, str) for l in smoe_layers)
+                else:
+                    return sum(isinstance(l, int) for l in smoe_layers)
 
             # Hybrid model Minimax
             attn_type_list = getattr(self.hf_config, "attn_type_list", None)
