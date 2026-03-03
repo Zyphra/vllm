@@ -371,24 +371,22 @@ class SMoERouter(nn.Module):
         logits = self.router_mlp(hs_norm)
         expert_prob = torch.softmax(logits, dim=-1)
 
-        # 4) expert choice with balancing biases (biases affect choice only, not the probabilities)
+        # 4) Expert choice with balancing biases (biases affect choice only, not probabilities)
         biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
-        _, expert_choice_t = torch.topk(biased, self.topk, dim=-1)  # (S, topk)
 
-        # 5) If MOD and topk>1, once skip expert is selected, force all subsequent choices to skip as well, but this never happens since we use topk=1
-        if (self.topk > 1) and self.use_mod:
-            skip_idx = self.num_experts - 1
-            n_mask = (expert_choice_t == skip_idx)
-            cumsum_mask = torch.cumsum(n_mask, dim=-1)
-            expert_choice_t = expert_choice_t.masked_fill(cumsum_mask > 0, skip_idx)
+        if self.topk == 1:
+            expert_choice_t = biased.argmax(dim=-1, keepdim=True)          # (S, 1)
+            route_prob = expert_prob.gather(1, expert_choice_t)            # (S, 1)
+        else:
+            _, expert_choice_t = torch.topk(biased, self.topk, dim=-1)    # (S, topk)
+            if self.use_mod:
+                skip_idx = self.num_experts - 1
+                n_mask = (expert_choice_t == skip_idx)
+                cumsum_mask = torch.cumsum(n_mask, dim=-1)
+                expert_choice_t = expert_choice_t.masked_fill(cumsum_mask > 0, skip_idx)
+            route_prob = torch.gather(expert_prob, dim=1, index=expert_choice_t)
 
-        # Gather the probabilities for the selected experts
-        route_prob = torch.gather(expert_prob, dim=1, index=expert_choice_t)
-        
-        expert_choice_flat = expert_choice_t.reshape(-1, self.topk)
-        route_prob_flat = route_prob.reshape(-1, self.topk)
-
-        return route_prob_flat, expert_choice_flat, router_hidden_states_next
+        return route_prob.reshape(-1, self.topk), expert_choice_t.reshape(-1, self.topk), router_hidden_states_next
 
 
 class SMoExperts(nn.Module):
