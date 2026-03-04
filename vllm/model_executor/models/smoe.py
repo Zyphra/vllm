@@ -9,6 +9,7 @@ from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
 import os
 VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 VLLM_ROCM_USE_AITER_MOE = os.getenv("VLLM_ROCM_USE_AITER_MOE", "0") == "1"
+VLLM_SMOE_FP8_A16 = os.getenv("VLLM_SMOE_FP8_A16", "0") == "1"
 
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -470,6 +471,12 @@ class SMoExperts(nn.Module):
             "weight_loader": self.weight_loader,
         })
 
+        self.use_fp8_a16 = VLLM_SMOE_FP8_A16 and VLLM_ROCM_USE_AITER_MOE
+        self.fc1_scale = None
+        self.fc2_scale = None
+        self.fc1_smooth_scale = None
+        self.fc2_smooth_scale = None
+
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
         if self.expert_map is None:
             return expert_id
@@ -504,7 +511,23 @@ class SMoExperts(nn.Module):
 
 
     def forward(self, hidden_states: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor):
-        if VLLM_ROCM_USE_AITER_MOE:
+        if self.use_fp8_a16:
+            from vllm._aiter_ops import rocm_aiter_ops
+            hidden_states = rocm_aiter_ops.asm_moe(
+                hidden_states,
+                self.ws,
+                self.w2s,
+                topk_weights.to(torch.float32),
+                topk_ids.to(torch.int32),
+                fc1_scale=self.fc1_scale,
+                fc2_scale=self.fc2_scale,
+                fc1_smooth_scale=self.fc1_smooth_scale,
+                fc2_smooth_scale=self.fc2_smooth_scale,
+                a16=True,
+                expert_mask=self.expert_map,
+                activation_method=0,
+            )
+        elif VLLM_ROCM_USE_AITER_MOE:
             hidden_states = rocm_aiter_fused_experts(
                 hidden_states, self.ws, self.w2s,
                 topk_weights, topk_ids,
@@ -975,12 +998,52 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
             loaded_params.add(chkpt_weight_name)
 
         if VLLM_ROCM_USE_AITER_MOE:
-            from vllm._aiter_ops import rocm_aiter_ops
+            from aiter.ops.shuffle import shuffle_weight
             for module in self.modules():
                 if isinstance(module, SMoExperts):
-                    ws_shuf, w2s_shuf = rocm_aiter_ops.shuffle_weights(
-                        module.ws.data, module.w2s.data)
-                    module.ws = nn.Parameter(ws_shuf, requires_grad=False)
-                    module.w2s = nn.Parameter(w2s_shuf, requires_grad=False)
+                    if module.use_fp8_a16:
+                        import aiter
+                        E = module.local_num_experts
+                        model_dim = module.hidden_size
+                        inter_dim = module.ffn_hidden_size_out
+
+                        quant_fn = aiter.get_torch_quant(aiter.QuantType.per_Token)
+                        w1_fp8, fc1_scale = quant_fn(
+                            module.ws.data,
+                            quant_dtype=torch.float8_e4m3fnuz,
+                        )
+                        w2_fp8, fc2_scale = quant_fn(
+                            module.w2s.data,
+                            quant_dtype=torch.float8_e4m3fnuz,
+                        )
+
+                        w1_fp8 = shuffle_weight(w1_fp8, (16, 16))
+                        w2_fp8 = shuffle_weight(w2_fp8, (16, 16))
+
+                        module.ws = nn.Parameter(w1_fp8, requires_grad=False)
+                        module.w2s = nn.Parameter(w2_fp8, requires_grad=False)
+                        module.fc1_scale = fc1_scale
+                        module.fc2_scale = fc2_scale
+                        module.fc1_smooth_scale = torch.ones(
+                            E, model_dim, dtype=torch.float32,
+                            device=w1_fp8.device,
+                        )
+                        module.fc2_smooth_scale = torch.ones(
+                            E, inter_dim, dtype=torch.float32,
+                            device=w2_fp8.device,
+                        )
+                        print(
+                            f"[SMoE] FP8-A16 enabled: ws {module.ws.shape} "
+                            f"w2s {module.w2s.shape} "
+                            f"fc1_scale {fc1_scale.shape} "
+                            f"fc2_scale {fc2_scale.shape}"
+                        )
+                    else:
+                        ws_shuf, w2s_shuf = (
+                            shuffle_weight(module.ws.data, (16, 16)),
+                            shuffle_weight(module.w2s.data, (16, 16)),
+                        )
+                        module.ws = nn.Parameter(ws_shuf, requires_grad=False)
+                        module.w2s = nn.Parameter(w2s_shuf, requires_grad=False)
 
         return loaded_params

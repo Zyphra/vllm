@@ -135,6 +135,58 @@ def _rocm_aiter_fused_moe_fake(
     return torch.empty_like(hidden_states)
 
 
+def _rocm_aiter_asm_moe_impl(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    fc1_scale: torch.Tensor | None = None,
+    fc2_scale: torch.Tensor | None = None,
+    fc1_smooth_scale: torch.Tensor | None = None,
+    fc2_smooth_scale: torch.Tensor | None = None,
+    a16: bool = False,
+    expert_mask: torch.Tensor | None = None,
+    activation_method: int = 0,
+) -> torch.Tensor:
+    from aiter import ActivationType
+    from aiter.fused_moe_bf16_asm import asm_moe
+
+    activation = ActivationType(activation_method)
+
+    return asm_moe(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+        fc1_scale=fc1_scale,
+        fc2_scale=fc2_scale,
+        fc1_smooth_scale=fc1_smooth_scale,
+        fc2_smooth_scale=fc2_smooth_scale,
+        a16=a16,
+        expert_mask=expert_mask,
+        activation=activation,
+    )
+
+
+def _rocm_aiter_asm_moe_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    fc1_scale: torch.Tensor | None = None,
+    fc2_scale: torch.Tensor | None = None,
+    fc1_smooth_scale: torch.Tensor | None = None,
+    fc2_smooth_scale: torch.Tensor | None = None,
+    a16: bool = False,
+    expert_mask: torch.Tensor | None = None,
+    activation_method: int = 0,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 def _rocm_aiter_asm_moe_tkw1_impl(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -1023,6 +1075,14 @@ class rocm_aiter_ops:
         if not _OPS_REGISTERED:
             # register all the custom ops here
             direct_register_custom_op(
+                op_name="rocm_aiter_asm_moe",
+                op_func=_rocm_aiter_asm_moe_impl,
+                mutates_args=[],
+                fake_impl=_rocm_aiter_asm_moe_fake,
+                dispatch_key=current_platform.dispatch_key,
+            )
+
+            direct_register_custom_op(
                 op_name="rocm_aiter_asm_moe_tkw1",
                 op_func=_rocm_aiter_asm_moe_tkw1_impl,
                 mutates_args=[],
@@ -1308,6 +1368,36 @@ class rocm_aiter_ops:
             a2_scale,
             num_local_tokens,
             output_dtype,
+        )
+
+    @staticmethod
+    def asm_moe(
+        hidden_states: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        fc1_scale: torch.Tensor | None = None,
+        fc2_scale: torch.Tensor | None = None,
+        fc1_smooth_scale: torch.Tensor | None = None,
+        fc2_smooth_scale: torch.Tensor | None = None,
+        a16: bool = False,
+        expert_mask: torch.Tensor | None = None,
+        activation_method: int = 0,
+    ) -> torch.Tensor:
+        return torch.ops.vllm.rocm_aiter_asm_moe(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            fc1_scale,
+            fc2_scale,
+            fc1_smooth_scale,
+            fc2_smooth_scale,
+            a16,
+            expert_mask,
+            activation_method,
         )
 
     @staticmethod
