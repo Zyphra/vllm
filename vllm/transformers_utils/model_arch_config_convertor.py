@@ -430,8 +430,26 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 1)
 
 
+class SMoEModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    """Convertor for SMoE models which use smoe_layers to specify expert counts."""
+
+    def get_num_experts(self) -> int:
+        """Extract number of experts from smoe_layers.
+
+        smoe_layers format: ['a', 16, 'a', 16, ...] where integers are expert counts.
+        """
+        smoe_layers = getattr(self.hf_text_config, "smoe_layers", [])
+        if smoe_layers:
+            # Find the first integer in the list (represents expert count)
+            for item in smoe_layers:
+                if isinstance(item, int):
+                    return item
+        return 0
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
+    "smoe": SMoEModelArchConfigConvertor,
     "mamba": MambaModelArchConfigConvertor,
     "falcon_mamba": MambaModelArchConfigConvertor,
     "timm_wrapper": TerratorchModelArchConfigConvertor,
