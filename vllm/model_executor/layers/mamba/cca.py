@@ -28,7 +28,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.cca_attn import (
     CCAAttentionMetadata)
 
-from vllm.model_executor.layers.mamba.ops import run_causal_conv1d_update, grouped_conv1d_decode
+from vllm.model_executor.layers.mamba.ops import (
+    run_causal_conv1d_update, grouped_conv1d_decode,
+    cca_decode_fused_available, cca_decode_fused,
+)
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
@@ -277,6 +280,9 @@ class CCA(MambaBase, CustomOp):
         # TODO: allocate memory for output tensors
         qk_packed3_output_list = []
         hs2_output_list = []
+        qk_packed3_p = None
+        _fused_query_d = None
+        _fused_key_d = None
 
         if has_prefill:
             # Prefill
@@ -547,43 +553,86 @@ class CCA(MambaBase, CustomOp):
             hs2_output_list.append(hs2)
             prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(prev_hs.device)
 
+        _fused_decode_active = False
         if has_decode:
             # Generation
             # In generation B and S are actually the same in meaning
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
 
-            # Assumming that decode requests in range [0, num_decodes) are real decode requests
-            # and the rest are padded requests, so we can simply ignore the padded requests
-            dim, _, kernel_width = self.conv_qk[0].weight.shape 
-            weights = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
-            
-            first_input = qk_packed0_d.transpose(1,2).contiguous()
-            qk_packed3_old = run_causal_conv1d_update(
-                first_input, 
-                conv_states,
-                weights,
-                self.conv_qk[0].bias, 
-                state_indices_tensor_d, 
-                seqlen=1
-            )
-            groups = self.num_k_heads + self.num_q_heads
-            b, d, w = qk_packed3_old.shape 
-            second_conv_input = qk_packed3_old.reshape(b, groups, d // groups, w).contiguous()
-            second_weights = self.conv_qk[1].weight.reshape(groups, d // groups, -1, w).contiguous()
-            second_bias = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
-            qk_packed3_d = grouped_conv1d_decode(
-                second_conv_input,
-                second_weights,
-                second_bias,
-            )
-            qk_packed3_d = qk_packed3_d.reshape(b, 1, -1).contiguous()
-            qk_packed3_output_list.insert(0, qk_packed3_d)
-            hs2 = prev_hs[state_indices_tensor_d].unsqueeze(1) # [S, 1, H]
-            hs2_output_list.insert(0, hs2)
+            # hs2 and prev_hs updates are common to both fused and unfused paths
+            hs2_d = prev_hs[state_indices_tensor_d].unsqueeze(1)  # [S, 1, H]
+            hs2_output_list.insert(0, hs2_d)
             prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
 
-        qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
+            if cca_decode_fused_available():
+                # ── Fused decode path ──
+                # Single kernel: depthwise conv1d update + grouped conv + qk_mean
+                #                + L2 norm + scale + temperature
+                b = num_decodes
+                dim, _, kernel_width = self.conv_qk[0].weight.shape
+                groups = self.num_k_heads + self.num_q_heads
+                head_dim = dim // groups
+
+                first_input = qk_packed0_d.transpose(1, 2).contiguous()  # [B, E, 1]
+                dw_weight = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
+                gw_weight = self.conv_qk[1].weight.reshape(
+                    groups, head_dim, -1, kernel_width).contiguous()
+                gw_bias = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+
+                # Pack qk_mean for decode tokens: [B, qh+kh, dh]
+                qk_mean_q_d = qk_mean_q[:num_decodes].squeeze(1)  # [B, qh, dh]
+                qk_mean_k_d = qk_mean_k[:num_decodes].squeeze(1)  # [B, kh, dh]
+                qk_mean_packed = torch.cat(
+                    [qk_mean_q_d, qk_mean_k_d], dim=1).contiguous()
+
+                fused_out = cca_decode_fused(
+                    first_input,
+                    dw_weight,
+                    self.conv_qk[0].bias,
+                    conv_states,
+                    state_indices_tensor_d,
+                    gw_weight,
+                    gw_bias,
+                    qk_mean_packed,
+                    self.temp.data,
+                    self.num_q_heads,
+                    self.sqrt_head_dim,
+                    self.config.clamp_temp,
+                )  # [B, G*dh]
+
+                _fused_query_d = fused_out[:, :self.latent_q_dim]   # [B, qh*dh]
+                _fused_key_d   = fused_out[:, self.latent_q_dim:]   # [B, kh*dh]
+                _fused_decode_active = True
+
+            else:
+                # ── Original unfused decode path ──
+                dim, _, kernel_width = self.conv_qk[0].weight.shape
+                weights = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
+
+                first_input = qk_packed0_d.transpose(1, 2).contiguous()
+                qk_packed3_old = run_causal_conv1d_update(
+                    first_input,
+                    conv_states,
+                    weights,
+                    self.conv_qk[0].bias,
+                    state_indices_tensor_d,
+                    seqlen=1
+                )
+                groups = self.num_k_heads + self.num_q_heads
+                b, d, w = qk_packed3_old.shape
+                second_conv_input = qk_packed3_old.reshape(
+                    b, groups, d // groups, w).contiguous()
+                second_weights = self.conv_qk[1].weight.reshape(
+                    groups, d // groups, -1, w).contiguous()
+                second_bias = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+                qk_packed3_d = grouped_conv1d_decode(
+                    second_conv_input,
+                    second_weights,
+                    second_bias,
+                )
+                qk_packed3_d = qk_packed3_d.reshape(b, 1, -1).contiguous()
+                qk_packed3_output_list.insert(0, qk_packed3_d)
         hs2 = torch.vstack(hs2_output_list)[:num_actual_tokens]
 
         # Values from the two time streams
@@ -592,30 +641,79 @@ class CCA(MambaBase, CustomOp):
         value = torch.cat([v1, v2], dim=-1).contiguous()
         value = value.view(num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)  # [S, B, kh, dh]
 
-        # Build queries/keys from conv output + means
-        query = qk_packed3[..., :self.latent_q_dim].view(
-            num_actual_tokens, batch_size, self.num_q_heads, self.head_dim
-        ) + qk_mean_q  # [S, B, qh, dh]
+        query = torch.empty(
+            (num_actual_tokens, self.latent_q_dim),
+            device=hs.device,
+            dtype=hs.dtype,
+        )
+        key = torch.empty(
+            (num_actual_tokens, self.latent_k_dim),
+            device=hs.device,
+            dtype=hs.dtype,
+        )
 
-        key = qk_packed3[..., self.latent_q_dim:].view(
-            num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
-        ) + qk_mean_k  # [S, B, kh, dh]
+        if _fused_decode_active:
+            # Fused decode kernel already includes qk_mean, L2 normalization,
+            # scaling and temperature. Keep decode path kernel-minimal.
+            query[:num_decodes] = _fused_query_d
+            key[:num_decodes] = _fused_key_d
 
-        # L2-normalize per head, then scale like Megatron
-        query_norm = query.norm(p=2, dim=-1, keepdim=True)
-        key_norm   = key.norm(p=2,   dim=-1, keepdim=True)
+            if has_prefill:
+                # Only prefill tokens still need Python-side post-processing.
+                qk_packed3_pf = qk_packed3_p[..., :].contiguous()
+                prefill_query = qk_packed3_pf[..., :self.latent_q_dim].view(
+                    num_prefill_tokens, batch_size, self.num_q_heads, self.head_dim
+                ) + qk_mean_q[num_decodes:]
+                prefill_key = qk_packed3_pf[..., self.latent_q_dim:].view(
+                    num_prefill_tokens, batch_size, self.num_k_heads, self.head_dim
+                ) + qk_mean_k[num_decodes:]
 
-        # temp: [kh] -> [1,1,kh,1]
-        if self.config.clamp_temp:
-            key = (key * (self.sqrt_head_dim / key_norm)) * torch.exp(torch.clamp(self.temp[None, None].unsqueeze(-1),0.0000001,2))
+                prefill_query_norm = prefill_query.norm(p=2, dim=-1, keepdim=True)
+                prefill_key_norm = prefill_key.norm(p=2, dim=-1, keepdim=True)
+
+                if self.config.clamp_temp:
+                    prefill_key = (
+                        prefill_key * (self.sqrt_head_dim / prefill_key_norm)
+                    ) * torch.exp(torch.clamp(self.temp[None, None].unsqueeze(-1),
+                                              0.0000001, 2))
+                else:
+                    prefill_key = (
+                        prefill_key * (self.sqrt_head_dim / prefill_key_norm)
+                    ) * self.temp[None, None].unsqueeze(-1)
+                prefill_query = prefill_query * (self.sqrt_head_dim / prefill_query_norm)
+
+                query[num_decodes:] = prefill_query.view(
+                    num_prefill_tokens, self.latent_q_dim)
+                key[num_decodes:] = prefill_key.view(
+                    num_prefill_tokens, self.latent_k_dim)
         else:
-            key = (key * (self.sqrt_head_dim / key_norm)) * self.temp[None, None].unsqueeze(-1)
-        query = query * (self.sqrt_head_dim / query_norm)
-        
-        # Flatten head axis, then return to vllm layout [S, ...]
-        query = query.view(num_actual_tokens, batch_size, self.num_q_heads * self.head_dim).transpose(0, 1).contiguous().squeeze(0)
-        key   = key  .view(num_actual_tokens, batch_size, self.num_k_heads * self.head_dim).transpose(0, 1).contiguous().squeeze(0)
+            qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
+            # Build queries/keys from conv output + means
+            query_h = qk_packed3[..., :self.latent_q_dim].view(
+                num_actual_tokens, batch_size, self.num_q_heads, self.head_dim
+            ) + qk_mean_q  # [S, B, qh, dh]
+            key_h = qk_packed3[..., self.latent_q_dim:].view(
+                num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
+            ) + qk_mean_k  # [S, B, kh, dh]
+
+            # L2-normalize per head, then scale like Megatron
+            query_norm = query_h.norm(p=2, dim=-1, keepdim=True)
+            key_norm = key_h.norm(p=2, dim=-1, keepdim=True)
+
+            # temp: [kh] -> [1,1,kh,1]
+            if self.config.clamp_temp:
+                key_h = (key_h * (self.sqrt_head_dim / key_norm)) * torch.exp(
+                    torch.clamp(self.temp[None, None].unsqueeze(-1), 0.0000001, 2))
+            else:
+                key_h = (key_h * (self.sqrt_head_dim / key_norm)) * self.temp[
+                    None, None].unsqueeze(-1)
+            query_h = query_h * (self.sqrt_head_dim / query_norm)
+
+            query = query_h.view(num_actual_tokens, self.latent_q_dim)
+            key = key_h.view(num_actual_tokens, self.latent_k_dim)
+
         value = value.view(num_actual_tokens, batch_size, self.num_k_heads * self.head_dim).transpose(0, 1).contiguous().squeeze(0)
+
         qkv = torch.cat([query, key, value], dim=1)
         output[:num_actual_tokens] = qkv
 

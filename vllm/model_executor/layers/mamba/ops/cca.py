@@ -1,3 +1,6 @@
+import os
+import logging
+
 import triton
 import triton.language as tl
 
@@ -5,6 +8,120 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F
 from triton import Config
+
+logger = logging.getLogger(__name__)
+
+# Environment variable to select grouped conv1d decode backend:
+#   "triton" (default) | "cpp"
+_GCONV_BACKEND = os.environ.get("VLLM_GCONV1D_BACKEND", "triton").lower()
+
+_cpp_grouped_conv1d_fn = None
+
+if _GCONV_BACKEND == "cpp":
+    try:
+        from torch.utils.cpp_extension import load_inline as _load_inline
+        _kernel_path = os.environ.get("VLLM_GCONV1D_BACKEND_KERNEL_PATH", None)
+        if _kernel_path is None:
+            raise ValueError("VLLM_GCONV1D_BACKEND_KERNEL_PATH is not set")
+        if os.path.exists(_kernel_path):
+            with open(_kernel_path, "r") as _f:
+                _cuda_src = _f.read()
+            _cpp_wrapper = """
+#include <torch/extension.h>
+torch::Tensor grouped_conv1d_w2_decode(
+    const torch::Tensor& x, const torch::Tensor& weight,
+    const std::optional<torch::Tensor>& bias_opt);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("grouped_conv1d_w2_decode", &grouped_conv1d_w2_decode);
+}
+"""
+            _extra = ["-O3"]
+            if torch.version.hip is not None:
+                _extra.append("-DUSE_ROCM")
+            _mod = _load_inline(
+                name="gconv1d_w2_decode_cca",
+                cpp_sources=[_cpp_wrapper],
+                cuda_sources=[_cuda_src],
+                extra_cflags=_extra,
+                extra_cuda_cflags=_extra,
+                verbose=False,
+            )
+            _cpp_grouped_conv1d_fn = _mod.grouped_conv1d_w2_decode
+            logger.info("Loaded C++ grouped_conv1d_w2_decode kernel")
+        else:
+            logger.warning("C++ kernel source not found at %s, "
+                           "falling back to triton", _kernel_path)
+            _GCONV_BACKEND = "triton"
+    except Exception as e:
+        logger.warning("Failed to compile C++ grouped_conv1d_w2_decode: %s, "
+                       "falling back to triton", e)
+        _GCONV_BACKEND = "triton"
+
+# ---------------------------------------------------------------------------
+# CCA decode fused kernel (depthwise conv + grouped conv + qk_mean + L2 norm
+# + scale + temperature — all in a single kernel launch).
+#
+# Controlled by two environment variables:
+#   VLLM_CCA_FUSED_ENABLED       "1" / "true" / "yes" to enable (default: off)
+#   VLLM_CCA_FUSED_KERNEL_PATH   absolute path to cca_decode_fused.cu
+# ---------------------------------------------------------------------------
+_CCA_FUSED_ENABLED = os.environ.get(
+    "VLLM_CCA_FUSED_ENABLED", "0").lower() in ("1", "true", "yes")
+_CCA_FUSED_SHAPE_DEBUG = os.environ.get(
+    "VLLM_CCA_FUSED_SHAPE_DEBUG", "0").lower() in ("1", "true", "yes")
+_cpp_cca_fused_fn = None
+
+if _CCA_FUSED_ENABLED:
+    try:
+        from torch.utils.cpp_extension import load_inline as _load_inline_fused
+        _fused_kernel_path = os.environ.get(
+            "VLLM_CCA_FUSED_KERNEL_PATH", None)
+        if _fused_kernel_path is None:
+            raise ValueError("VLLM_CCA_FUSED_KERNEL_PATH is not set")
+        if os.path.exists(_fused_kernel_path):
+            with open(_fused_kernel_path, "r") as _f:
+                _fused_cuda_src = _f.read()
+            _fused_cpp_wrapper = """
+#include <torch/extension.h>
+torch::Tensor cca_decode_fused(
+    const torch::Tensor& new_token,
+    const torch::Tensor& dw_weight,
+    const std::optional<torch::Tensor>& dw_bias,
+    torch::Tensor& conv_state,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& gw_weight,
+    const std::optional<torch::Tensor>& gw_bias,
+    const torch::Tensor& qk_mean,
+    const torch::Tensor& temp,
+    int64_t num_q_heads,
+    double sqrt_head_dim,
+    bool clamp_temp);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cca_decode_fused", &cca_decode_fused);
+}
+"""
+            _fused_extra = ["-O3"]
+            if torch.version.hip is not None:
+                _fused_extra.append("-DUSE_ROCM")
+            _fused_mod = _load_inline_fused(
+                name="cca_decode_fused_cca",
+                cpp_sources=[_fused_cpp_wrapper],
+                cuda_sources=[_fused_cuda_src],
+                extra_cflags=_fused_extra,
+                extra_cuda_cflags=_fused_extra,
+                verbose=False,
+            )
+            _cpp_cca_fused_fn = _fused_mod.cca_decode_fused
+            logger.info("Loaded C++ cca_decode_fused kernel from %s",
+                        _fused_kernel_path)
+        else:
+            logger.warning("CCA fused kernel source not found at %s, "
+                           "disabling fusion", _fused_kernel_path)
+            _CCA_FUSED_ENABLED = False
+    except Exception as e:
+        logger.warning("Failed to compile CCA fused kernel: %s, "
+                       "disabling fusion", e)
+        _CCA_FUSED_ENABLED = False
 
 @triton.jit()
 def _causal_conv1d_update_kernel(
@@ -166,34 +283,107 @@ def _grouped_conv1d_w2_decode_kernel(
              mask=None)
 
 
-def grouped_conv1d_decode(x, weight, bias=None):
-
+def _grouped_conv1d_decode_triton(x, weight, bias=None):
     B, G, D, W = x.shape
     G, D, _, W = weight.shape
     y = torch.empty(B, G, D, dtype=x.dtype, device=x.device)
-    
+
     x = x.contiguous()
     weight = weight.contiguous()
-
-
     if bias is not None:
         bias = bias.contiguous()
-        
-  
+
     grid = (B, G)
-    
     _grouped_conv1d_w2_decode_kernel[grid](
-        x=x, 
-        y=y, 
-        weight=weight, 
+        x=x,
+        y=y,
+        weight=weight,
         bias=bias,
-        G=G, 
-        D=D, 
+        G=G,
+        D=D,
         W=W,
         HAS_BIAS=(bias is not None),
     )
-    
     return y
+
+
+def grouped_conv1d_decode(x, weight, bias=None):
+    """Grouped 1D conv (W=2) decode.
+
+    Backend controlled by env var VLLM_GCONV1D_BACKEND:
+        "triton" (default) | "cpp"
+    """
+    if _GCONV_BACKEND == "cpp" and _cpp_grouped_conv1d_fn is not None:
+        return _cpp_grouped_conv1d_fn(x.contiguous(),
+                                      weight.contiguous(),
+                                      bias.contiguous() if bias is not None else None)
+    return _grouped_conv1d_decode_triton(x, weight, bias)
+
+
+def cca_decode_fused_available():
+    """Return True when the fused CCA decode kernel is compiled and ready."""
+    return _CCA_FUSED_ENABLED and _cpp_cca_fused_fn is not None
+
+
+def cca_decode_fused(
+    new_token,          # [B, E, 1]
+    dw_weight,          # [E, 2]
+    dw_bias,            # [E] or None
+    conv_state,         # [num_cache, E, state_len] — mutated in-place
+    state_indices,      # [B] int64
+    gw_weight,          # [G, D, D, 2]
+    gw_bias,            # [G, D] or None
+    qk_mean,            # [B, G, D]
+    temp,               # [num_k_heads] float
+    num_q_heads,        # int
+    sqrt_head_dim,      # float
+    clamp_temp,         # bool
+):
+    """CCA decode fused kernel: depthwise conv + grouped conv + post-processing.
+
+    Returns [B, G*D] with query/key heads already L2-normalised, scaled, and
+    temperature-applied.
+
+    Requires VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_FUSED_KERNEL_PATH set.
+    """
+    assert _cpp_cca_fused_fn is not None, (
+        "cca_decode_fused called but C++ kernel not loaded. "
+        "Set VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_FUSED_KERNEL_PATH."
+    )
+    if _CCA_FUSED_SHAPE_DEBUG:
+        logger.info(
+            "[cca_decode_fused] input shapes: "
+            "new_token=%s, dw_weight=%s, dw_bias=%s, conv_state=%s, "
+            "state_indices=%s, gw_weight=%s, gw_bias=%s, qk_mean=%s, temp=%s",
+            tuple(new_token.shape),
+            tuple(dw_weight.shape),
+            None if dw_bias is None else tuple(dw_bias.shape),
+            tuple(conv_state.shape),
+            tuple(state_indices.shape),
+            tuple(gw_weight.shape),
+            None if gw_bias is None else tuple(gw_bias.shape),
+            tuple(qk_mean.shape),
+            tuple(temp.shape),
+        )
+
+    out = _cpp_cca_fused_fn(
+        new_token.contiguous(),
+        dw_weight.contiguous(),
+        dw_bias.contiguous() if dw_bias is not None else None,
+        conv_state,
+        state_indices.to(torch.int64).contiguous(),
+        gw_weight.contiguous(),
+        gw_bias.contiguous() if gw_bias is not None else None,
+        qk_mean.contiguous(),
+        temp.float().contiguous(),
+        int(num_q_heads),
+        float(sqrt_head_dim),
+        bool(clamp_temp),
+    )
+    if _CCA_FUSED_SHAPE_DEBUG:
+        logger.info("[cca_decode_fused] output shape: out=%s", tuple(out.shape))
+    return out
+
 
 def run_causal_conv1d_update(
     x,              # Input: (batch, dim, seqlen)
