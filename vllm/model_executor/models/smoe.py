@@ -7,7 +7,7 @@ from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
                               tensor_model_parallel_all_reduce)
 
 import os
-VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "0") == "1"
+VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
