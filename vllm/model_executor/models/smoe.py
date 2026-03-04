@@ -2,13 +2,15 @@
 """Inference-only SMoE model."""
 import torch
 
-from vllm.distributed import (get_dp_group, get_tensor_model_parallel_rank,
+from vllm.distributed import (get_dp_group, get_ep_group,
+                              get_tensor_model_parallel_rank,
                               get_tensor_model_parallel_world_size,
                               tensor_model_parallel_all_reduce)
 
 import os
 VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 
+from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -26,6 +28,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.config import get_current_vllm_config
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.model_executor.layers.fused_moe import fused_experts
 from vllm.model_executor.layers.fused_moe.layer import determine_expert_map
@@ -420,8 +423,8 @@ class SMoExperts(nn.Module):
         if self.tp_size > 1:
             assert use_ep, "Only EP is supported! Set enable_expert_parallel=True"
 
-        if self.dp_size > 1 and use_ep:
-            print(f"WARNING: DP>1 detected, EP is enabled - currently this combo appears to be broken")
+        # EP+DP mode: need all_gather/reduce_scatter for proper communication
+        self.use_ep_dp = (self.dp_size > 1 and use_ep)
 
         if use_ep:
             # Set TP size to 1 to adjust for EP and adjust EP size and rank
@@ -431,7 +434,7 @@ class SMoExperts(nn.Module):
             self.ep_size = self.tp_size * self.dp_size
             self.tp_size = 1
 
-            self.local_num_experts, self.expert_map = determine_expert_map(
+            self.local_num_experts, self.expert_map, _ = determine_expert_map(
                 ep_size=self.ep_size,
                 ep_rank=self.ep_rank,
                 global_num_experts=self.global_num_experts,
@@ -524,9 +527,9 @@ class SMoEBlock(nn.Module):
         layer_n: int,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",        
+        prefix: str = "",
     ):
-        
+
         super().__init__()
         self.config = config
         self.layer_n = layer_n
@@ -543,7 +546,7 @@ class SMoEBlock(nn.Module):
             layer_number=layer_n,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.router",            
+            prefix=f"{prefix}.router",
         )
 
         self.experts = SMoExperts(
@@ -552,40 +555,98 @@ class SMoEBlock(nn.Module):
             ffn_hidden_size=ffn_hidden_size,
             cache_config=cache_config,
             quant_config=quant_config,
-            prefix=f"{prefix}.experts",         
+            prefix=f"{prefix}.experts",
         )
+
+    def _get_dp_chunk_sizes(self) -> Optional[list[int]]:
+        """Get chunk sizes for DP all_gatherv/reduce_scatterv."""
+        ctx = get_forward_context()
+        if ctx.dp_metadata is not None:
+            return ctx.dp_metadata.get_chunk_sizes_across_dp_rank()
+        return None
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         prev_router_hidden_states: Optional[torch.Tensor] = None,
     ):
+        use_ep_dp = self.experts.use_ep_dp
+        ctx = get_forward_context()
 
-        probs, indices, prev_router_hidden_states = self.router(
-            hidden_states,
-            prev_router_hidden_states=prev_router_hidden_states,
-        )
+        # EP+DP: Set up local_sizes context and gather/scatter
+        sp_ctx = ctx.dp_metadata.sp_local_sizes(1) if (ctx.dp_metadata and use_ep_dp) else nullcontext()
 
-        if self.config.smoe_use_mod and not getattr(self.config, "ignore_mod_in_smoe_block", False):
-            # Make sure you understand when to enable ignore_mod_in_smoe_block.
-            # Some SMoE checkpoints technically have MoD enabled in the router,
-            # but MoD bias is set to -1, effectively prohibiting the router 
-            # from ever selecting the MoD expert. In such cases, we can skip
-            # the MoD handling in the expert layer for efficiency.
-            clamped_indices = torch.clamp(indices,
-                                          min=0,
-                                          max=self.num_moe_experts - 1)
-            hidden_states_experts = self.experts(hidden_states,
-                                                 probs,
-                                                 clamped_indices)
-            hidden_states_mod = hidden_states * probs
-            mod_mask = (indices != self.num_moe_experts)
-            hidden_states = (mod_mask * hidden_states_experts) + ((~mod_mask) * hidden_states_mod)
-        else:
-            hidden_states = self.experts(hidden_states, probs, indices)
-        expert_output = hidden_states
+        with sp_ctx:
+            # EP+DP dispatch: gather hidden_states from all DP ranks
+            local_num_tokens = hidden_states.shape[0]
+            if use_ep_dp and ctx.dp_metadata is not None:
+                dp_group = get_dp_group()
+                sizes = ctx.dp_metadata.get_chunk_sizes_across_dp_rank()
 
-        return expert_output, prev_router_hidden_states
+                # Use uniform all_gather during torch.compile (static shapes required)
+                # Use variable-size all_gatherv in eager mode (handles different batch sizes)
+                if torch.compiler.is_compiling():
+                    # torch.compile path: uniform sizes, static shapes
+                    if prev_router_hidden_states is not None:
+                        hidden_states = dp_group.all_gather(hidden_states, dim=0)
+                        prev_router_hidden_states = dp_group.all_gather(prev_router_hidden_states, dim=0)
+                    else:
+                        hidden_states = dp_group.all_gather(hidden_states, dim=0)
+                else:
+                    # Eager mode path: variable sizes supported
+                    if sizes is not None:
+                        if prev_router_hidden_states is not None:
+                            hidden_states, prev_router_hidden_states = dp_group.all_gatherv(
+                                [hidden_states, prev_router_hidden_states],
+                                dim=0,
+                                sizes=sizes,
+                            )
+                        else:
+                            hidden_states = dp_group.all_gatherv(
+                                [hidden_states],
+                                dim=0,
+                                sizes=sizes,
+                            )[0]
+
+            probs, indices, router_hidden_states_out = self.router(
+                hidden_states,
+                prev_router_hidden_states=prev_router_hidden_states,
+            )
+
+            if self.config.smoe_use_mod and not getattr(self.config, "ignore_mod_in_smoe_block", False):
+                clamped_indices = torch.clamp(indices,
+                                              min=0,
+                                              max=self.num_moe_experts - 1)
+                hidden_states_experts = self.experts(hidden_states,
+                                                     probs,
+                                                     clamped_indices)
+                hidden_states_mod = hidden_states * probs
+                mod_mask = (indices != self.num_moe_experts)
+                hidden_states = (mod_mask * hidden_states_experts) + ((~mod_mask) * hidden_states_mod)
+            else:
+                hidden_states = self.experts(hidden_states, probs, indices)
+
+            # EP+DP combine: reduce-scatter back to local DP rank
+            if use_ep_dp and ctx.dp_metadata is not None:
+                dp_group = get_dp_group()
+                rank = dp_group.rank_in_group
+
+                if torch.compiler.is_compiling():
+                    # torch.compile path: uniform sizes
+                    hidden_states = dp_group.reduce_scatter(hidden_states, dim=0)
+                    start_idx = rank * local_num_tokens
+                    end_idx = start_idx + local_num_tokens
+                    router_hidden_states_out = router_hidden_states_out[start_idx:end_idx]
+                else:
+                    # Eager mode path: variable sizes
+                    sizes = ctx.dp_metadata.get_chunk_sizes_across_dp_rank()
+                    if sizes is not None:
+                        hidden_states = dp_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+                        start_idx = sum(sizes[:rank])
+                        end_idx = start_idx + sizes[rank]
+                        router_hidden_states_out = router_hidden_states_out[start_idx:end_idx]
+
+        return hidden_states, router_hidden_states_out
 
 
 class SMoEDecoderMLPLayer(nn.Module):
