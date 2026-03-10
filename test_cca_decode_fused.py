@@ -178,13 +178,10 @@ def load_fused_kernel():
     try:
         from torch.utils.cpp_extension import load_inline
 
-        # kernel_src_path = os.path.join(
-        #     os.path.dirname(__file__),
-        #     "CCA_Decode", "csrc", "rocm", "cca_decode_fused.cu",
-        # )
-
-        kernel_src_path = "/apps/tas/yaoc/work/zyphra/CCA_Decode/csrc/rocm/cca_decode_fused_wrap_reduce.cu"
-        kernel_src_path = "/apps/tas/yaoc/work/zyphra/CCA_Decode/csrc/rocm/cca_decode_fused.cu"
+        kernel_src_path = os.path.join(
+            os.path.dirname(__file__),
+            "csrc", "rocm", "cca_decode_fused.cu",
+        )
         if not os.path.exists(kernel_src_path):
             print(f"[WARN] Fused kernel source not found: {kernel_src_path}")
             return None
@@ -212,7 +209,7 @@ torch::Tensor cca_decode_fused(
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cca_decode_fused", &cca_decode_fused,
-          "CCA decode fused kernel (HIP/CUDA)");
+          "CCA decode fused kernel v2 (HIP/CUDA)");
 }
 """
 
@@ -240,6 +237,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         import traceback
         traceback.print_exc()
         return None
+
+
+def transpose_gw_weight(gw_weight):
+    """Transpose gw_weight from [G, D, D, 2] to [G, D*2, D] for coalesced access."""
+    G, D_out, D_in, K = gw_weight.shape
+    return gw_weight.permute(0, 2, 3, 1).contiguous().view(G, D_in * K, D_out)
 
 
 # ── Test helpers ────────────────────────────────────────────────────
@@ -334,12 +337,13 @@ def run_single_test(
     # ── Fused C++ kernel vs reference ──
     if fused_fn is not None:
         cs_fused = conv_state.clone()
+        gw_weight_T = transpose_gw_weight(gw_weight)
         y_fused = fused_fn(
             new_token.contiguous(), dw_weight.contiguous(),
             dw_bias.contiguous() if dw_bias is not None else None,
             cs_fused,
             state_indices.contiguous(),
-            gw_weight.contiguous(),
+            gw_weight_T,
             gw_bias.contiguous() if gw_bias is not None else None,
             qk_mean.contiguous(),
             temp_vec.contiguous(),
@@ -382,6 +386,7 @@ def benchmark_fused(fused_fn, ref_fn, device,
     dww_c = dw_weight.contiguous()
     dwb_c = dw_bias.contiguous()
     gww_c = gw_weight.contiguous()
+    gww_T = transpose_gw_weight(gww_c)                      # [G, D*2, D]
     gwb_c = gw_bias.contiguous()
     qkm_c = qk_mean.contiguous()
     tv_c  = temp_vec.contiguous()
@@ -407,7 +412,7 @@ def benchmark_fused(fused_fn, ref_fn, device,
         cs = conv_state.clone()
         return fused_fn(
             nt_c, dww_c, dwb_c, cs, si_c,
-            gww_c, gwb_c, qkm_c, tv_c,
+            gww_T, gwb_c, qkm_c, tv_c,
             num_q_heads, sqrt_hd, False, -1,
         )
 
@@ -532,7 +537,7 @@ def main():
     #                 B=4, G=24, D=128, num_q_heads=16)
 
     benchmark_fused(fused_fn, ref_triton_cca_decode_fused, device,
-                    B=512, G=10, D=128, num_q_heads=8)
+                    B=128, G=10, D=128, num_q_heads=8)
 
     print("\nDone.")
 

@@ -83,6 +83,8 @@ if _CCA_FUSED_ENABLED:
                 _fused_cuda_src = _f.read()
             _fused_cpp_wrapper = """
 #include <torch/extension.h>
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
 torch::Tensor cca_decode_fused(
     const torch::Tensor& new_token,
     const torch::Tensor& dw_weight,
@@ -95,9 +97,16 @@ torch::Tensor cca_decode_fused(
     const torch::Tensor& temp,
     int64_t num_q_heads,
     double sqrt_head_dim,
-    bool clamp_temp);
+    bool clamp_temp,
+    int64_t pad_slot_id);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("cca_decode_fused", &cca_decode_fused);
+    m.def("cca_decode_fused", &cca_decode_fused, "",
+          py::arg("new_token"), py::arg("dw_weight"), py::arg("dw_bias"),
+          py::arg("conv_state"), py::arg("state_indices"),
+          py::arg("gw_weight"), py::arg("gw_bias"),
+          py::arg("qk_mean"), py::arg("temp"),
+          py::arg("num_q_heads"), py::arg("sqrt_head_dim"),
+          py::arg("clamp_temp"), py::arg("pad_slot_id") = (int64_t)-1);
 }
 """
             _fused_extra = ["-O3"]
@@ -331,7 +340,7 @@ def cca_decode_fused(
     dw_bias,            # [E] or None
     conv_state,         # [num_cache, E, state_len] — mutated in-place
     state_indices,      # [B] int64
-    gw_weight,          # [G, D, D, 2]
+    gw_weight,          # [G, D*2, D]  transposed for coalesced access
     gw_bias,            # [G, D] or None
     qk_mean,            # [B, G, D]
     temp,               # [num_k_heads] float

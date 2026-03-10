@@ -1,22 +1,27 @@
 /*
- * CCA Decode Fused Kernel — optimised for MI300X decode serving.
+ * CCA Decode Fused Kernel v2 — optimised for MI300X decode serving.
  *
- * Runtime shapes (from server.log):
- *   B=512  E=1280  G=10  D=128  state_len=2  qh=8  kh=2
- *   → grid(512,10)  block(128)  2 wavefronts on CDNA3
+ * Runtime shapes:
+ *   B=128  E=1280  G=10  D=128  state_len=2  qh=8  kh=2
+ *   → grid(B,G)  block(128)
  *
  * Fuses in a SINGLE kernel launch per (batch, group):
  *
  *   Phase 1 — Depthwise causal conv1d update  (K=2)
- *   Phase 2 — Grouped conv1d  (W=2)   GEMV through LDS
+ *   Phase 2 — Grouped conv1d  (W=2)   coalesced GEMV
  *   Phase 3 — qk_mean + L2-norm + scale + temperature
  *   Phase 4 — Write to output q/k buffer
  *
- * Optimisations vs. baseline:
- *   - Warp-shuffle L2-norm reduction: 3 barriers instead of 10
- *   - LDS reduced from (D*2+BLOCK_D) to (D*2+NUM_WARPS) floats
- *   - __launch_bounds__ for better register allocation
- *   - Explicit vectorised GEMV inner loop (#pragma unroll)
+ * v2 key change: gw_weight is now TRANSPOSED to [G, D*2, D] so that
+ * consecutive threads (d_out) read consecutive bf16 elements → fully
+ * coalesced global/L2 reads.  Previous layout [G, D, D, 2] caused each
+ * warp to issue 64 separate cache-line requests per iteration (threads
+ * 512 bytes apart).  With the transposed layout this drops to 2 cache
+ * lines per warp per iteration — a ~32x reduction in L1 pressure.
+ *
+ * Other v2 changes:
+ *   - __launch_bounds__(BLOCK_D, 8) for higher occupancy / latency hiding
+ *   - Host-side: skip redundant contiguous() and temp conversion
  */
 
 #include <torch/all.h>
@@ -35,8 +40,6 @@
 
 namespace {
 
-// Warp-shuffle butterfly reduction.  After this call **every lane** in the
-// warp holds the full partial sum of its warp.
 __device__ __forceinline__ float warp_reduce_sum(float val) {
     #pragma unroll
     for (int offset = WARP_SZ / 2; offset > 0; offset >>= 1)
@@ -44,8 +47,6 @@ __device__ __forceinline__ float warp_reduce_sum(float val) {
     return val;
 }
 
-// Block-level sum using warp-shuffle + one LDS exchange.
-// NUM_WARPS = ceil(BLOCK_D / WARP_SZ).  Returns the sum on ALL threads.
 template <int BLOCK_D>
 __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
     constexpr int NUM_WARPS = (BLOCK_D + WARP_SZ - 1) / WARP_SZ;
@@ -66,50 +67,48 @@ __device__ __forceinline__ float block_reduce_sum(float val, float* smem) {
     #pragma unroll
     for (int w = 0; w < NUM_WARPS; ++w)
         total += smem[w];
-    __syncthreads();          // guard smem reuse
+    __syncthreads();
     return total;
 }
 
 // =======================================================================
-// Fused kernel
+// Fused kernel v2
 //
 // Grid  (B, G)      Block (BLOCK_D)
-// LDS   D*2 floats (phase-1)  +  NUM_WARPS floats (reduction scratch)
+// LDS   D*2 floats (phase-1 output) + NUM_WARPS floats (reduction scratch)
+//
+// gw_weight MUST be in transposed layout [G, D*2, D]  (not [G, D, D, 2])
 // =======================================================================
 template <typename scalar_t, int BLOCK_D,
           bool HAS_DW_BIAS, bool HAS_GW_BIAS, bool CLAMP_TEMP>
-__global__ void cca_decode_fused_kernel(
-    // Phase 1 inputs
+__global__ void
+__launch_bounds__(BLOCK_D, 8)
+cca_decode_fused_kernel(
     const scalar_t* __restrict__ new_token,   // [B, E, 1]
     const scalar_t* __restrict__ dw_weight,   // [E, 2]
     const scalar_t* __restrict__ dw_bias,     // [E]
     scalar_t*       __restrict__ conv_state,  // [num_cache, E, state_len]
     const int64_t*  __restrict__ state_idx,   // [B]
-    // Phase 2 inputs
-    const scalar_t* __restrict__ gw_weight,   // [G, D, D, 2]
+    const scalar_t* __restrict__ gw_weight_T, // [G, D*2, D]  ← TRANSPOSED
     const scalar_t* __restrict__ gw_bias,     // [G, D]
-    // Phase 3 inputs
     const scalar_t* __restrict__ qk_mean,     // [B, G, D]
     const float*    __restrict__ temp,        // [num_k_heads]
-    // Phase 4 output
     scalar_t*       __restrict__ output,      // [B, G*D]
-    // Dimensions
     const int G, const int D,
-    const int E,                               // = G * D
+    const int E,
     const int state_len,
     const int num_q_heads,
     const float sqrt_head_dim,
     const int num_cache_lines,
     const int64_t pad_slot_id)
 {
-    const int i_n   = blockIdx.x;   // batch
-    const int i_g   = blockIdx.y;   // group  (0..qh-1 = Q, qh..G-1 = K)
-    const int d_out = threadIdx.x;  // output channel within group
+    const int i_n   = blockIdx.x;
+    const int i_g   = blockIdx.y;
+    const int d_out = threadIdx.x;
 
     const int DW = D * 2;
     const int GD = G * D;
 
-    // LDS layout: [D*2] phase1 output  |  [NUM_WARPS] reduce scratch
     extern __shared__ char raw_smem[];
     float* s_phase1 = reinterpret_cast<float*>(raw_smem);
     constexpr int NUM_WARPS = (BLOCK_D + WARP_SZ - 1) / WARP_SZ;
@@ -155,48 +154,24 @@ __global__ void cca_decode_fused_kernel(
     if (d_out >= D) return;
 
     // ================================================================
-    // Phase 2: Grouped conv GEMV
-    //   acc = Σ_k Σ_w  gw_weight[g, d_out, k, w] * s_phase1[k, w]
+    // Phase 2: Grouped conv GEMV — COALESCED column-oriented access
+    //
+    //   weight_T layout: [G, DW, D]
+    //   weight_T[g, k, d_out] at offset  g*DW*D + k*D + d_out
+    //
+    //   Consecutive threads (d_out, d_out+1) read addresses that differ
+    //   by 1 element (2 bytes) → perfectly coalesced.  A full warp of
+    //   64 threads touches only 2 cache lines (128 bytes) per iteration.
     // ================================================================
-    const scalar_t* gw_row = gw_weight
-        + static_cast<int64_t>(i_g) * D * DW + d_out * DW;
+    const scalar_t* gw_base = gw_weight_T
+        + static_cast<int64_t>(i_g) * DW * D;
 
     float acc = 0.0f;
 
-    if constexpr (sizeof(scalar_t) <= 2) {
-        constexpr int PACK = 8;
-        const int n_full   = DW / PACK;
-        const int4* w_vec  = reinterpret_cast<const int4*>(gw_row);
-
-        #pragma unroll
-        for (int p = 0; p < n_full; ++p) {
-            int4 pk = w_vec[p];
-            const scalar_t* e = reinterpret_cast<const scalar_t*>(&pk);
-            const int base = p * PACK;
-            #pragma unroll
-            for (int j = 0; j < PACK; ++j)
-                acc = fmaf(static_cast<float>(e[j]), s_phase1[base + j], acc);
-        }
-        #pragma unroll
-        for (int k = n_full * PACK; k < DW; ++k)
-            acc = fmaf(static_cast<float>(gw_row[k]), s_phase1[k], acc);
-    } else {
-        constexpr int PACK = 4;
-        const int n_full      = DW / PACK;
-        const float4* w_vec   = reinterpret_cast<const float4*>(gw_row);
-
-        #pragma unroll
-        for (int p = 0; p < n_full; ++p) {
-            float4 v = w_vec[p];
-            const int base = p * PACK;
-            acc = fmaf(v.x, s_phase1[base + 0], acc);
-            acc = fmaf(v.y, s_phase1[base + 1], acc);
-            acc = fmaf(v.z, s_phase1[base + 2], acc);
-            acc = fmaf(v.w, s_phase1[base + 3], acc);
-        }
-        #pragma unroll
-        for (int k = n_full * PACK; k < DW; ++k)
-            acc = fmaf(gw_row[k], s_phase1[k], acc);
+    #pragma unroll 8
+    for (int k = 0; k < DW; ++k) {
+        float w = static_cast<float>(gw_base[k * D + d_out]);
+        acc = fmaf(w, s_phase1[k], acc);
     }
 
     if constexpr (HAS_GW_BIAS)
@@ -221,7 +196,7 @@ __global__ void cca_decode_fused_kernel(
     }
 
     // ================================================================
-    // Phase 4: Write to output[batch, ...]
+    // Phase 4: Write output
     // ================================================================
     output[i_n * GD + i_g * D + d_out] = static_cast<scalar_t>(acc);
 }
@@ -235,7 +210,7 @@ void launch_fused(
     const scalar_t* new_token, const scalar_t* dw_weight,
     const scalar_t* dw_bias, scalar_t* conv_state,
     const int64_t* state_idx,
-    const scalar_t* gw_weight, const scalar_t* gw_bias,
+    const scalar_t* gw_weight_T, const scalar_t* gw_bias,
     const scalar_t* qk_mean, const float* temp,
     scalar_t* output,
     int B, int G, int D, int E, int state_len,
@@ -250,7 +225,7 @@ void launch_fused(
                             HAS_DW_BIAS, HAS_GW_BIAS, CLAMP_TEMP>
         <<<grid, BLOCK_D, smem, stream>>>(
             new_token, dw_weight, dw_bias, conv_state, state_idx,
-            gw_weight, gw_bias, qk_mean, temp, output,
+            gw_weight_T, gw_bias, qk_mean, temp, output,
             G, D, E, state_len, num_q_heads, sqrt_head_dim,
             num_cache_lines, pad_slot_id);
 }
@@ -259,14 +234,16 @@ void launch_fused(
 
 // =======================================================================
 // Public entry point
+//
+// gw_weight must be PRE-TRANSPOSED to [G, D*2, D] by the caller.
 // =======================================================================
 torch::Tensor cca_decode_fused(
     const torch::Tensor& new_token,       // [B, E, 1]
     const torch::Tensor& dw_weight,       // [E, 2]
     const std::optional<torch::Tensor>& dw_bias_opt, // [E]
-    torch::Tensor& conv_state,            // [num_cache, E, state_len] — mutated
+    torch::Tensor& conv_state,            // [num_cache, E, state_len]
     const torch::Tensor& state_indices,   // [B] int64
-    const torch::Tensor& gw_weight,       // [G, D, D, 2]
+    const torch::Tensor& gw_weight,       // [G, D*2, D]  ← transposed
     const std::optional<torch::Tensor>& gw_bias_opt, // [G, D]
     const torch::Tensor& qk_mean,         // [B, G, D]
     const torch::Tensor& temp,            // [num_k_heads] float
@@ -280,36 +257,33 @@ torch::Tensor cca_decode_fused(
                 "new_token must be [B, E, 1]");
 
     const int B = new_token.size(0);
-    const int E = new_token.size(1);  // total channels = G * D
+    const int E = new_token.size(1);
     const int G = gw_weight.size(0);
-    const int D = gw_weight.size(1);
+    const int D = gw_weight.size(2);    // transposed: [G, DW, D]
+    const int DW = gw_weight.size(1);
     TORCH_CHECK(G * D == E, "G*D must equal E");
-    TORCH_CHECK(gw_weight.size(2) == D && gw_weight.size(3) == 2,
-                "gw_weight must be [G,D,D,2]");
+    TORCH_CHECK(DW == D * 2,
+                "gw_weight must be transposed to [G, D*2, D]");
 
     const bool has_dw_bias = dw_bias_opt.has_value() && dw_bias_opt->defined();
     const bool has_gw_bias = gw_bias_opt.has_value() && gw_bias_opt->defined();
     const int num_cache_lines = conv_state.size(0);
     const int state_len = conv_state.size(2);
 
-    auto nt_c = new_token.contiguous();
-    auto dww  = dw_weight.contiguous();
-    auto gww  = gw_weight.contiguous();
-    auto qkm  = qk_mean.contiguous();
-    auto tmp   = temp.to(torch::kFloat32).contiguous();
-    auto sidx  = state_indices.contiguous();
+    auto output = torch::empty({B, G * D}, new_token.options());
+
+    const at::cuda::OptionalCUDAGuard guard(new_token.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     torch::Tensor dwb, gwb;
     if (has_dw_bias) dwb = dw_bias_opt->contiguous();
     if (has_gw_bias) gwb = gw_bias_opt->contiguous();
 
-    auto output = torch::empty({B, G * D}, nt_c.options());
-
-    const at::cuda::OptionalCUDAGuard guard(new_token.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto tmp = (temp.scalar_type() == at::kFloat)
+        ? temp : temp.to(torch::kFloat32);
 
 #define _DISPATCH(...)                                                       \
-    AT_DISPATCH_SWITCH(nt_c.scalar_type(), "cca_decode_fused",               \
+    AT_DISPATCH_SWITCH(new_token.scalar_type(), "cca_decode_fused",          \
         AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] { __VA_ARGS__; })    \
         AT_DISPATCH_CASE(at::ScalarType::Half,     [&] { __VA_ARGS__; })    \
         AT_DISPATCH_CASE(at::ScalarType::Float,    [&] { __VA_ARGS__; })    \
@@ -325,10 +299,10 @@ torch::Tensor cca_decode_fused(
 
         if (D <= 64) {
             _DISPATCH(launch_fused<scalar_t, 64, DWB, GWB, CT>(
-                _PTR(nt_c), _PTR(dww), _OPTR(dwb, has_dw_bias),
-                _PTR(conv_state), sidx.data_ptr<int64_t>(),
-                _PTR(gww), _OPTR(gwb, has_gw_bias),
-                _PTR(qkm), tmp.data_ptr<float>(),
+                _PTR(new_token), _PTR(dw_weight), _OPTR(dwb, has_dw_bias),
+                _PTR(conv_state), state_indices.data_ptr<int64_t>(),
+                _PTR(gw_weight), _OPTR(gwb, has_gw_bias),
+                _PTR(qk_mean), tmp.data_ptr<float>(),
                 _PTR(output),
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),
@@ -336,10 +310,10 @@ torch::Tensor cca_decode_fused(
                 num_cache_lines, pad_slot_id, stream));
         } else if (D <= 128) {
             _DISPATCH(launch_fused<scalar_t, 128, DWB, GWB, CT>(
-                _PTR(nt_c), _PTR(dww), _OPTR(dwb, has_dw_bias),
-                _PTR(conv_state), sidx.data_ptr<int64_t>(),
-                _PTR(gww), _OPTR(gwb, has_gw_bias),
-                _PTR(qkm), tmp.data_ptr<float>(),
+                _PTR(new_token), _PTR(dw_weight), _OPTR(dwb, has_dw_bias),
+                _PTR(conv_state), state_indices.data_ptr<int64_t>(),
+                _PTR(gw_weight), _OPTR(gwb, has_gw_bias),
+                _PTR(qk_mean), tmp.data_ptr<float>(),
                 _PTR(output),
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),
@@ -347,10 +321,10 @@ torch::Tensor cca_decode_fused(
                 num_cache_lines, pad_slot_id, stream));
         } else {
             _DISPATCH(launch_fused<scalar_t, 256, DWB, GWB, CT>(
-                _PTR(nt_c), _PTR(dww), _OPTR(dwb, has_dw_bias),
-                _PTR(conv_state), sidx.data_ptr<int64_t>(),
-                _PTR(gww), _OPTR(gwb, has_gw_bias),
-                _PTR(qkm), tmp.data_ptr<float>(),
+                _PTR(new_token), _PTR(dw_weight), _OPTR(dwb, has_dw_bias),
+                _PTR(conv_state), state_indices.data_ptr<int64_t>(),
+                _PTR(gw_weight), _OPTR(gwb, has_gw_bias),
+                _PTR(qk_mean), tmp.data_ptr<float>(),
                 _PTR(output),
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),

@@ -133,6 +133,8 @@ class CCA(MambaBase, CustomOp):
         self.gw_weight_flat = self.conv_qk[1].weight.reshape(groups, head_dim, -1, kernel_width).contiguous()
         self.gw_bias_flat = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
 
+        self._gw_weight_T = None
+
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
@@ -656,7 +658,11 @@ class CCA(MambaBase, CustomOp):
                 first_input = qk_packed0_d.transpose(1, 2).contiguous()  # [B, E, 1]
 
                 dw_weight = self.dw_weight_flat
-                gw_weight = self.gw_weight_flat
+                if self._gw_weight_T is None:
+                    gw = self.gw_weight_flat
+                    self._gw_weight_T = gw.permute(0, 2, 3, 1).contiguous().view(
+                        gw.shape[0], gw.shape[2] * gw.shape[3], gw.shape[1])
+                gw_weight = self._gw_weight_T
                 gw_bias = self.gw_bias_flat
 
                 # Pack qk_mean for decode tokens: [B, qh+kh, dh]
