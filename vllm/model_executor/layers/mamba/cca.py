@@ -123,6 +123,15 @@ class CCA(MambaBase, CustomOp):
             ),
         )
 
+
+        dim, _, kernel_width = self.conv_qk[0].weight.shape
+        groups = self.num_k_heads + self.num_q_heads
+        head_dim = dim // groups
+
+        self.dw_weight_flat = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
+        self.gw_weight_flat = self.conv_qk[1].weight.reshape(groups, head_dim, -1, kernel_width).contiguous()
+        self.gw_bias_flat = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
@@ -575,10 +584,10 @@ class CCA(MambaBase, CustomOp):
                 head_dim = dim // groups
 
                 first_input = qk_packed0_d.transpose(1, 2).contiguous()  # [B, E, 1]
-                dw_weight = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
-                gw_weight = self.conv_qk[1].weight.reshape(
-                    groups, head_dim, -1, kernel_width).contiguous()
-                gw_bias = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+
+                dw_weight = self.dw_weight_flat
+                gw_weight = self.gw_weight_flat
+                gw_bias = self.gw_bias_flat
 
                 # Pack qk_mean for decode tokens: [B, qh+kh, dh]
                 qk_mean_q_d = qk_mean_q[:num_decodes].squeeze(1)  # [B, qh, dh]
