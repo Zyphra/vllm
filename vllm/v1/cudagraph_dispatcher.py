@@ -220,6 +220,7 @@ class CudagraphDispatcher:
         uniform_decode: bool = False,
         has_lora: bool = False,
         disable_full: bool = False,
+        disable_piecewise: bool = False,
         num_active_loras: int = 0,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
@@ -236,6 +237,9 @@ class CudagraphDispatcher:
             disable_full: If True, skip FULL cudagraph checks and
                 return PIECEWISE or NONE only. (can be used for features like
                 cascade attention that are not supported by full cudagraphs)
+            disable_piecewise: If True, skip PIECEWISE cudagraph checks and
+                return FULL or NONE only. This can be used for backends whose
+                decode path is only safe under exact/full decode graphs.
             num_active_loras: Number of distinct active LoRA adapters.
         """
         if (
@@ -277,7 +281,10 @@ class CudagraphDispatcher:
 
         # also check if the relaxed key exists for more "general"
         # piecewise cudagraph
-        if relaxed_batch_desc in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]:
+        if (
+            not disable_piecewise
+            and relaxed_batch_desc in self.cudagraph_keys[CUDAGraphMode.PIECEWISE]
+        ):
             return CUDAGraphMode.PIECEWISE, relaxed_batch_desc
 
         # finally, just return no cudagraphs and a trivial batch descriptor

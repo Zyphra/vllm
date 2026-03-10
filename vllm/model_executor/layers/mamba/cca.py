@@ -12,6 +12,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from vllm.v1.attention.backend import AttentionMetadata
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -292,6 +293,7 @@ class CCA(MambaBase, CustomOp):
         qk_packed3_p = None
         _fused_query_d = None
         _fused_key_d = None
+        decode_is_pad: Optional[torch.Tensor] = None
 
         if has_prefill:
             # Prefill
@@ -331,21 +333,70 @@ class CCA(MambaBase, CustomOp):
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
 
-            # Assumming that decode requests in range [0, num_decodes) are real decode requests
-            # and the rest are padded requests, so we can simply ignore the padded requests
-            
-            qk_packed0_cached = conv_states[state_indices_tensor_d]  # [S, H, total_padding]            
+            # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
+            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+            # block_id=0 reserved for safe indexing (see vllm/v1/core/block_pool.py)
+            safe_decode_indices = torch.where(
+                decode_is_pad,
+                torch.zeros_like(state_indices_tensor_d),
+                state_indices_tensor_d,
+            )
+            qk_packed0_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                qk_packed0_d.new_zeros(()),
+                qk_packed0_d,
+            )
+            hs_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs_d.new_zeros(()),
+                hs_d,
+            )
+
+
+            qk_packed0_cached = conv_states[safe_decode_indices]  # [S, H, total_padding]
+            qk_packed0_cached = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                qk_packed0_cached.new_zeros(()),
+                qk_packed0_cached,
+            )
+
+
             qk_packed0_cat = torch.cat([qk_packed0_cached, qk_packed0_d.transpose(1, 2)], dim=-1) # [S, H, total_padding + 1]
             qk_packed3_d = self.conv_qk(qk_packed0_cat).transpose(1, 2)  # [S, 1, E]
+            # Zero out conv output for padded positions (conv bias adds non-zero values even with zero input)
+            qk_packed3_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                qk_packed3_d.new_zeros(()),
+                qk_packed3_d,
+            )
             qk_packed3_output_list.insert(0, qk_packed3_d)
             
             new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
             new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :]
-            conv_states[state_indices_tensor_d] = new_qk_packed0_cache.to(conv_states.device)
+            new_qk_packed0_cache = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                new_qk_packed0_cache.new_zeros(()),
+                new_qk_packed0_cache,
+            )
+            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
+                device=conv_states.device, dtype=conv_states.dtype)
 
-            hs2 = prev_hs[state_indices_tensor_d].unsqueeze(1) # [S, 1, H]
+            hs2 = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
+            hs2 = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs2.new_zeros(()),
+                hs2,
+            )
             hs2_output_list.insert(0, hs2)
-            prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
+            new_prev_hs = hs_d[:, 0, :].to(prev_hs.dtype)
+            new_prev_hs = torch.where(
+                decode_is_pad.view(-1, 1),
+                new_prev_hs.new_zeros(()),
+                new_prev_hs,
+            )
+            prev_hs[safe_decode_indices] = new_prev_hs.to(
+                device=prev_hs.device, dtype=prev_hs.dtype)
+
 
         qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
         hs2 = torch.vstack(hs2_output_list)[:num_actual_tokens]
@@ -530,6 +581,7 @@ class CCA(MambaBase, CustomOp):
         # TODO: allocate memory for output tensors
         qk_packed3_output_list = []
         hs2_output_list = []
+        decode_is_pad: Optional[torch.Tensor] = None
 
         if has_prefill:
             # Prefill
@@ -569,8 +621,26 @@ class CCA(MambaBase, CustomOp):
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
 
+            # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
+            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+            # block_id=0 reserved for safe indexing (see vllm/v1/core/block_pool.py)
+            safe_decode_indices = torch.where(
+                decode_is_pad,
+                torch.zeros_like(state_indices_tensor_d),
+                state_indices_tensor_d,
+            )
             # hs2 and prev_hs updates are common to both fused and unfused paths
-            hs2_d = prev_hs[state_indices_tensor_d].unsqueeze(1)  # [S, 1, H]
+            hs_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs_d.new_zeros(()),
+                hs_d,
+            )
+            hs2_d = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
+            hs2_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs2_d.new_zeros(()),
+                hs2_d,
+            )
             hs2_output_list.insert(0, hs2_d)
             prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
 
@@ -641,6 +711,12 @@ class CCA(MambaBase, CustomOp):
                     second_bias,
                 )
                 qk_packed3_d = qk_packed3_d.reshape(b, 1, -1).contiguous()
+               # Zero out conv output for padded positions (conv bias adds non-zero values even with zero input)
+                qk_packed3_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed3_d.new_zeros(()),
+                    qk_packed3_d,
+                )
                 qk_packed3_output_list.insert(0, qk_packed3_d)
         hs2 = torch.vstack(hs2_output_list)[:num_actual_tokens]
 
