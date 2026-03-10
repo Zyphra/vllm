@@ -1295,11 +1295,6 @@ def add_cli_args(parser: argparse.ArgumentParser):
         help="Trust remote code from huggingface",
     )
     parser.add_argument(
-        "--skip-initial-run",
-        action="store_true",
-        help="Skip the initial run of the benchmark.",
-    )
-    parser.add_argument(
         "--disable-tqdm",
         action="store_true",
         help="Specify to disable tqdm progress bar.",
