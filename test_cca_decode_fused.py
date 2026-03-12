@@ -191,6 +191,8 @@ def load_fused_kernel():
 
         cpp_src = r"""
 #include <torch/extension.h>
+#include <pybind11/pybind11.h>
+namespace py = pybind11;
 
 torch::Tensor cca_decode_fused(
     const torch::Tensor& new_token,
@@ -205,11 +207,19 @@ torch::Tensor cca_decode_fused(
     int64_t num_q_heads,
     double sqrt_head_dim,
     bool clamp_temp,
-    int64_t pad_slot_id);
+    int64_t pad_slot_id,
+    const std::optional<torch::Tensor>& output);
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cca_decode_fused", &cca_decode_fused,
-          "CCA decode fused kernel v2 (HIP/CUDA)");
+          "CCA decode fused kernel v2 (HIP/CUDA)",
+          py::arg("new_token"), py::arg("dw_weight"), py::arg("dw_bias"),
+          py::arg("conv_state"), py::arg("state_indices"),
+          py::arg("gw_weight"), py::arg("gw_bias"),
+          py::arg("qk_mean"), py::arg("temp"),
+          py::arg("num_q_heads"), py::arg("sqrt_head_dim"),
+          py::arg("clamp_temp"), py::arg("pad_slot_id") = (int64_t)-1,
+          py::arg("output") = py::none());
 }
 """
 

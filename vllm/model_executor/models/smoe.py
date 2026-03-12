@@ -12,6 +12,7 @@ VLLM_DISABLE_CCA_QKV = os.getenv("VLLM_DISABLE_CCA_QKV", "0") == "1"
 VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 VLLM_ROCM_USE_AITER_MOE = os.getenv("VLLM_ROCM_USE_AITER_MOE", "0") == "1"
 VLLM_SMOE_FP8_A16 = os.getenv("VLLM_SMOE_FP8_A16", "0") == "1"
+VLLM_SMOE_FUSED_ROUTER = os.getenv("VLLM_SMOE_FUSED_ROUTER", "1") == "1"
 
 from contextlib import nullcontext
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -57,6 +58,12 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.layernorm import RMSNorm
+
+if VLLM_SMOE_FUSED_ROUTER:
+    from vllm.model_executor.models.smoe_ops import (
+        fused_eda_rmsnorm,
+        fused_softmax_topk,
+    )
 
 from .interfaces import HasInnerState, IsHybrid, SupportsMambaPrefixCaching
 from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
@@ -364,37 +371,43 @@ class SMoERouter(nn.Module):
             router_hidden_states_next: (batch, seq, mlp_expansion)
         """
         S, _ = hidden_states.shape
-        device = hidden_states.device
 
-        # eda
         hs = self.down_proj(hidden_states)
-        if self.use_eda and (prev_router_hidden_states is not None):
-            hs = hs + prev_router_hidden_states * self.router_states_scale
 
-        # Stash the pre-norm states for the caller (this is what Megatron returns)
-        router_hidden_states_next = hs[-S:].clone()
-
-        # 2) RMSNorm eda
-        hs_norm = self.rmsnorm_eda(hs)
-
-        # 3) Expert probability distribution
-        logits = self.router_mlp(hs_norm)
-        expert_prob = torch.softmax(logits, dim=-1)
-
-        # 4) Expert choice with balancing biases (biases affect choice only, not probabilities)
-        biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
-
-        if self.topk == 1:
-            expert_choice_t = biased.argmax(dim=-1, keepdim=True)          # (S, 1)
-            route_prob = expert_prob.gather(1, expert_choice_t)            # (S, 1)
+        if VLLM_SMOE_FUSED_ROUTER and self.use_eda and (prev_router_hidden_states is not None):
+            hs_norm, router_hidden_states_next = fused_eda_rmsnorm(
+                hs, prev_router_hidden_states, self.router_states_scale,
+                self.rmsnorm_eda.weight.data, self.rmsnorm_eda.variance_epsilon,
+            )
         else:
-            _, expert_choice_t = torch.topk(biased, self.topk, dim=-1)    # (S, topk)
-            if self.use_mod:
-                skip_idx = self.num_experts - 1
-                n_mask = (expert_choice_t == skip_idx)
-                cumsum_mask = torch.cumsum(n_mask, dim=-1)
-                expert_choice_t = expert_choice_t.masked_fill(cumsum_mask > 0, skip_idx)
-            route_prob = torch.gather(expert_prob, dim=1, index=expert_choice_t)
+            if self.use_eda and (prev_router_hidden_states is not None):
+                hs = hs + prev_router_hidden_states * self.router_states_scale
+            router_hidden_states_next = hs.clone()
+            hs_norm = self.rmsnorm_eda(hs)
+
+        logits = self.router_mlp(hs_norm)
+
+        if VLLM_SMOE_FUSED_ROUTER:
+            route_prob, expert_choice_t = fused_softmax_topk(
+                logits, self.balancing_biases, self.topk,
+                use_mod=self.use_mod,
+                skip_idx=self.num_experts - 1 if self.use_mod else 0,
+            )
+        else:
+            expert_prob = torch.softmax(logits, dim=-1)
+            biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
+
+            if self.topk == 1:
+                expert_choice_t = biased.argmax(dim=-1, keepdim=True)          # (S, 1)
+                route_prob = expert_prob.gather(1, expert_choice_t)            # (S, 1)
+            else:
+                _, expert_choice_t = torch.topk(biased, self.topk, dim=-1)    # (S, topk)
+                if self.use_mod:
+                    skip_idx = self.num_experts - 1
+                    n_mask = (expert_choice_t == skip_idx)
+                    cumsum_mask = torch.cumsum(n_mask, dim=-1)
+                    expert_choice_t = expert_choice_t.masked_fill(cumsum_mask > 0, skip_idx)
+                route_prob = torch.gather(expert_prob, dim=1, index=expert_choice_t)
 
         return route_prob.reshape(-1, self.topk), expert_choice_t.reshape(-1, self.topk), router_hidden_states_next
 
@@ -1046,6 +1059,20 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 elif "_B.weight" in key:
                     key = key.replace("_B.weight", ".B.weight")
             weights_dict[key] = loaded_weight
+
+        # Fuse checkpoint linear_q / linear_k into linear_qk
+        _fuse_keys: dict[str, dict[str, torch.Tensor]] = {}
+        for suffix in (".weight", ".bias"):
+            for qk_name in ("linear_q", "linear_k"):
+                keys_to_fuse = [k for k in weights_dict if f".{qk_name}{suffix}" in k]
+                for k in keys_to_fuse:
+                    fused_key = k.replace(f".{qk_name}{suffix}", f".linear_qk{suffix}")
+                    _fuse_keys.setdefault(fused_key, {})[qk_name] = weights_dict.pop(k)
+        for fused_key, parts in _fuse_keys.items():
+            if "linear_q" in parts and "linear_k" in parts:
+                weights_dict[fused_key] = torch.cat(
+                    [parts["linear_q"], parts["linear_k"]], dim=0
+                )
 
         loaded_params: Set[str] = set()
         import tqdm
