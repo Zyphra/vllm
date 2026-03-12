@@ -32,7 +32,6 @@ from vllm.v1.attention.backends.cca_attn import (
 from vllm.model_executor.layers.mamba.ops import (
     run_causal_conv1d_update, grouped_conv1d_decode,
     cca_decode_fused_available, cca_decode_fused,
-    cca_pad_fused_available, fused_pad_gather_scatter,
 )
 
 @CustomOp.register("cca")
@@ -84,13 +83,19 @@ class CCA(MambaBase, CustomOp):
         assert self.num_q_heads % self.num_k_heads == 0, "q_heads must be a multiple of k_heads"
         assert (self.latent_k_dim + self.latent_q_dim) == (self.num_k_heads + self.num_q_heads) * self.head_dim
 
-        # Projections (q and k fused into a single GEMM)
-        self.linear_qk = ReplicatedLinear(self.hidden_size,
-                                          self.latent_q_dim + self.latent_k_dim,
+        # Projections
+        self.linear_q  = ReplicatedLinear(self.hidden_size,
+                                          self.latent_q_dim,
                                           bias=self.config.attention_bias,
                                           quant_config=quant_config,
                                           return_bias=False,
-                                          prefix=f"{prefix}.linear_qk")
+                                          prefix=f"{prefix}.linear_q")
+        self.linear_k  = ReplicatedLinear(self.hidden_size,
+                                          self.latent_k_dim,
+                                          bias=self.config.attention_bias,
+                                          quant_config=quant_config,
+                                          return_bias=False,
+                                          prefix=f"{prefix}.linear_k")
         self.val_proj1 = ReplicatedLinear(self.hidden_size,
                                           self.latent_k_dim // 2,
                                           bias=self.config.attention_bias,
@@ -181,7 +186,9 @@ class CCA(MambaBase, CustomOp):
             # V1 profile run
             hs = hidden_states.unsqueeze(0).transpose(0, 1).contiguous()
             hs_d = F.pad(hs[:-1], pad=(0, 0, 0, 0, 1, 0))    # [S, B, H]
-            qk_packed0 = self.linear_qk(hs)  # [S, B, latent_q + latent_k]
+            q = self.linear_q(hs)  # [S, B, latent_q_dim]
+            k = self.linear_k(hs)  # [S, B, latent_k_dim]
+            qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
 
             # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
             query_pre = qk_packed0[..., :self.latent_q_dim].view(
@@ -242,7 +249,9 @@ class CCA(MambaBase, CustomOp):
         # ---- Switch to Megatron's layout: [S, B, H] ----
         hs = hidden_states.transpose(0, 1).contiguous()  # [S, B, H]
 
-        qk_packed0 = self.linear_qk(hs)  # [S, B, latent_q + latent_k]
+        q = self.linear_q(hs)  # [S, B, latent_q_dim]
+        k = self.linear_k(hs)  # [S, B, latent_k_dim]
+        qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
 
         # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
         query_pre = qk_packed0[..., :self.latent_q_dim].view(
@@ -445,103 +454,6 @@ class CCA(MambaBase, CustomOp):
             hidden_size=self.hidden_size,
         )
 
-    def forward_decode(
-        self,
-        hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ):
-        forward_context = get_forward_context()
-        attn_metadata: AttentionMetadata = forward_context.attn_metadata
-        if attn_metadata is not None:
-            assert isinstance(attn_metadata, dict)
-            attn_metadata = attn_metadata[self.prefix]
-            assert isinstance(attn_metadata, CCAAttentionMetadata)
-            self_kv_cache = self.kv_cache[forward_context.virtual_engine]
-            conv_states = self_kv_cache[0]
-            prev_hs = self_kv_cache[1]
-            state_indices_tensor = attn_metadata.state_indices_tensor
-            has_initial_states_p = attn_metadata.has_initial_states_p
-            query_start_loc_p = attn_metadata.query_start_loc_p
-        else:
-            raise ValueError("attn_metadata is None in forward_decode")
-
-        assert attn_metadata.num_prefills == 0
-        num_decodes = attn_metadata.num_decode_tokens
-        num_actual_tokens = num_decodes
-
-        num_input_tokens, hidden_size = hidden_states.shape
-        hidden_states = hidden_states[:num_actual_tokens]
-
-        hidden_states = hidden_states.unsqueeze(0)  # [B, S, E]
-        batch_size, _, _ = hidden_states.shape
-
-        # ---- Switch to Megatron's layout: [S, B, H] ----
-        hs = hidden_states.transpose(0, 1).contiguous()  # [S, B, H]
-
-        qk_packed0 = self.linear_qk(hs)  # [S, B, latent_q + latent_k]
-
-        # Pre-mean tensors in grouped form to avoid repeat
-        q_grouped = qk_packed0[..., :self.latent_q_dim].view(
-            *qk_packed0.shape[:2], self.num_k_heads, self.gqa_groups, self.head_dim
-        )  # [S, B, kh, G, dh]
-        k_pre = qk_packed0[..., self.latent_q_dim:].view(
-            *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
-        )  # [S, B, kh, dh]
-
-        qk_mean_grouped = (q_grouped + k_pre.unsqueeze(-2)) / 2  # [S, B, kh, G, dh]
-        qk_mean_q = qk_mean_grouped.view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
-        qk_mean_k = qk_mean_grouped.mean(dim=-2)  # [S, B, kh, dh]
-
-        # Fused: pad detection + prev_hs gather/scatter
-        hs2, decode_is_pad = fused_pad_gather_scatter(
-            state_indices_tensor, hs, prev_hs,
-        )
-
-        # ── Fused decode path ──
-        dim, _, kernel_width = self.conv_qk[0].weight.shape
-        groups = self.num_k_heads + self.num_q_heads
-        head_dim = dim // groups
-
-        first_input = qk_packed0.transpose(1, 2).contiguous()  # [B, E, S]
-
-        if self._gw_weight_T is None:
-            gw = self.gw_weight_flat
-            self._gw_weight_T = gw.permute(0, 2, 3, 1).contiguous().view(
-                gw.shape[0], gw.shape[2] * gw.shape[3], gw.shape[1])
-
-        # Pack qk_mean for decode tokens: [B, qh+kh, dh]
-        qk_mean_q_d = qk_mean_q.squeeze(1)  # [B, qh, dh]
-        qk_mean_k_d = qk_mean_k.squeeze(1)  # [B, kh, dh]
-        qk_mean_packed = torch.cat(
-            [qk_mean_q_d, qk_mean_k_d], dim=1).contiguous()
-
-        q_end = self.latent_q_dim
-        k_end = q_end + self.latent_k_dim
-        v_mid = k_end + self.latent_k_dim // 2
-
-        cca_decode_fused(
-            first_input,
-            self.dw_weight_flat,
-            self.conv_qk[0].bias,
-            conv_states,
-            state_indices_tensor,
-            self._gw_weight_T,
-            self.gw_bias_flat,
-            qk_mean_packed,
-            self.temp.data,
-            self.num_q_heads,
-            self.sqrt_head_dim,
-            self.config.clamp_temp,
-            output=output[:num_decodes, :k_end],
-        )
-
-        # Values from the two time streams — use original hs (not pad-zeroed hs_d)
-        v1 = self.val_proj1(hs)   # [S, 1, latent_k_dim/2]
-        v2 = self.val_proj2(hs2)  # [S, 1, latent_k_dim/2]
-
-        output[:num_decodes, k_end:v_mid] = v1.view(num_decodes, -1)
-        output[:num_decodes, v_mid:] = v2.view(num_decodes, -1)
-
     def forward_triton(
         self,
         hidden_states: torch.Tensor,
@@ -563,19 +475,24 @@ class CCA(MambaBase, CustomOp):
             # V1 profile run
             hs = hidden_states.unsqueeze(0).transpose(0, 1).contiguous()
             hs_d = F.pad(hs[:-1], pad=(0, 0, 0, 0, 1, 0))    # [S, B, H]
-            qk_packed0 = self.linear_qk(hs)  # [S, B, latent_q + latent_k]
+            q = self.linear_q(hs)  # [S, B, latent_q_dim]
+            k = self.linear_k(hs)  # [S, B, latent_k_dim]
+            qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
 
-            # Pre-mean tensors in grouped form to avoid repeat
-            q_grouped = qk_packed0[..., :self.latent_q_dim].view(
-                *qk_packed0.shape[:2], self.num_k_heads, self.gqa_groups, self.head_dim
-            )  # [S, B, kh, G, dh]
-            k_pre = qk_packed0[..., self.latent_q_dim:].view(
+            # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
+            query_pre = qk_packed0[..., :self.latent_q_dim].view(
+                *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
+            )  # [S, B, qh, dh]
+
+            key_pre = qk_packed0[..., self.latent_q_dim:].view(
                 *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
             )  # [S, B, kh, dh]
+            key_pre = key_pre.unsqueeze(-2).repeat(1, 1, 1, self.gqa_groups, 1) \
+                            .view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
 
-            qk_mean_grouped = (q_grouped + k_pre.unsqueeze(-2)) / 2  # [S, B, kh, G, dh]
-            qk_mean_q = qk_mean_grouped.view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
-            qk_mean_k = qk_mean_grouped.mean(dim=-2)  # [S, B, kh, dh]
+            # Means for residual mixing (identical to Megatron)
+            qk_mean_q = (query_pre + key_pre) / 2
+            qk_mean_k = qk_mean_q.view(*qk_mean_q.shape[:2], self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
 
             qk_packed1 = qk_packed0.permute(1, 2, 0)             # [B, E, S]
             qk_packed2 = F.pad(qk_packed1, (self.total_padding, 0))
@@ -612,10 +529,6 @@ class CCA(MambaBase, CustomOp):
         has_decode = num_decodes > 0
         num_actual_tokens = num_decodes + num_prefill_tokens
 
-        if not has_prefill:
-            self.forward_decode(hidden_states, output)
-            return
-
         num_input_tokens, hidden_size = hidden_states.shape
         hidden_states = hidden_states[:num_actual_tokens]
 
@@ -625,19 +538,24 @@ class CCA(MambaBase, CustomOp):
         # ---- Switch to Megatron's layout: [S, B, H] ----
         hs = hidden_states.transpose(0, 1).contiguous()  # [S, B, H]
 
-        qk_packed0 = self.linear_qk(hs)  # [S, B, latent_q + latent_k]
+        q = self.linear_q(hs)  # [S, B, latent_q_dim]
+        k = self.linear_k(hs)  # [S, B, latent_k_dim]
+        qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
 
-        # Pre-mean tensors in grouped form to avoid repeat
-        q_grouped = qk_packed0[..., :self.latent_q_dim].view(
-            *qk_packed0.shape[:2], self.num_k_heads, self.gqa_groups, self.head_dim
-        )  # [S, B, kh, G, dh]
-        k_pre = qk_packed0[..., self.latent_q_dim:].view(
+        # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
+        query_pre = qk_packed0[..., :self.latent_q_dim].view(
+            *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
+        )  # [S, B, qh, dh]
+
+        key_pre = qk_packed0[..., self.latent_q_dim:].view(
             *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
         )  # [S, B, kh, dh]
+        key_pre = key_pre.unsqueeze(-2).repeat(1, 1, 1, self.gqa_groups, 1) \
+                          .view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
 
-        qk_mean_grouped = (q_grouped + k_pre.unsqueeze(-2)) / 2  # [S, B, kh, G, dh]
-        qk_mean_q = qk_mean_grouped.view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
-        qk_mean_k = qk_mean_grouped.mean(dim=-2)  # [S, B, kh, dh]
+        # Means for residual mixing (identical to Megatron)
+        qk_mean_q = (query_pre + key_pre) / 2
+        qk_mean_k = qk_mean_q.view(*qk_mean_q.shape[:2], self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
 
         # # NOTE: V1 puts decode before prefill
         # # Separate prefill and decode by splitting varlen input
@@ -705,11 +623,28 @@ class CCA(MambaBase, CustomOp):
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
 
-            # Fused: pad detection + prev_hs gather/scatter
-            hs2_d, decode_is_pad = fused_pad_gather_scatter(
-                state_indices_tensor_d, hs_d, prev_hs,
+            # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
+            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+            # block_id=0 reserved for safe indexing (see vllm/v1/core/block_pool.py)
+            safe_decode_indices = torch.where(
+                decode_is_pad,
+                torch.zeros_like(state_indices_tensor_d),
+                state_indices_tensor_d,
+            )
+            # hs2 and prev_hs updates are common to both fused and unfused paths
+            hs_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs_d.new_zeros(()),
+                hs_d,
+            )
+            hs2_d = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
+            hs2_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                hs2_d.new_zeros(()),
+                hs2_d,
             )
             hs2_output_list.insert(0, hs2_d)
+            prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
 
             if cca_decode_fused_available():
                 # ── Fused decode path ──
@@ -796,9 +731,6 @@ class CCA(MambaBase, CustomOp):
         v2 = self.val_proj2(hs2)
         value = torch.cat([v1, v2], dim=-1).contiguous()
         value = value.view(num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)  # [S, B, kh, dh]
-
-        q_end = self.latent_q_dim
-        k_end = q_end + self.latent_k_dim
 
         query = torch.empty(
             (num_actual_tokens, self.latent_q_dim),

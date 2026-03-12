@@ -98,8 +98,7 @@ torch::Tensor cca_decode_fused(
     int64_t num_q_heads,
     double sqrt_head_dim,
     bool clamp_temp,
-    int64_t pad_slot_id,
-    const std::optional<torch::Tensor>& output);
+    int64_t pad_slot_id);
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cca_decode_fused", &cca_decode_fused, "",
           py::arg("new_token"), py::arg("dw_weight"), py::arg("dw_bias"),
@@ -107,8 +106,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("gw_weight"), py::arg("gw_bias"),
           py::arg("qk_mean"), py::arg("temp"),
           py::arg("num_q_heads"), py::arg("sqrt_head_dim"),
-          py::arg("clamp_temp"), py::arg("pad_slot_id") = (int64_t)-1,
-          py::arg("output") = py::none());
+          py::arg("clamp_temp"), py::arg("pad_slot_id") = (int64_t)-1);
 }
 """
             _fused_extra = ["-O3"]
@@ -331,102 +329,6 @@ def grouped_conv1d_decode(x, weight, bias=None):
     return _grouped_conv1d_decode_triton(x, weight, bias)
 
 
-# ---------------------------------------------------------------------------
-# Fused pad detection + hs_d zeroing + prev_hs gather/scatter.
-# Replaces 6 separate kernel launches with 1 in the decode path.
-# Controlled by VLLM_CCA_PAD_FUSED_ENABLED (default: enabled).
-# ---------------------------------------------------------------------------
-_CCA_PAD_FUSED_ENABLED = os.environ.get(
-    "VLLM_CCA_PAD_FUSED_ENABLED", "1").lower() in ("1", "true", "yes")
-
-
-def cca_pad_fused_available():
-    """Return True when the fused pad/gather/scatter kernel is enabled."""
-    return _CCA_PAD_FUSED_ENABLED
-
-@triton.jit
-def _fused_pad_gather_scatter_kernel(
-    state_indices_ptr,
-    hs_d_ptr,
-    prev_hs_ptr,
-    hs2_d_out_ptr,
-    decode_is_pad_ptr,
-    H: tl.constexpr,
-    PREV_HS_STRIDE0,
-    PAD_SLOT_ID: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-):
-    slot_id = tl.program_id(0)
-    h_block_id = tl.program_id(1)
-
-    h_offs = h_block_id * BLOCK_H + tl.arange(0, BLOCK_H)
-    h_mask = h_offs < H
-
-    state_idx = tl.load(state_indices_ptr + slot_id).to(tl.int64)
-    is_valid = (state_idx != PAD_SLOT_ID)
-    is_pad = (state_idx == PAD_SLOT_ID)
-    safe_idx = tl.where(is_valid, state_idx, 0).to(tl.int64)
-
-    if h_block_id == 0:
-        tl.store(decode_is_pad_ptr + slot_id, is_pad)
-
-    valid_mask = h_mask & is_valid
-
-    hs_val = tl.load(
-        hs_d_ptr + slot_id * H + h_offs, mask=valid_mask, other=0.0,
-    )
-
-    prev_hs_row_off = safe_idx * PREV_HS_STRIDE0
-    hs2_val = tl.load(
-        prev_hs_ptr + prev_hs_row_off + h_offs, mask=valid_mask, other=0.0,
-    )
-    tl.store(hs2_d_out_ptr + slot_id * H + h_offs, hs2_val, mask=h_mask)
-
-    tl.store(
-        prev_hs_ptr + prev_hs_row_off + h_offs, hs_val, mask=valid_mask,
-    )
-
-
-def fused_pad_gather_scatter(
-    state_indices,   # [S], int64
-    hs_d,            # [S, 1, H]
-    prev_hs,         # [num_blocks, H]  — modified in-place (scatter)
-):
-    """Fused pad handling for the CCA decode path.
-
-    Returns (hs2_d_out, decode_is_pad):
-        hs2_d_out:     [S, 1, H]  gathered from prev_hs, zeroed for pads
-        decode_is_pad: [S]        boolean pad mask
-    Also scatters valid (non-pad) hs_d rows into prev_hs in-place.
-    """
-    S = state_indices.shape[0]
-    H = hs_d.shape[2]
-
-    hs_d_flat = hs_d.squeeze(1).contiguous()
-    hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=hs_d.dtype)
-    decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
-
-    BLOCK_H = 128
-    grid = (S, triton.cdiv(H, BLOCK_H))
-
-    _fused_pad_gather_scatter_kernel[grid](
-        state_indices,
-        hs_d_flat,
-        prev_hs,
-        hs2_d_out,
-        decode_is_pad,
-        H=H,
-        PREV_HS_STRIDE0=prev_hs.stride(0),
-        PAD_SLOT_ID=-1,
-        BLOCK_H=BLOCK_H,
-    )
-
-    return (
-        hs2_d_out.unsqueeze(1),
-        decode_is_pad,
-    )
-
-
 def cca_decode_fused_available():
     """Return True when the fused CCA decode kernel is compiled and ready."""
     return _CCA_FUSED_ENABLED and _cpp_cca_fused_fn is not None
@@ -445,14 +347,11 @@ def cca_decode_fused(
     num_q_heads,        # int
     sqrt_head_dim,      # float
     clamp_temp,         # bool
-    output=None,        # optional [B, >=G*D] pre-allocated output tensor
 ):
     """CCA decode fused kernel: depthwise conv + grouped conv + post-processing.
 
     Returns [B, G*D] with query/key heads already L2-normalised, scaled, and
-    temperature-applied.  When *output* is provided the kernel writes directly
-    into it (using its row stride) and returns it; otherwise a fresh tensor is
-    allocated.
+    temperature-applied.
 
     Requires VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_FUSED_KERNEL_PATH set.
     """
@@ -489,8 +388,6 @@ def cca_decode_fused(
         int(num_q_heads),
         float(sqrt_head_dim),
         bool(clamp_temp),
-        -1,
-        output,
     )
     if _CCA_FUSED_SHAPE_DEBUG:
         logger.info("[cca_decode_fused] output shape: out=%s", tuple(out.shape))

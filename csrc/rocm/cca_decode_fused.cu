@@ -93,15 +93,14 @@ cca_decode_fused_kernel(
     const scalar_t* __restrict__ gw_bias,     // [G, D]
     const scalar_t* __restrict__ qk_mean,     // [B, G, D]
     const float*    __restrict__ temp,        // [num_k_heads]
-    scalar_t*       __restrict__ output,      // [B, >=G*D] or strided
+    scalar_t*       __restrict__ output,      // [B, G*D]
     const int G, const int D,
     const int E,
     const int state_len,
     const int num_q_heads,
     const float sqrt_head_dim,
     const int num_cache_lines,
-    const int64_t pad_slot_id,
-    const int output_stride)                  // elements between rows
+    const int64_t pad_slot_id)
 {
     const int i_n   = blockIdx.x;
     const int i_g   = blockIdx.y;
@@ -199,7 +198,7 @@ cca_decode_fused_kernel(
     // ================================================================
     // Phase 4: Write output
     // ================================================================
-    output[i_n * output_stride + i_g * D + d_out] = static_cast<scalar_t>(acc);
+    output[i_n * GD + i_g * D + d_out] = static_cast<scalar_t>(acc);
 }
 
 // =======================================================================
@@ -217,7 +216,6 @@ void launch_fused(
     int B, int G, int D, int E, int state_len,
     int num_q_heads, float sqrt_head_dim,
     int num_cache_lines, int64_t pad_slot_id,
-    int output_stride,
     cudaStream_t stream)
 {
     dim3 grid(B, G);
@@ -229,7 +227,7 @@ void launch_fused(
             new_token, dw_weight, dw_bias, conv_state, state_idx,
             gw_weight_T, gw_bias, qk_mean, temp, output,
             G, D, E, state_len, num_q_heads, sqrt_head_dim,
-            num_cache_lines, pad_slot_id, output_stride);
+            num_cache_lines, pad_slot_id);
 }
 
 }  // anonymous namespace
@@ -252,8 +250,7 @@ torch::Tensor cca_decode_fused(
     int64_t num_q_heads,
     double sqrt_head_dim,
     bool clamp_temp,
-    int64_t pad_slot_id,
-    const std::optional<torch::Tensor>& output_opt)   // optional [B, >=G*D] pre-allocated
+    int64_t pad_slot_id)
 {
     TORCH_CHECK(new_token.is_cuda(), "new_token must be on CUDA/HIP");
     TORCH_CHECK(new_token.dim() == 3 && new_token.size(2) == 1,
@@ -273,10 +270,7 @@ torch::Tensor cca_decode_fused(
     const int num_cache_lines = conv_state.size(0);
     const int state_len = conv_state.size(2);
 
-    const bool has_output = output_opt.has_value() && output_opt->defined();
-    auto output = has_output ? *output_opt
-                             : torch::empty({B, G * D}, new_token.options());
-    const int out_stride = static_cast<int>(output.stride(0));
+    auto output = torch::empty({B, G * D}, new_token.options());
 
     const at::cuda::OptionalCUDAGuard guard(new_token.device());
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -313,7 +307,7 @@ torch::Tensor cca_decode_fused(
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),
                 static_cast<float>(sqrt_head_dim),
-                num_cache_lines, pad_slot_id, out_stride, stream));
+                num_cache_lines, pad_slot_id, stream));
         } else if (D <= 128) {
             _DISPATCH(launch_fused<scalar_t, 128, DWB, GWB, CT>(
                 _PTR(new_token), _PTR(dw_weight), _OPTR(dwb, has_dw_bias),
@@ -324,7 +318,7 @@ torch::Tensor cca_decode_fused(
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),
                 static_cast<float>(sqrt_head_dim),
-                num_cache_lines, pad_slot_id, out_stride, stream));
+                num_cache_lines, pad_slot_id, stream));
         } else {
             _DISPATCH(launch_fused<scalar_t, 256, DWB, GWB, CT>(
                 _PTR(new_token), _PTR(dw_weight), _OPTR(dwb, has_dw_bias),
@@ -335,7 +329,7 @@ torch::Tensor cca_decode_fused(
                 B, G, D, E, state_len,
                 static_cast<int>(num_q_heads),
                 static_cast<float>(sqrt_head_dim),
-                num_cache_lines, pad_slot_id, out_stride, stream));
+                num_cache_lines, pad_slot_id, stream));
         }
     };
 
