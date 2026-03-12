@@ -8,6 +8,7 @@ from vllm.distributed import (get_dp_group, get_ep_group,
                               tensor_model_parallel_all_reduce)
 
 import os
+VLLM_DISABLE_CCA_QKV = os.getenv("VLLM_DISABLE_CCA_QKV", "0") == "1"
 VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 VLLM_ROCM_USE_AITER_MOE = os.getenv("VLLM_ROCM_USE_AITER_MOE", "0") == "1"
 VLLM_SMOE_FP8_A16 = os.getenv("VLLM_SMOE_FP8_A16", "0") == "1"
@@ -26,6 +27,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.ops import cca_decode_fused_available
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.model_executor.layers.quantization import QuantizationConfig
@@ -61,6 +63,9 @@ from .utils import (AutoWeightsLoader, is_pp_missing_parameter,
                     make_empty_intermediate_tensors_factory, make_layers,
                     maybe_prefix)
 from vllm.transformers_utils.configs import SMoEConfig
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 class ResidualScaling(nn.Module):
     def __init__(
@@ -928,6 +933,26 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 "SMoE currently does not support 'all' prefix caching, "
                 "please use '--mamba-cache-mode=align' instead"
             )
+        
+        if VLLM_CCA_TRITON:
+            logger.info("[SMoE]: Using Triton CCA backend")
+            if cca_decode_fused_available():
+                logger.info("[SMoE]: Using CCA fused for decode")
+        else:
+            logger.info("[SMoE]: Using pytorch-native CCA backend")
+
+        if VLLM_ROCM_USE_AITER_MOE:
+            logger.info("[SMoE]: Using AITER MoE backend")
+        
+        if VLLM_SMOE_FP8_A16:
+            logger.info("[SMoE]: Using FP8-A16 for MoE experts")
+
+        if VLLM_DISABLE_CCA_QKV:
+            logger.warning(
+                "[SMoE]: WARNING! Skipping QKV computation in CCA, "
+                "QKV will be just filled with zeros. This is only used "
+                "for debugging/benchmarking purposes."
+            )
 
         super().__init__()
         self.config = config
@@ -937,11 +962,13 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.quant_config = vllm_config.quant_config
         self.model_config = vllm_config.model_config
         if config.smoe_use_mod and getattr(config, "ignore_mod_in_smoe_block", False):
-            print("Warning: SMoE is using MoD but ignoring it in SMoE blocks! "
-                  "Please, double check if this is intended. "
-                  "Some SMoE checkpoints technically have MoD, but MoD bias is set to -1, "
-                  "so the MoD expert is never selected. In this case, setting "
-                  "ignore_mod_in_smoe_block=True can improve inference speed.")
+            logger.warning(
+                "[SMoE]: WARNING! SMoE is using MoD but ignoring it in SMoE blocks! "
+                "Please, double check if this is intended. "
+                "Some SMoE checkpoints technically have MoD, but MoD bias is set to -1, "
+                "so the MoD expert is never selected. In this case, setting "
+                "ignore_mod_in_smoe_block=True can improve inference speed."
+            )
 
         self.model = SMoEModel(vllm_config=vllm_config,
                                prefix=maybe_prefix(prefix, "model"))
@@ -1052,7 +1079,7 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
                
             # Loading other parameters
             if chkpt_weight_name not in params_dict:
-                print(f"WARNING: key {chkpt_weight_name} not in params! Skipping loading")
+                logger.info(f"WARNING: key {chkpt_weight_name} not in params! Skipping loading")
                 continue
             param = params_dict[chkpt_weight_name]
             weight_loader = getattr(param, "weight_loader",
@@ -1095,7 +1122,7 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
                             E, inter_dim, dtype=torch.float32,
                             device=w2_fp8.device,
                         )
-                        print(
+                        logger.info(
                             f"[SMoE] FP8-A16 enabled: ws {module.ws.shape} "
                             f"w2s {module.w2s.shape} "
                             f"fc1_scale {fc1_scale.shape} "
