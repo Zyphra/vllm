@@ -189,7 +189,8 @@ class SMoEAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
         output_qkv = torch.zeros((hidden_states.shape[0], self.qkv_dim), device=hidden_states.device, dtype=hidden_states.dtype)
-        self.qkv(hidden_states, output_qkv)
+        if not VLLM_DISABLE_CCA_QKV:
+            self.qkv(hidden_states, output_qkv)
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
         attn_output = self.attn(q, k, v)     
