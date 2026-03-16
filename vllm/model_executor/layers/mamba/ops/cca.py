@@ -63,21 +63,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 #
 # Controlled by two environment variables:
 #   VLLM_CCA_FUSED_ENABLED       "1" / "true" / "yes" to enable (default: off)
-#   VLLM_CCA_FUSED_KERNEL_PATH   absolute path to cca_decode_fused.cu
+#   VLLM_CCA_DECODE_FUSED_KERNEL_PATH   absolute path to cca_decode_fused.cu
 # ---------------------------------------------------------------------------
 _CCA_FUSED_ENABLED = os.environ.get(
     "VLLM_CCA_FUSED_ENABLED", "0").lower() in ("1", "true", "yes")
 _CCA_FUSED_SHAPE_DEBUG = os.environ.get(
     "VLLM_CCA_FUSED_SHAPE_DEBUG", "0").lower() in ("1", "true", "yes")
-_cpp_cca_fused_fn = None
+_cpp_cca_decode_fused_fn = None
 
 if _CCA_FUSED_ENABLED:
     try:
         from torch.utils.cpp_extension import load_inline as _load_inline_fused
         _fused_kernel_path = os.environ.get(
-            "VLLM_CCA_FUSED_KERNEL_PATH", None)
+            "VLLM_CCA_DECODE_FUSED_KERNEL_PATH", None)
         if _fused_kernel_path is None:
-            raise ValueError("VLLM_CCA_FUSED_KERNEL_PATH is not set")
+            raise ValueError("VLLM_CCA_DECODE_FUSED_KERNEL_PATH is not set")
         if os.path.exists(_fused_kernel_path):
             with open(_fused_kernel_path, "r") as _f:
                 _fused_cuda_src = _f.read()
@@ -120,17 +120,131 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
                 extra_cuda_cflags=_fused_extra,
                 verbose=False,
             )
-            _cpp_cca_fused_fn = _fused_mod.cca_decode_fused
+            _cpp_cca_decode_fused_fn = _fused_mod.cca_decode_fused
             logger.info("Loaded C++ cca_decode_fused kernel from %s",
                         _fused_kernel_path)
         else:
             logger.warning("CCA fused kernel source not found at %s, "
                            "disabling fusion", _fused_kernel_path)
-            _CCA_FUSED_ENABLED = False
+            raise ValueError("CCA fused kernel source not found at %s" % _fused_kernel_path)
     except Exception as e:
         logger.warning("Failed to compile CCA fused kernel: %s, "
                        "disabling fusion", e)
-        _CCA_FUSED_ENABLED = False
+
+# ---------------------------------------------------------------------------
+# CCA prefill fused kernel (HIP/CUDA C++)
+#
+# Controlled by:
+#   VLLM_CCA_FUSED_ENABLED              (same gate as decode fused kernel)
+#   VLLM_CCA_PREFILL_FUSED_KERNEL_PATH  absolute path to cca_prefill_fused.cu
+# ---------------------------------------------------------------------------
+_cpp_cca_prefill_fused_fn = None
+
+if _CCA_FUSED_ENABLED:
+    try:
+        from torch.utils.cpp_extension import load_inline as _load_inline_pfused
+        _pfused_kernel_path = os.environ.get(
+            "VLLM_CCA_PREFILL_FUSED_KERNEL_PATH", None)
+        if _pfused_kernel_path is None:
+            raise ValueError("VLLM_CCA_PREFILL_FUSED_KERNEL_PATH is not set")
+        if _pfused_kernel_path and os.path.exists(_pfused_kernel_path):
+            with open(_pfused_kernel_path, "r") as _f:
+                _pfused_cuda_src = _f.read()
+            _pfused_cpp_wrapper = """
+#include <torch/extension.h>
+std::vector<torch::Tensor> cca_prefill_fused_hip(
+    const torch::Tensor& hs_p,
+    const torch::Tensor& qk_packed0_p,
+    torch::Tensor& prev_hs,
+    torch::Tensor& conv_states,
+    const torch::Tensor& query_start_loc,
+    const torch::Tensor& has_initial_i32,
+    const torch::Tensor& state_indices,
+    const torch::Tensor& req_idx,
+    const torch::Tensor& dw_weight,
+    const std::optional<torch::Tensor>& dw_bias_opt,
+    const torch::Tensor& gw_weight,
+    const std::optional<torch::Tensor>& gw_bias_opt);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("cca_prefill_fused_hip", &cca_prefill_fused_hip);
+}
+"""
+            _pfused_extra = ["-O3"]
+            if torch.version.hip is not None:
+                _pfused_extra.append("-DUSE_ROCM")
+            _pfused_mod = _load_inline_pfused(
+                name="cca_prefill_fused_hip_cca",
+                cpp_sources=[_pfused_cpp_wrapper],
+                cuda_sources=[_pfused_cuda_src],
+                extra_cflags=_pfused_extra,
+                extra_cuda_cflags=_pfused_extra,
+                verbose=False,
+            )
+            _cpp_cca_prefill_fused_fn = _pfused_mod.cca_prefill_fused_hip
+            logger.info("Loaded C++ cca_prefill_fused_hip kernel from %s",
+                        _pfused_kernel_path)
+        else:
+            logger.info("CCA prefill fused kernel source not found at %s",
+                        _pfused_kernel_path)
+    except Exception as e:
+        logger.warning("Failed to compile CCA prefill fused kernel: %s", e)
+
+
+def cca_prefill_fused_hip_available():
+    """Return True when the HIP/CUDA prefill fused kernel is ready."""
+    return _cpp_cca_prefill_fused_fn is not None
+
+
+def cca_prefill_fused_hip(
+    hs_p,                # [T, 1, H]
+    qk_packed0_p,        # [T, 1, E]
+    prev_hs,             # [num_cache, H]  — mutated
+    conv_states,         # [num_cache, E, state_len]  — mutated
+    query_start_loc_p,   # [num_prefills + 1]
+    has_initial_states_p,# [num_prefills]
+    state_indices_p,     # [num_prefills]
+    dw_weight,           # [E, K0]
+    dw_bias,             # [E] or None
+    gw_weight,           # [G, D, D, K1]
+    gw_bias,             # [G, D]
+):
+    """HIP/CUDA fused CCA prefill (3 kernel launches, no intermediate buffer).
+
+    Returns (hs2, qk_packed3_p) both shaped [T, 1, ...].
+    """
+    assert _cpp_cca_prefill_fused_fn is not None, (
+        "cca_prefill_fused_hip called but C++ kernel not loaded.")
+    device = hs_p.device
+    T = hs_p.shape[0]
+    num_prefills = query_start_loc_p.shape[0] - 1
+
+    query_start_loc_p = query_start_loc_p.to(device=device, dtype=torch.int64)
+    state_indices_p = state_indices_p.to(device=device, dtype=torch.int64)
+
+    seq_lens = query_start_loc_p[1:] - query_start_loc_p[:-1]
+    req_idx = torch.repeat_interleave(
+        torch.arange(num_prefills, device=device, dtype=torch.int32),
+        seq_lens.int(),
+    )
+    has_init_i32 = has_initial_states_p.to(device=device, dtype=torch.int32)
+
+    hs_p_2d = hs_p[:, 0, :].contiguous()
+    qk_p_2d = qk_packed0_p[:, 0, :].contiguous()
+
+    hs2_2d, qk3_2d = _cpp_cca_prefill_fused_fn(
+        hs_p_2d, qk_p_2d,
+        prev_hs, conv_states,
+        query_start_loc_p,
+        has_init_i32,
+        state_indices_p,
+        req_idx,
+        dw_weight.contiguous(),
+        dw_bias.contiguous() if dw_bias is not None else None,
+        gw_weight.contiguous(),
+        gw_bias.contiguous() if gw_bias is not None else None,
+    )
+    return hs2_2d.unsqueeze(1), qk3_2d.unsqueeze(1)
+
 
 @triton.jit()
 def _causal_conv1d_update_kernel(
@@ -331,7 +445,7 @@ def grouped_conv1d_decode(x, weight, bias=None):
 
 def cca_decode_fused_available():
     """Return True when the fused CCA decode kernel is compiled and ready."""
-    return _CCA_FUSED_ENABLED and _cpp_cca_fused_fn is not None
+    return _CCA_FUSED_ENABLED and _cpp_cca_decode_fused_fn is not None
 
 
 def cca_decode_fused(
@@ -353,11 +467,11 @@ def cca_decode_fused(
     Returns [B, G*D] with query/key heads already L2-normalised, scaled, and
     temperature-applied.
 
-    Requires VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_FUSED_KERNEL_PATH set.
+    Requires VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_DECODE_FUSED_KERNEL_PATH set.
     """
-    assert _cpp_cca_fused_fn is not None, (
+    assert _cpp_cca_decode_fused_fn is not None, (
         "cca_decode_fused called but C++ kernel not loaded. "
-        "Set VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_FUSED_KERNEL_PATH."
+        "Set VLLM_CCA_FUSED_ENABLED=1 and VLLM_CCA_DECODE_FUSED_KERNEL_PATH."
     )
     if _CCA_FUSED_SHAPE_DEBUG:
         logger.info(
@@ -375,7 +489,7 @@ def cca_decode_fused(
             tuple(temp.shape),
         )
 
-    out = _cpp_cca_fused_fn(
+    out = _cpp_cca_decode_fused_fn(
         new_token.contiguous(),
         dw_weight.contiguous(),
         dw_bias.contiguous() if dw_bias is not None else None,
@@ -484,6 +598,274 @@ def run_causal_conv1d_update(
     return out
 
 
+# ---------------------------------------------------------------------------
+# CCA prefill fused kernels (Triton fallback)
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _cca_prefill_hs2_shift_kernel(
+    hs_p_ptr,           # [T, H]  (hs_p squeezed to 2-D)
+    prev_hs_ptr,        # [num_cache, H]
+    hs2_ptr,            # [T, H]  output
+    query_start_loc_ptr,   # [num_prefills + 1]
+    has_initial_ptr,       # [num_prefills]
+    state_indices_ptr,     # [num_prefills]
+    req_idx_ptr,           # [T]  maps token -> request index
+    T: tl.constexpr,
+    H: tl.constexpr,
+    stride_hs_t: tl.constexpr,
+    stride_prev_row: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    pid_t = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    if pid_t >= T:
+        return
+
+    ch = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = ch < H
+
+    req_i = tl.load(req_idx_ptr + pid_t).to(tl.int32)
+    start_i = tl.load(query_start_loc_ptr + req_i).to(tl.int64)
+    slot = tl.load(state_indices_ptr + req_i).to(tl.int64)
+
+    is_first = (pid_t == start_i)
+    has_init = tl.load(has_initial_ptr + req_i)
+
+    use_prev = is_first & has_init
+
+    prev_val = tl.load(prev_hs_ptr + slot * stride_prev_row + ch,
+                       mask=mask & use_prev, other=0.0).to(tl.float32)
+    shift_val = tl.load(hs_p_ptr + tl.maximum(pid_t - 1, 0) * stride_hs_t + ch,
+                        mask=mask & (~is_first), other=0.0).to(tl.float32)
+    val = tl.where(is_first, prev_val, shift_val)
+
+    tl.store(hs2_ptr + pid_t * stride_hs_t + ch, val, mask=mask)
+
+    end_i = tl.load(query_start_loc_ptr + req_i + 1).to(tl.int64)
+    is_last = (pid_t == end_i - 1)
+    last_val = tl.load(hs_p_ptr + pid_t * stride_hs_t + ch,
+                       mask=mask & is_last, other=0.0)
+    tl.store(prev_hs_ptr + slot * stride_prev_row + ch, last_val,
+             mask=mask & is_last)
+
+
+@triton.jit
+def _cca_prefill_dw_conv1d_kernel(
+    qk_p_ptr,           # [T, E]  (qk_packed0_p squeezed to 2-D)
+    dw_weight_ptr,       # [E, 2]
+    dw_bias_ptr,         # [E]
+    conv_state_ptr,      # [num_cache, E, state_len]
+    dw_out_ptr,          # [T + num_prefills, E]  intermediate
+    query_start_loc_ptr, # [num_prefills + 1]
+    has_initial_ptr,     # [num_prefills]
+    state_indices_ptr,   # [num_prefills]
+    dw_start_loc_ptr,    # [num_prefills]  start offset in dw_out per request
+    num_prefills: tl.constexpr,
+    E: tl.constexpr,
+    state_len: tl.constexpr,
+    stride_qk_t: tl.constexpr,
+    stride_cs_row: tl.constexpr,
+    stride_cs_ch: tl.constexpr,
+    stride_cs_tok: tl.constexpr,
+    stride_dw_t: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_E: tl.constexpr,
+):
+    pid_req = tl.program_id(0)
+    pid_ch = tl.program_id(1)
+    if pid_req >= num_prefills:
+        return
+
+    ch = pid_ch * BLOCK_E + tl.arange(0, BLOCK_E)
+    mask = ch < E
+
+    start_i = tl.load(query_start_loc_ptr + pid_req).to(tl.int64)
+    end_i = tl.load(query_start_loc_ptr + pid_req + 1).to(tl.int64)
+    s_cur = end_i - start_i
+    slot = tl.load(state_indices_ptr + pid_req).to(tl.int64)
+    dw_start = tl.load(dw_start_loc_ptr + pid_req).to(tl.int64)
+    has_init = tl.load(has_initial_ptr + pid_req)
+
+    w0 = tl.load(dw_weight_ptr + ch * 2 + 0, mask=mask, other=0.0).to(tl.float32)
+    w1 = tl.load(dw_weight_ptr + ch * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+    if HAS_BIAS:
+        bias = tl.load(dw_bias_ptr + ch, mask=mask, other=0.0).to(tl.float32)
+    else:
+        bias = tl.zeros((BLOCK_E,), dtype=tl.float32)
+
+    if has_init:
+        prev_val = tl.load(
+            conv_state_ptr + slot * stride_cs_row + ch * stride_cs_ch
+            + 0 * stride_cs_tok,
+            mask=mask, other=0.0).to(tl.float32)
+        curr_val = tl.load(
+            conv_state_ptr + slot * stride_cs_row + ch * stride_cs_ch
+            + 1 * stride_cs_tok,
+            mask=mask, other=0.0).to(tl.float32)
+    else:
+        prev_val = tl.zeros((BLOCK_E,), dtype=tl.float32)
+        curr_val = tl.zeros((BLOCK_E,), dtype=tl.float32)
+
+    y0 = bias + w0 * prev_val + w1 * curr_val
+    tl.store(dw_out_ptr + dw_start * stride_dw_t + ch, y0, mask=mask)
+
+    for t in range(s_cur):
+        prev_val = curr_val
+        curr_val = tl.load(qk_p_ptr + (start_i + t) * stride_qk_t + ch,
+                           mask=mask, other=0.0).to(tl.float32)
+        y = bias + w0 * prev_val + w1 * curr_val
+        tl.store(dw_out_ptr + (dw_start + 1 + t) * stride_dw_t + ch,
+                 y, mask=mask)
+
+    tl.store(conv_state_ptr + slot * stride_cs_row + ch * stride_cs_ch
+             + 0 * stride_cs_tok, prev_val, mask=mask)
+    tl.store(conv_state_ptr + slot * stride_cs_row + ch * stride_cs_ch
+             + 1 * stride_cs_tok, curr_val, mask=mask)
+
+
+@triton.jit
+def _cca_prefill_grouped_conv1d_kernel(
+    dw_out_ptr,          # [T + num_prefills, E]  intermediate from dw conv
+    gw_weight_ptr,       # [G, D, D, 2]
+    gw_bias_ptr,         # [G, D]
+    out_ptr,             # [T, E]  final output
+    dw_token_offset_ptr, # [T]  maps output token -> intermediate position
+    G: tl.constexpr,
+    D: tl.constexpr,
+    E: tl.constexpr,
+    stride_dw_t: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    T: tl.constexpr,
+):
+    i_t = tl.program_id(0)
+    i_g = tl.program_id(1)
+    if i_t >= T:
+        return
+
+    c_out = tl.arange(0, D)
+    c_in = tl.arange(0, D)
+
+    dw_pos = tl.load(dw_token_offset_ptr + i_t).to(tl.int64)
+
+    x_base_hist = dw_out_ptr + dw_pos * stride_dw_t + i_g * D
+    x_base_curr = dw_out_ptr + (dw_pos + 1) * stride_dw_t + i_g * D
+    x_hist = tl.load(x_base_hist + c_in, mask=None).to(tl.float32)
+    x_curr = tl.load(x_base_curr + c_in, mask=None).to(tl.float32)
+
+    w_base = gw_weight_ptr + i_g * D * D * 2
+    w_off_hist = c_out[:, None] * D * 2 + c_in[None, :] * 2 + 0
+    w_off_curr = c_out[:, None] * D * 2 + c_in[None, :] * 2 + 1
+    w_hist = tl.load(w_base + w_off_hist, mask=None).to(tl.float32)
+    w_curr = tl.load(w_base + w_off_curr, mask=None).to(tl.float32)
+
+    acc = tl.sum(w_hist * x_hist[None, :], axis=1) \
+        + tl.sum(w_curr * x_curr[None, :], axis=1)
+
+    if HAS_BIAS:
+        acc += tl.load(gw_bias_ptr + i_g * D + c_out, mask=None).to(tl.float32)
+
+    tl.store(out_ptr + i_t * stride_out_t + i_g * D + c_out, acc, mask=None)
+
+
+def cca_prefill_fused(
+    hs_p,                # [T, 1, H]
+    qk_packed0_p,        # [T, 1, E]
+    prev_hs,             # [num_cache, H]  — mutated
+    conv_states,         # [num_cache, E, state_len]  — mutated
+    query_start_loc_p,   # [num_prefills + 1]  (CPU or GPU int64)
+    has_initial_states_p,# [num_prefills]
+    state_indices_p,     # [num_prefills]
+    dw_weight,           # [E, K0]  (flattened depthwise weight)
+    dw_bias,             # [E] or None
+    gw_weight,           # [G, D, D, K1]  (flattened grouped weight)
+    gw_bias,             # [G, D]
+):
+    """Fused CCA prefill: hs2-shift + depthwise conv1d + grouped conv1d.
+
+    Replaces the Python for-loop over prefill requests with three parallel
+    Triton kernels.  Mutates *prev_hs* and *conv_states* in-place.
+
+    Returns (hs2, qk_packed3_p) both shaped [T, 1, ...].
+    """
+    device = hs_p.device
+    T = hs_p.shape[0]
+    H = hs_p.shape[2]
+    E = qk_packed0_p.shape[2]
+    num_prefills = query_start_loc_p.shape[0] - 1
+    G = gw_weight.shape[0]
+    D = gw_weight.shape[1]
+
+    query_start_loc_p = query_start_loc_p.to(device=device)
+    has_initial_states_p = has_initial_states_p.to(device=device)
+    state_indices_p = state_indices_p.to(device=device, dtype=torch.int64)
+
+    seq_lens = query_start_loc_p[1:] - query_start_loc_p[:-1]
+    req_idx = torch.repeat_interleave(
+        torch.arange(num_prefills, device=device, dtype=torch.int32),
+        seq_lens.int(),
+    )
+
+    hs_p_2d = hs_p[:, 0, :].contiguous()
+    qk_p_2d = qk_packed0_p[:, 0, :].contiguous()
+
+    hs2_2d = torch.empty((T, H), device=device, dtype=hs_p.dtype)
+
+    BLOCK_H = 128
+    grid_hs2 = (T, triton.cdiv(H, BLOCK_H))
+    _cca_prefill_hs2_shift_kernel[grid_hs2](
+        hs_p_2d, prev_hs, hs2_2d,
+        query_start_loc_p, has_initial_states_p, state_indices_p,
+        req_idx,
+        T=T, H=H,
+        stride_hs_t=hs_p_2d.stride(0),
+        stride_prev_row=prev_hs.stride(0),
+        BLOCK_H=BLOCK_H,
+    )
+
+    dw_start_loc = query_start_loc_p[:-1] + torch.arange(
+        num_prefills, device=device, dtype=query_start_loc_p.dtype)
+    total_dw = T + num_prefills
+    dw_out = torch.empty((total_dw, E), device=device, dtype=hs_p.dtype)
+
+    BLOCK_E = 128
+    grid_dw = (num_prefills, triton.cdiv(E, BLOCK_E))
+    cs_strides = conv_states.stride()
+    _cca_prefill_dw_conv1d_kernel[grid_dw](
+        qk_p_2d, dw_weight, dw_bias, conv_states, dw_out,
+        query_start_loc_p, has_initial_states_p, state_indices_p,
+        dw_start_loc,
+        num_prefills=num_prefills,
+        E=E,
+        state_len=conv_states.shape[2],
+        stride_qk_t=qk_p_2d.stride(0),
+        stride_cs_row=cs_strides[0],
+        stride_cs_ch=cs_strides[1],
+        stride_cs_tok=cs_strides[2],
+        stride_dw_t=dw_out.stride(0),
+        HAS_BIAS=(dw_bias is not None),
+        BLOCK_E=BLOCK_E,
+    )
+
+    dw_token_offset = torch.arange(T, device=device, dtype=torch.int64) + req_idx.long()
+    qk3_2d = torch.empty((T, E), device=device, dtype=hs_p.dtype)
+
+    grid_gw = (T, G)
+    _cca_prefill_grouped_conv1d_kernel[grid_gw](
+        dw_out, gw_weight, gw_bias, qk3_2d,
+        dw_token_offset,
+        G=G, D=D, E=E,
+        stride_dw_t=dw_out.stride(0),
+        stride_out_t=qk3_2d.stride(0),
+        HAS_BIAS=(gw_bias is not None),
+        T=T,
+    )
+
+    hs2 = hs2_2d.unsqueeze(1)
+    qk_packed3_p = qk3_2d.unsqueeze(1)
+    return hs2, qk_packed3_p
 
 
 

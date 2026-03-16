@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -32,7 +33,12 @@ from vllm.v1.attention.backends.cca_attn import (
 from vllm.model_executor.layers.mamba.ops import (
     run_causal_conv1d_update, grouped_conv1d_decode,
     cca_decode_fused_available, cca_decode_fused,
+    cca_prefill_fused,
+    cca_prefill_fused_hip_available, cca_prefill_fused_hip,
 )
+
+_CCA_FUSED_ENABLED = os.environ.get(
+    "VLLM_CCA_FUSED_ENABLED", "0").lower() in ("1", "true", "yes")
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
@@ -586,35 +592,53 @@ class CCA(MambaBase, CustomOp):
         decode_is_pad: Optional[torch.Tensor] = None
 
         if has_prefill:
-            # Prefill
-            hs2 = torch.zeros((num_prefill_tokens, batch_size, self.hidden_size), device=hs.device, dtype=hs.dtype)
-            qk_packed3_p = torch.zeros((num_prefill_tokens, batch_size, self.in_out_ch), device=hs.device, dtype=hs.dtype)
-            for i in range(len(query_start_loc_p) - 1):
-                start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
-                hs2_cur = hs_p[start_i:end_i, :, :] # [S_cur, B, H]
-                qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]  # [S_cur, B, H]    
-                qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)  # [1, H, S_cur]
-                
-                if has_initial_states_p[i]:
-                    hs2_cached = prev_hs[state_indices_tensor_p[i]].unsqueeze(0).unsqueeze(0) # [1, 1, H]
-                    hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0) # [S_cur, 1, H]
-                    qk_packed0_cached = conv_states[state_indices_tensor_p[i]].unsqueeze(0) # [1, H, total_padding]
-                    qk_packed2_cur = torch.cat([qk_packed0_cached, qk_packed1_cur], dim=-1) # [1, H, S_cur + total_padding]
+            if _CCA_FUSED_ENABLED:
+                _prefill_args = (
+                    hs_p, qk_packed0_p,
+                    prev_hs, conv_states,
+                    query_start_loc_p, has_initial_states_p,
+                    state_indices_tensor_p,
+                    self.dw_weight_flat,
+                    self.conv_qk[0].bias,
+                    self.gw_weight_flat,
+                    self.gw_bias_flat,
+                )
+                if cca_prefill_fused_hip_available():
+                    hs2, qk_packed3_p = cca_prefill_fused_hip(
+                        *_prefill_args)
                 else:
-                    hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 0, 0, 1, 0))
-                    qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
+                    hs2, qk_packed3_p = cca_prefill_fused(*_prefill_args)
+                qk_packed3_output_list.append(qk_packed3_p)
+                hs2_output_list.append(hs2)
+            else:
+                hs2 = torch.zeros((num_prefill_tokens, batch_size, self.hidden_size), device=hs.device, dtype=hs.dtype)
+                qk_packed3_p = torch.zeros((num_prefill_tokens, batch_size, self.in_out_ch), device=hs.device, dtype=hs.dtype)
+                for i in range(len(query_start_loc_p) - 1):
+                    start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
+                    hs2_cur = hs_p[start_i:end_i, :, :] # [S_cur, B, H]
+                    qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]  # [S_cur, B, H]    
+                    qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)  # [1, H, S_cur]
                     
-                hs2[start_i:end_i] = hs2_cur
+                    if has_initial_states_p[i]:
+                        hs2_cached = prev_hs[state_indices_tensor_p[i]].unsqueeze(0).unsqueeze(0) # [1, 1, H]
+                        hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0) # [S_cur, 1, H]
+                        qk_packed0_cached = conv_states[state_indices_tensor_p[i]].unsqueeze(0) # [1, H, total_padding]
+                        qk_packed2_cur = torch.cat([qk_packed0_cached, qk_packed1_cur], dim=-1) # [1, H, S_cur + total_padding]
+                    else:
+                        hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 0, 0, 1, 0))
+                        qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
+                        
+                    hs2[start_i:end_i] = hs2_cur
 
-                conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(conv_states.device)
-                
-                # Computing conv
-                qk_packed3_cur = self.conv_qk(qk_packed2_cur).permute(2, 0, 1)  # [S, B, E]
-                qk_packed3_p[start_i:end_i] = qk_packed3_cur
-            qk_packed3_output_list.append(qk_packed3_p)
-            hs2_output_list.append(hs2)
-            prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(prev_hs.device)
+                    conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
+                    conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(conv_states.device)
+                    
+                    # Computing conv
+                    qk_packed3_cur = self.conv_qk(qk_packed2_cur).permute(2, 0, 1)  # [S, B, E]
+                    qk_packed3_p[start_i:end_i] = qk_packed3_cur
+                qk_packed3_output_list.append(qk_packed3_p)
+                hs2_output_list.append(hs2)
+                prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(prev_hs.device)
 
         _fused_decode_active = False
         if has_decode:
