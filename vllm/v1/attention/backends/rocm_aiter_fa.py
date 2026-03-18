@@ -56,6 +56,8 @@ if current_platform.is_rocm():
         head_size,
         x,
         max_block_num,
+        kc_block_stride,
+        vc_block_stride,
         DEQUANT: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         CACHE_FORMAT: tl.constexpr,
@@ -87,13 +89,13 @@ if current_platform.is_rocm():
             # V: [num_blocks, page_size, num_head, head_dim]
             key_cache_ptr_offset = (
                 key_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * kc_block_stride
                 + slot_id * num_heads * head_size
                 + head_id * head_size
             )
             value_cache_ptr_offset = (
                 value_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * vc_block_stride
                 + slot_id * num_heads * head_size
                 + head_id * head_size
             )
@@ -115,13 +117,13 @@ if current_platform.is_rocm():
             # V: [num_blocks, num_head, page_size // x, head_dim, x]
             key_cache_ptr_offset = (
                 key_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * kc_block_stride
                 + head_id * head_size * PAGE_SIZE
                 + slot_id * x
             )
             value_cache_ptr_offset = (
                 value_cache_ptr
-                + block_id * num_heads * head_size * PAGE_SIZE
+                + block_id * vc_block_stride
                 + head_id * head_size * PAGE_SIZE
                 + (slot_id // x) * head_size * x
                 + slot_id % x
@@ -167,6 +169,8 @@ if current_platform.is_rocm():
         )
         page_size = key_cache.shape[1]
         num_heads = key_cache.shape[2]
+        kc_block_stride = key_cache.stride(0)
+        vc_block_stride = value_cache.stride(0)
 
         grid = lambda meta: (total_tokens, num_heads)
         cp_mha_gather_cache_kernel[grid](
@@ -184,6 +188,8 @@ if current_platform.is_rocm():
             head_dim,
             x,
             block_tables.size(1),
+            kc_block_stride,
+            vc_block_stride,
             DEQUANT=dequant,
             PAGE_SIZE=page_size,
             CACHE_FORMAT=kv_cache_layout,
