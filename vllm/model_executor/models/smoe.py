@@ -445,12 +445,14 @@ class SMoExperts(nn.Module):
             self.ep_size = self.tp_size * self.dp_size
             self.tp_size = 1
 
-            self.local_num_experts, self.expert_map, _ = determine_expert_map(
-                ep_size=self.ep_size,
-                ep_rank=self.ep_rank,
-                global_num_experts=self.global_num_experts,
-                expert_placement_strategy=vllm_config.parallel_config.expert_placement_strategy,
-            )
+            self.local_num_experts, self.expert_map, self.expert_mask = \
+                determine_expert_map(
+                    ep_size=self.ep_size,
+                    ep_rank=self.ep_rank,
+                    global_num_experts=self.global_num_experts,
+                    expert_placement_strategy=vllm_config.parallel_config.expert_placement_strategy,
+                    return_expert_mask=VLLM_ROCM_USE_AITER_MOE,
+                )
         else:
             # Overriding this for now
             # self.tp_rank = tp_rank + self.tp_size * self.dp_rank
@@ -461,6 +463,7 @@ class SMoExperts(nn.Module):
             self.ep_size = 1
             self.local_num_experts = self.global_num_experts
             self.expert_map = None
+            self.expert_mask = None
 
         self.intermediate_size = ffn_hidden_size // self.tp_size
         self.ffn_hidden_size_out = self.intermediate_size // 2
@@ -534,7 +537,7 @@ class SMoExperts(nn.Module):
                 fc1_smooth_scale=self.fc1_smooth_scale,
                 fc2_smooth_scale=self.fc2_smooth_scale,
                 a16=True,
-                expert_mask=self.expert_map,
+                expert_mask=self.expert_mask,
                 activation_method=0,
             )
         elif VLLM_ROCM_USE_AITER_MOE:
@@ -542,7 +545,7 @@ class SMoExperts(nn.Module):
                 hidden_states, self.ws, self.w2s,
                 topk_weights, topk_ids,
                 activation="silu",
-                expert_map=self.expert_map,
+                expert_map=self.expert_mask,
                 output_dtype=hidden_states.dtype,
             )
         else:

@@ -177,6 +177,27 @@ class CudaCommunicator(DeviceCommunicatorBase):
             torch.distributed.all_reduce(out, group=self.device_group)
         return out
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        world_size = self.world_size
+        pynccl_comm = self.pynccl_comm
+        assert pynccl_comm is not None
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+        output_size = (input_size[0] * world_size,) + input_size[1:]
+        output_tensor = torch.empty(
+            output_size, dtype=input_.dtype, device=input_.device
+        )
+        pynccl_comm.all_gather(output_tensor, input_)
+        output_tensor = output_tensor.reshape((world_size,) + input_size)
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim]
+            + (world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
+        return output_tensor
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
