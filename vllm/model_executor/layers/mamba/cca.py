@@ -35,10 +35,15 @@ from vllm.model_executor.layers.mamba.ops import (
     cca_decode_fused_available, cca_decode_fused,
     cca_prefill_fused,
     cca_prefill_fused_hip_available, cca_prefill_fused_hip,
+    fused_pad_gather_scatter,
+    fused_qk_mean,
 )
 
 _CCA_FUSED_ENABLED = os.environ.get(
     "VLLM_CCA_FUSED_ENABLED", "0").lower() in ("1", "true", "yes")
+
+_CCA_TRITON_FUSION_ENABLED = os.environ.get(
+    "VLLM_CCA_TRITON_FUSION_ENABLED", "0").lower() in ("1", "true", "yes")
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
@@ -548,20 +553,24 @@ class CCA(MambaBase, CustomOp):
         k = self.linear_k(hs)  # [S, B, latent_k_dim]
         qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
 
-        # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
-        query_pre = qk_packed0[..., :self.latent_q_dim].view(
-            *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
-        )  # [S, B, qh, dh]
-
-        key_pre = qk_packed0[..., self.latent_q_dim:].view(
-            *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
-        )  # [S, B, kh, dh]
-        key_pre = key_pre.unsqueeze(-2).repeat(1, 1, 1, self.gqa_groups, 1) \
-                          .view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)  # [S, B, qh, dh]
-
-        # Means for residual mixing (identical to Megatron)
-        qk_mean_q = (query_pre + key_pre) / 2
-        qk_mean_k = qk_mean_q.view(*qk_mean_q.shape[:2], self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
+        if _CCA_TRITON_FUSION_ENABLED:
+            qk_mean_q, qk_mean_k = fused_qk_mean(
+                qk_packed0, self.num_q_heads, self.num_k_heads,
+                self.head_dim, self.gqa_groups,
+            )
+        else:
+            query_pre = qk_packed0[..., :self.latent_q_dim].view(
+                *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
+            )
+            key_pre = qk_packed0[..., self.latent_q_dim:].view(
+                *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
+            )
+            key_pre = key_pre.unsqueeze(-2).repeat(1, 1, 1, self.gqa_groups, 1) \
+                              .view(*qk_packed0.shape[:2], self.num_q_heads, self.head_dim)
+            qk_mean_q = (query_pre + key_pre) / 2
+            qk_mean_k = qk_mean_q.view(
+                *qk_mean_q.shape[:2], self.num_k_heads, self.gqa_groups, -1
+            ).mean(dim=-2)
 
         # # NOTE: V1 puts decode before prefill
         # # Separate prefill and decode by splitting varlen input
@@ -647,28 +656,33 @@ class CCA(MambaBase, CustomOp):
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
 
-            # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
-            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
-            # block_id=0 reserved for safe indexing (see vllm/v1/core/block_pool.py)
-            safe_decode_indices = torch.where(
-                decode_is_pad,
-                torch.zeros_like(state_indices_tensor_d),
-                state_indices_tensor_d,
-            )
-            # hs2 and prev_hs updates are common to both fused and unfused paths
-            hs_d = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                hs_d.new_zeros(()),
-                hs_d,
-            )
-            hs2_d = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
-            hs2_d = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                hs2_d.new_zeros(()),
-                hs2_d,
-            )
+            if _CCA_TRITON_FUSION_ENABLED:
+                # Fused: pad detection + prev_hs gather/scatter
+                hs2_d, decode_is_pad = fused_pad_gather_scatter(
+                    state_indices_tensor_d, hs_d, prev_hs,
+                )
+            else:
+                # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
+                decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+                # block_id=0 reserved for safe indexing (see vllm/v1/core/block_pool.py)
+                safe_decode_indices = torch.where(
+                    decode_is_pad,
+                    torch.zeros_like(state_indices_tensor_d),
+                    state_indices_tensor_d,
+                )
+                hs_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    hs_d.new_zeros(()),
+                    hs_d,
+                )
+                hs2_d = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
+                hs2_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    hs2_d.new_zeros(()),
+                    hs2_d,
+                )
+                prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
             hs2_output_list.insert(0, hs2_d)
-            prev_hs[state_indices_tensor_d] = hs_d[:, 0, :].to(prev_hs.device)
 
             if cca_decode_fused_available():
                 # ── Fused decode path ──

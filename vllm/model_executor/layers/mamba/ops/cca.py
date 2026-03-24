@@ -443,6 +443,209 @@ def grouped_conv1d_decode(x, weight, bias=None):
     return _grouped_conv1d_decode_triton(x, weight, bias)
 
 
+# ---------------------------------------------------------------------------
+# Fused pad detection + hs_d zeroing + prev_hs gather/scatter.
+# Replaces 6 separate kernel launches with 1 in the decode path.
+# Controlled by VLLM_CCA_PAD_SLOTS_FUSED_ENABLED (default: disabled).
+# ---------------------------------------------------------------------------
+@triton.jit
+def _fused_pad_gather_scatter_kernel(
+    state_indices_ptr,
+    hs_d_ptr,
+    prev_hs_ptr,
+    hs2_d_out_ptr,
+    decode_is_pad_ptr,
+    H: tl.constexpr,
+    HS_D_STRIDE0,
+    PREV_HS_STRIDE0,
+    PAD_SLOT_ID: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    slot_id = tl.program_id(0)
+    h_block_id = tl.program_id(1)
+
+    h_offs = h_block_id * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = h_offs < H
+
+    state_idx = tl.load(state_indices_ptr + slot_id).to(tl.int64)
+    is_valid = (state_idx != PAD_SLOT_ID)
+    is_pad = (state_idx == PAD_SLOT_ID)
+    safe_idx = tl.where(is_valid, state_idx, 0).to(tl.int64)
+
+    if h_block_id == 0:
+        tl.store(decode_is_pad_ptr + slot_id, is_pad)
+
+    valid_mask = h_mask & is_valid
+
+    hs_val = tl.load(
+        hs_d_ptr + slot_id * HS_D_STRIDE0 + h_offs, mask=valid_mask, other=0.0,
+    )
+
+    prev_hs_row_off = safe_idx * PREV_HS_STRIDE0
+    hs2_val = tl.load(
+        prev_hs_ptr + prev_hs_row_off + h_offs, mask=valid_mask, other=0.0,
+    )
+    tl.store(hs2_d_out_ptr + slot_id * H + h_offs, hs2_val, mask=h_mask)
+
+    tl.store(
+        prev_hs_ptr + prev_hs_row_off + h_offs, hs_val, mask=valid_mask,
+    )
+
+
+def fused_pad_gather_scatter(
+    state_indices,   # [S], int64
+    hs_d,            # [S, 1, H]
+    prev_hs,         # [num_blocks, H]  — modified in-place (scatter)
+):
+    """Fused pad handling for the CCA decode path.
+
+    Returns (hs2_d_out, decode_is_pad):
+        hs2_d_out:     [S, 1, H]  gathered from prev_hs, zeroed for pads
+        decode_is_pad: [S]        boolean pad mask
+    Also scatters valid (non-pad) hs_d rows into prev_hs in-place.
+    """
+    S = state_indices.shape[0]
+    H = hs_d.shape[2]
+
+    hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=hs_d.dtype)
+    decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
+
+    BLOCK_H = 128
+    grid = (S, triton.cdiv(H, BLOCK_H))
+
+    _fused_pad_gather_scatter_kernel[grid](
+        state_indices,
+        hs_d,
+        prev_hs,
+        hs2_d_out,
+        decode_is_pad,
+        H=H,
+        HS_D_STRIDE0=hs_d.stride(0),
+        PREV_HS_STRIDE0=prev_hs.stride(0),
+        PAD_SLOT_ID=-1,
+        BLOCK_H=BLOCK_H,
+    )
+
+    return (
+        hs2_d_out.unsqueeze(1),
+        decode_is_pad,
+    )
+
+
+
+
+# ---------------------------------------------------------------------------
+# Fused qk_mean kernel
+# ---------------------------------------------------------------------------
+# Replaces 5 GPU kernels (repeat/expand + add + div + reduce mean) with one.
+#
+# Input:  qk_packed0 [S, B, latent_q_dim + latent_k_dim]  (bf16/fp16/fp32)
+# Output: qk_mean_q  [S, B, num_q_heads, head_dim]        (same dtype)
+#         qk_mean_k  [S, B, num_k_heads, head_dim]        (same dtype)
+#
+# For each (s, b, kh) where kh in [0, num_k_heads):
+#   key_slice = qk_packed0[s, b, latent_q_dim + kh*head_dim : ... + (kh+1)*head_dim]
+#   For g in [0, gqa_groups):
+#     qh = kh * gqa_groups + g
+#     query_slice = qk_packed0[s, b, qh*head_dim : (qh+1)*head_dim]
+#     qk_mean_q[s, b, qh, :] = (query_slice + key_slice) / 2
+#   qk_mean_k[s, b, kh, :] = mean over g of qk_mean_q[s, b, kh*gqa+g, :]
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_qk_mean_kernel(
+    qk_ptr,            # [S*B, latent_q + latent_k]
+    qk_mean_q_ptr,     # [S*B, num_q_heads, head_dim]
+    qk_mean_k_ptr,     # [S*B, num_k_heads, head_dim]
+    LATENT_Q: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_K_HEADS: tl.constexpr,
+    GQA_GROUPS: tl.constexpr,
+    STRIDE_QK_ROW,
+    STRIDE_MQ_ROW,
+    STRIDE_MK_ROW,
+    BLOCK_D: tl.constexpr,
+):
+    pid_sb = tl.program_id(0)
+    pid_kh = tl.program_id(1)
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < HEAD_DIM
+
+    key_off = LATENT_Q + pid_kh * HEAD_DIM
+    key_val = tl.load(
+        qk_ptr + pid_sb * STRIDE_QK_ROW + key_off + d_offs,
+        mask=d_mask, other=0.0,
+    ).to(tl.float32)
+
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for g in range(GQA_GROUPS):
+        qh = pid_kh * GQA_GROUPS + g
+        q_off = qh * HEAD_DIM
+        q_val = tl.load(
+            qk_ptr + pid_sb * STRIDE_QK_ROW + q_off + d_offs,
+            mask=d_mask, other=0.0,
+        ).to(tl.float32)
+
+        mean_q = (q_val + key_val) * 0.5
+        acc += mean_q
+
+        tl.store(
+            qk_mean_q_ptr + pid_sb * STRIDE_MQ_ROW + qh * HEAD_DIM + d_offs,
+            mean_q,
+            mask=d_mask,
+        )
+
+    mean_k = acc / GQA_GROUPS
+    tl.store(
+        qk_mean_k_ptr + pid_sb * STRIDE_MK_ROW + pid_kh * HEAD_DIM + d_offs,
+        mean_k,
+        mask=d_mask,
+    )
+
+
+def fused_qk_mean(qk_packed0, num_q_heads, num_k_heads, head_dim, gqa_groups):
+    """Compute qk_mean_q and qk_mean_k in a single fused Triton kernel.
+
+    Args:
+        qk_packed0: [S, B, latent_q_dim + latent_k_dim]
+        num_q_heads, num_k_heads, head_dim, gqa_groups: int scalars
+
+    Returns:
+        qk_mean_q: [S, B, num_q_heads, head_dim]
+        qk_mean_k: [S, B, num_k_heads, head_dim]
+    """
+    S, B, _ = qk_packed0.shape
+    latent_q = num_q_heads * head_dim
+
+    qk_flat = qk_packed0.reshape(S * B, -1)
+    qk_mean_q = torch.empty(S * B, num_q_heads, head_dim,
+                             device=qk_packed0.device, dtype=qk_packed0.dtype)
+    qk_mean_k = torch.empty(S * B, num_k_heads, head_dim,
+                             device=qk_packed0.device, dtype=qk_packed0.dtype)
+
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    grid = (S * B, num_k_heads)
+
+    _fused_qk_mean_kernel[grid](
+        qk_flat,
+        qk_mean_q,
+        qk_mean_k,
+        LATENT_Q=latent_q,
+        HEAD_DIM=head_dim,
+        NUM_K_HEADS=num_k_heads,
+        GQA_GROUPS=gqa_groups,
+        STRIDE_QK_ROW=qk_flat.stride(0),
+        STRIDE_MQ_ROW=qk_mean_q.stride(0),
+        STRIDE_MK_ROW=qk_mean_k.stride(0),
+        BLOCK_D=BLOCK_D,
+    )
+
+    return (qk_mean_q.view(S, B, num_q_heads, head_dim),
+            qk_mean_k.view(S, B, num_k_heads, head_dim))
+
+
 def cca_decode_fused_available():
     """Return True when the fused CCA decode kernel is compiled and ready."""
     return _CCA_FUSED_ENABLED and _cpp_cca_decode_fused_fn is not None
