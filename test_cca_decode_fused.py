@@ -536,8 +536,15 @@ def main():
     # benchmark_fused(fused_fn, ref_cca_decode_fused, device,
     #                 B=4, G=24, D=128, num_q_heads=16)
 
-    benchmark_fused(fused_fn, ref_triton_cca_decode_fused, device,
-                    B=128, G=10, D=128, num_q_heads=8)
+    print("\n  --- Production shape: G=10 D=128 ---")
+    for bs in [128, 64, 32, 16]:
+        benchmark_fused(fused_fn, ref_triton_cca_decode_fused, device,
+                        B=bs, G=10, D=128, num_q_heads=8)
+
+    print("\n  --- Large shape: G=24 D=128 ---")
+    for bs in [128, 64, 32, 16]:
+        benchmark_fused(fused_fn, ref_triton_cca_decode_fused, device,
+                        B=bs, G=24, D=128, num_q_heads=16)
 
     print("\nDone.")
 
