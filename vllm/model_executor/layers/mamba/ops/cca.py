@@ -196,8 +196,8 @@ def cca_prefill_fused_hip_available():
 
 
 def cca_prefill_fused_hip(
-    hs_p,                # [T, 1, H]
-    qk_packed0_p,        # [T, 1, E]
+    hs_p,                # [T, H]
+    qk_packed0_p,        # [T, E]
     prev_hs,             # [num_cache, H]  — mutated
     conv_states,         # [num_cache, E, state_len]  — mutated
     query_start_loc_p,   # [num_prefills + 1]
@@ -210,7 +210,7 @@ def cca_prefill_fused_hip(
 ):
     """HIP/CUDA fused CCA prefill (3 kernel launches, no intermediate buffer).
 
-    Returns (hs2, qk_packed3_p) both shaped [T, 1, ...].
+    Returns (hs2, qk_packed3_p) both shaped [T, ...].
     """
     assert _cpp_cca_prefill_fused_fn is not None, (
         "cca_prefill_fused_hip called but C++ kernel not loaded.")
@@ -228,8 +228,8 @@ def cca_prefill_fused_hip(
     )
     has_init_i32 = has_initial_states_p.to(device=device, dtype=torch.int32)
 
-    hs_p_2d = hs_p[:, 0, :].contiguous()
-    qk_p_2d = qk_packed0_p[:, 0, :].contiguous()
+    hs_p_2d = hs_p.contiguous()
+    qk_p_2d = qk_packed0_p.contiguous()
 
     hs2_2d, qk3_2d = _cpp_cca_prefill_fused_fn(
         hs_p_2d, qk_p_2d,
@@ -243,7 +243,7 @@ def cca_prefill_fused_hip(
         gw_weight.contiguous(),
         gw_bias.contiguous() if gw_bias is not None else None,
     )
-    return hs2_2d.unsqueeze(1), qk3_2d.unsqueeze(1)
+    return hs2_2d, qk3_2d
 
 
 @triton.jit()
@@ -494,18 +494,18 @@ def _fused_pad_gather_scatter_kernel(
 
 def fused_pad_gather_scatter(
     state_indices,   # [S], int64
-    hs_d,            # [S, 1, H]
+    hs_d,            # [S, H]
     prev_hs,         # [num_blocks, H]  — modified in-place (scatter)
 ):
     """Fused pad handling for the CCA decode path.
 
     Returns (hs2_d_out, decode_is_pad):
-        hs2_d_out:     [S, 1, H]  gathered from prev_hs, zeroed for pads
-        decode_is_pad: [S]        boolean pad mask
+        hs2_d_out:     [S, H]  gathered from prev_hs, zeroed for pads
+        decode_is_pad: [S]     boolean pad mask
     Also scatters valid (non-pad) hs_d rows into prev_hs in-place.
     """
     S = state_indices.shape[0]
-    H = hs_d.shape[2]
+    H = hs_d.shape[-1]
 
     hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=hs_d.dtype)
     decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
@@ -527,7 +527,7 @@ def fused_pad_gather_scatter(
     )
 
     return (
-        hs2_d_out.unsqueeze(1),
+        hs2_d_out,
         decode_is_pad,
     )
 
@@ -539,17 +539,17 @@ def fused_pad_gather_scatter(
 # ---------------------------------------------------------------------------
 # Replaces 5 GPU kernels (repeat/expand + add + div + reduce mean) with one.
 #
-# Input:  qk_packed0 [S, B, latent_q_dim + latent_k_dim]  (bf16/fp16/fp32)
-# Output: qk_mean_q  [S, B, num_q_heads, head_dim]        (same dtype)
-#         qk_mean_k  [S, B, num_k_heads, head_dim]        (same dtype)
+# Input:  qk_packed0 [S, latent_q_dim + latent_k_dim]  (bf16/fp16/fp32)
+# Output: qk_mean_q  [S, num_q_heads, head_dim]        (same dtype)
+#         qk_mean_k  [S, num_k_heads, head_dim]        (same dtype)
 #
-# For each (s, b, kh) where kh in [0, num_k_heads):
-#   key_slice = qk_packed0[s, b, latent_q_dim + kh*head_dim : ... + (kh+1)*head_dim]
+# For each (s, kh) where kh in [0, num_k_heads):
+#   key_slice = qk_packed0[s, latent_q_dim + kh*head_dim : ... + (kh+1)*head_dim]
 #   For g in [0, gqa_groups):
 #     qh = kh * gqa_groups + g
-#     query_slice = qk_packed0[s, b, qh*head_dim : (qh+1)*head_dim]
-#     qk_mean_q[s, b, qh, :] = (query_slice + key_slice) / 2
-#   qk_mean_k[s, b, kh, :] = mean over g of qk_mean_q[s, b, kh*gqa+g, :]
+#     query_slice = qk_packed0[s, qh*head_dim : (qh+1)*head_dim]
+#     qk_mean_q[s, qh, :] = (query_slice + key_slice) / 2
+#   qk_mean_k[s, kh, :] = mean over g of qk_mean_q[s, kh*gqa+g, :]
 # ---------------------------------------------------------------------------
 
 @triton.jit
@@ -609,24 +609,24 @@ def fused_qk_mean(qk_packed0, num_q_heads, num_k_heads, head_dim, gqa_groups):
     """Compute qk_mean_q and qk_mean_k in a single fused Triton kernel.
 
     Args:
-        qk_packed0: [S, B, latent_q_dim + latent_k_dim]
+        qk_packed0: [S, latent_q_dim + latent_k_dim]
         num_q_heads, num_k_heads, head_dim, gqa_groups: int scalars
 
     Returns:
-        qk_mean_q: [S, B, num_q_heads, head_dim]
-        qk_mean_k: [S, B, num_k_heads, head_dim]
+        qk_mean_q: [S, num_q_heads, head_dim]
+        qk_mean_k: [S, num_k_heads, head_dim]
     """
-    S, B, _ = qk_packed0.shape
+    S = qk_packed0.shape[0]
     latent_q = num_q_heads * head_dim
 
-    qk_flat = qk_packed0.reshape(S * B, -1)
-    qk_mean_q = torch.empty(S * B, num_q_heads, head_dim,
+    qk_flat = qk_packed0.reshape(S, -1)
+    qk_mean_q = torch.empty(S, num_q_heads, head_dim,
                              device=qk_packed0.device, dtype=qk_packed0.dtype)
-    qk_mean_k = torch.empty(S * B, num_k_heads, head_dim,
+    qk_mean_k = torch.empty(S, num_k_heads, head_dim,
                              device=qk_packed0.device, dtype=qk_packed0.dtype)
 
     BLOCK_D = triton.next_power_of_2(head_dim)
-    grid = (S * B, num_k_heads)
+    grid = (S, num_k_heads)
 
     _fused_qk_mean_kernel[grid](
         qk_flat,
@@ -642,8 +642,8 @@ def fused_qk_mean(qk_packed0, num_q_heads, num_k_heads, head_dim, gqa_groups):
         BLOCK_D=BLOCK_D,
     )
 
-    return (qk_mean_q.view(S, B, num_q_heads, head_dim),
-            qk_mean_k.view(S, B, num_k_heads, head_dim))
+    return (qk_mean_q.view(S, num_q_heads, head_dim),
+            qk_mean_k.view(S, num_k_heads, head_dim))
 
 
 def cca_decode_fused_available():
@@ -974,8 +974,8 @@ def _cca_prefill_grouped_conv1d_kernel(
 
 
 def cca_prefill_fused(
-    hs_p,                # [T, 1, H]
-    qk_packed0_p,        # [T, 1, E]
+    hs_p,                # [T, H]
+    qk_packed0_p,        # [T, E]
     prev_hs,             # [num_cache, H]  — mutated
     conv_states,         # [num_cache, E, state_len]  — mutated
     query_start_loc_p,   # [num_prefills + 1]  (CPU or GPU int64)
@@ -991,12 +991,12 @@ def cca_prefill_fused(
     Replaces the Python for-loop over prefill requests with three parallel
     Triton kernels.  Mutates *prev_hs* and *conv_states* in-place.
 
-    Returns (hs2, qk_packed3_p) both shaped [T, 1, ...].
+    Returns (hs2, qk_packed3_p) both shaped [T, ...].
     """
     device = hs_p.device
     T = hs_p.shape[0]
-    H = hs_p.shape[2]
-    E = qk_packed0_p.shape[2]
+    H = hs_p.shape[-1]
+    E = qk_packed0_p.shape[-1]
     num_prefills = query_start_loc_p.shape[0] - 1
     G = gw_weight.shape[0]
     D = gw_weight.shape[1]
@@ -1011,8 +1011,8 @@ def cca_prefill_fused(
         seq_lens.int(),
     )
 
-    hs_p_2d = hs_p[:, 0, :].contiguous()
-    qk_p_2d = qk_packed0_p[:, 0, :].contiguous()
+    hs_p_2d = hs_p.contiguous()
+    qk_p_2d = qk_packed0_p.contiguous()
 
     hs2_2d = torch.empty((T, H), device=device, dtype=hs_p.dtype)
 
@@ -1066,9 +1066,7 @@ def cca_prefill_fused(
         T=T,
     )
 
-    hs2 = hs2_2d.unsqueeze(1)
-    qk_packed3_p = qk3_2d.unsqueeze(1)
-    return hs2, qk_packed3_p
+    return hs2_2d, qk3_2d
 
 
 
