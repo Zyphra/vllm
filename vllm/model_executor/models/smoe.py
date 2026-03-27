@@ -72,7 +72,6 @@ class ResidualScaling(nn.Module):
                 residual = (residual + self.residual_bias.expand(1, -1)) * self.residual_scale.expand(1, -1)
         return residual, hidden_states
 
-
 class SMoEAttention(nn.Module):
     def __init__(
         self,
@@ -100,27 +99,28 @@ class SMoEAttention(nn.Module):
         # self.qkv_size = self.hidden_size // tp_size
         self.attention_dropout = config.attention_dropout
 
-        # TODO: clean up the config
-        self.cca_num_k_heads = 2
-        self.cca_num_q_heads = 8
-        self.cca_num_heads = 16
+        # Derive CCA dimensions from config (supports both SMoE and BMOE)
+        nah_list = getattr(config, "num_attention_heads_list", None)
+        cca_q_list = getattr(config, "cca_num_q_heads", None)
+        self.cca_num_heads = next((h for h in nah_list if h > 0), config.num_attention_heads) if nah_list else 16
+        self.cca_num_k_heads = getattr(config, "num_key_value_heads", 2)
+        cca_num_q_heads_config = max(cca_q_list) if cca_q_list else 8
+        global_head_dim = config.hidden_size // config.num_attention_heads
+        self.cca_hidden_size = self.cca_num_heads * global_head_dim
+        self.head_dim = global_head_dim
+        self.cca_num_q_heads = cca_num_q_heads_config * self.cca_hidden_size // config.hidden_size
+        self.q_head_expand = cca_num_q_heads_config // self.cca_num_q_heads
+        self.o_proj_in = cca_num_q_heads_config * self.head_dim
         self.cca_time0 = 2
         self.cca_time1 = 2
-        self.head_dim = self.hidden_size // self.cca_num_heads
         self.scale = self.head_dim**-0.5
 
-        # if (self.head_dim * self.total_num_heads) != self.hidden_size:
-        #     raise ValueError(
-        #         f"hidden_size must be divisible by num_heads (got `hidden_size`: {self.hidden_size}"
-        #         f" and `num_heads`: {self.total_num_heads})."
-        #     )
-        
         self.qkv = CCA(
             config=config,
             cca_num_k_heads=self.cca_num_k_heads,
             cca_num_q_heads=self.cca_num_q_heads,
             cca_num_heads=self.cca_num_heads,
-            hidden_size=self.hidden_size,
+            hidden_size=self.cca_hidden_size,
             cca_time0=self.cca_time0,
             cca_time1=self.cca_time1,
             layer_number=layer_n,
@@ -130,28 +130,36 @@ class SMoEAttention(nn.Module):
             use_triton=VLLM_CCA_TRITON,
             prefix=f"{prefix_name}.cca",
         )
-        self.o_proj = ReplicatedLinear(self.cca_num_q_heads * self.head_dim,
+        self.o_proj = ReplicatedLinear(self.o_proj_in,
                                        self.hidden_size,
                                        bias=self.config.attention_bias,
                                        quant_config=quant_config,
                                        return_bias=False,
                                        prefix=f"{prefix_name}.o_proj")            
 
+        swa_layers = getattr(config, "swa_layers", None)
+        swa_window = swa_layers[layer_n] if swa_layers is not None else None
+        is_swa = swa_window is not None and swa_window != 0
+
         self.attn = Attention(
             self.cca_num_q_heads,
             self.head_dim,
             self.scale,
             self.cca_num_k_heads,
+            per_layer_sliding_window=swa_window if is_swa else None,
             cache_config=cache_config,
             prefix=f"{prefix_name}.attn",
         )
+
+        rope_theta = (getattr(config, "swa_rotary_base", config.rotary_base)
+                      if is_swa else config.rotary_base)
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
             max_position=config.max_position_embeddings,
             is_neox_style=True,
             rope_parameters={
-                "rope_theta": config.rotary_base,
+                "rope_theta": rope_theta,
                 "rope_type": "default",
                 "partial_rotary_factor": 0.5,
             },
@@ -168,12 +176,17 @@ class SMoEAttention(nn.Module):
         position_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         
-        output_qkv = torch.zeros((hidden_states.shape[0], self.qkv_dim), device=hidden_states.device, dtype=hidden_states.dtype)
+        cca_input = hidden_states[..., :self.cca_hidden_size] if self.cca_hidden_size < self.hidden_size else hidden_states
+        output_qkv = torch.zeros((cca_input.shape[0], self.qkv_dim), device=cca_input.device, dtype=cca_input.dtype)
         if not VLLM_DISABLE_CCA_QKV:
-            self.qkv(hidden_states, output_qkv)
+            self.qkv(cca_input, output_qkv)
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
-        attn_output = self.attn(q, k, v)     
+        attn_output = self.attn(q, k, v)
+        if self.q_head_expand > 1:
+            attn_output = attn_output.view(-1, self.cca_num_q_heads, self.head_dim)
+            attn_output = attn_output.repeat_interleave(self.q_head_expand, dim=-2)
+            attn_output = attn_output.reshape(-1, self.o_proj_in)
         attn_output = self.o_proj(attn_output)     
 
         return attn_output
@@ -659,6 +672,7 @@ class SMoEModel(nn.Module):
 
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
+
         if residual is not None:
             hidden_states += residual
         hidden_states = self.final_norm(hidden_states)
@@ -687,12 +701,23 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
         parallel_config = vllm_config.parallel_config
         hf_config = vllm_config.model_config.hf_config
 
-        # TODO: make these configurable
-        conv_kernel_size = 2
-        num_k_heads = 2
-        num_q_heads = 8
-        head_dim = 128
-        hidden_size = hf_config.hidden_size
+        cca_time0 = 2
+        cca_time1 = 2
+        conv_kernel_size = (cca_time0 - 1) + (cca_time1 - 1)
+
+        num_k_heads = getattr(hf_config, "num_key_value_heads", 2)
+
+        cca_q_list = getattr(hf_config, "cca_num_q_heads", None)
+        cca_num_q_heads_config = max(cca_q_list) if cca_q_list else 8
+
+        nah_list = getattr(hf_config, "num_attention_heads_list", None)
+        cca_num_heads = (next((h for h in nah_list if h > 0),
+                              hf_config.num_attention_heads)
+                         if nah_list else hf_config.num_attention_heads)
+
+        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        cca_hidden_size = cca_num_heads * head_dim
+        num_q_heads = cca_num_q_heads_config * cca_hidden_size // hf_config.hidden_size
 
         return MambaStateShapeCalculator.cca_state_shape(
             tp_world_size=parallel_config.tensor_parallel_size,
@@ -700,7 +725,7 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
             num_k_heads=num_k_heads,
             num_q_heads=num_q_heads,
             head_dim=head_dim,
-            hidden_size=hidden_size,
+            hidden_size=cca_hidden_size,
         )
 
     @classmethod

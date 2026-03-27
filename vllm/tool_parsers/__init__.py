@@ -150,6 +150,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "functiongemma_tool_parser",
         "FunctionGemmaToolParser",
     ),
+    "smoe_xml": (
+        "smoe_xml_tool_parser",
+        "SMOEXMLToolParser",
+    ),
 }
 
 

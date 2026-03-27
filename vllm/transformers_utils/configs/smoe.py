@@ -49,7 +49,10 @@ class SMoEConfig(PretrainedConfig):
         sliding_window=None,
         clamp_temp=False,
         num_key_value_heads=2,
+        kv_channels=None,
         mamba_chunk_size=16,
+        swa_layers = None,
+        swa_rotary_base = None,
         chunk_size=16,
         ignore_mod_in_smoe_block=False, # Make sure you understand to enable this only when the model is really not using MoD even though MoD is technically included
         **kwargs,
@@ -68,7 +71,7 @@ class SMoEConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         assert self.hidden_size % self.num_attention_heads == 0
-        self.kv_channels = self.hidden_size // self.num_attention_heads
+        self.kv_channels = kv_channels if kv_channels is not None else self.hidden_size // self.num_attention_heads
         self.num_key_value_heads = num_key_value_heads
         self.activation_func = activation_func
         self.max_position_embeddings = max_position_embeddings
@@ -113,6 +116,8 @@ class SMoEConfig(PretrainedConfig):
         self.ignore_mod_in_smoe_block = ignore_mod_in_smoe_block
         self.mamba_chunk_size = mamba_chunk_size
         self.chunk_size = chunk_size
+        self.swa_layers = swa_layers
+        self.swa_rotary_base = swa_rotary_base
 
         super().__init__(
             pad_token_id=pad_token_id,
