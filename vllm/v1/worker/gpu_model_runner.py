@@ -3115,16 +3115,6 @@ class GPUModelRunner(
             else len(self.input_batch.lora_id_to_lora_request)
         )
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
-        kv_cache_config = getattr(self, "kv_cache_config", None)
-        disable_piecewise = (
-            uniform_decode
-            and kv_cache_config is not None
-            and any(
-                isinstance(kv_cache_group.kv_cache_spec, MambaSpec)
-                for kv_cache_group in kv_cache_config.kv_cache_groups
-            )
-        )
-
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         dispatch_cudagraph = (
             lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
@@ -3132,7 +3122,6 @@ class GPUModelRunner(
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
                 disable_full=disable_full,
-                disable_piecewise=disable_piecewise,
                 num_active_loras=num_active_loras,
             )
             if not force_eager
