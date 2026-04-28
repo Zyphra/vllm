@@ -506,7 +506,8 @@ def fused_pad_gather_scatter(
     S = state_indices.shape[0]
     H = hs_d.shape[-1]
 
-    hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=hs_d.dtype)
+    hs_d_cast = hs_d.to(dtype=prev_hs.dtype) if hs_d.dtype != prev_hs.dtype else hs_d
+    hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=prev_hs.dtype)
     decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
 
     BLOCK_H = 128
@@ -514,12 +515,12 @@ def fused_pad_gather_scatter(
 
     _fused_pad_gather_scatter_kernel[grid](
         state_indices,
-        hs_d,
+        hs_d_cast,
         prev_hs,
         hs2_d_out,
         decode_is_pad,
         H=H,
-        HS_D_STRIDE0=hs_d.stride(0),
+        HS_D_STRIDE0=hs_d_cast.stride(0),
         PREV_HS_STRIDE0=prev_hs.stride(0),
         PAD_SLOT_ID=-1,
         BLOCK_H=BLOCK_H,
@@ -1287,7 +1288,6 @@ def cca_prefill_fused(
 
 #     return out_q, out_k, out_qn, out_kn
 
-# # Autotune configurations - experiment with different block sizes
 # # Autotune configurations - experiment with different block sizes
 # configs = [
 #     Config({"BLOCK_BT":1}, num_warps =4),

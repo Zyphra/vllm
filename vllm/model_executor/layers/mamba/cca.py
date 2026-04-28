@@ -45,6 +45,9 @@ _CCA_FUSED_ENABLED = os.environ.get(
 _CCA_TRITON_FUSION_ENABLED = os.environ.get(
     "VLLM_CCA_TRITON_FUSION_ENABLED", "0").lower() in ("1", "true", "yes")
 
+_CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
+    "CCA_DIM_PRESERVE_CONV", "0").lower() in ("1", "true", "yes")
+
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
     def __init__(
@@ -135,19 +138,16 @@ class CCA(MambaBase, CustomOp):
             ),
         )
 
-
-        dim, _, kernel_width = self.conv_qk[0].weight.shape
-        groups = self.num_k_heads + self.num_q_heads
-        head_dim = dim // groups
-
-        self.dw_weight_flat = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
-        self.gw_weight_flat = self.conv_qk[1].weight.reshape(groups, head_dim, -1, kernel_width).contiguous()
-        self.gw_bias_flat = self.conv_qk[1].bias.reshape(groups, -1).contiguous()
-
         self._gw_weight_T = None
+        self.refresh_runtime_weight_views()
 
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
+
+        if _CCA_DIM_PRESERVE_CONV_ENABLED:
+            self._decode_conv = self.conv_qk_dim_preserve
+        else:
+            self._decode_conv = self._conv_qk_apply
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
@@ -155,6 +155,98 @@ class CCA(MambaBase, CustomOp):
         compilation_config.static_forward_context[prefix] = self
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
 
+    def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
+        x_fp32 = x.to(torch.float32)
+
+        def _conv1d_fp32(module: nn.Conv1d, inp: torch.Tensor) -> torch.Tensor:
+            bias = None if module.bias is None else module.bias.to(torch.float32)
+            return F.conv1d(
+                inp,
+                module.weight.to(torch.float32),
+                bias,
+                stride=module.stride,
+                padding=module.padding,
+                dilation=module.dilation,
+                groups=module.groups,
+            )
+
+        return _conv1d_fp32(self.conv_qk[1], _conv1d_fp32(self.conv_qk[0], x_fp32))
+
+    @torch.no_grad()
+    def refresh_runtime_weight_views(self) -> None:
+        """Refresh cached conv views after in-place runtime weight reloads."""
+        dim, _, kernel_width = self.conv_qk[0].weight.shape
+        groups = self.num_k_heads + self.num_q_heads
+        head_dim = dim // groups
+        self.dw_weight_flat = self.conv_qk[0].weight.reshape(
+            dim, kernel_width
+        ).contiguous()
+        self.gw_weight_flat = self.conv_qk[1].weight.reshape(
+            groups, head_dim, -1, kernel_width
+        ).contiguous()
+        self.gw_bias_flat = (
+            None
+            if self.conv_qk[1].bias is None
+            else self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+        )
+        self._gw_weight_T = None
+
+    def _rms_normalize_qk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        target_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        eps = 1e-12
+        sqrt_head_dim = float(self.sqrt_head_dim)
+
+        query_fp32 = query.to(torch.float32)
+        q_norm = query_fp32.norm(p=2, dim=-1, keepdim=True)
+        query_out = (
+            query_fp32 * torch.rsqrt(q_norm * q_norm + eps) * sqrt_head_dim
+        ).to(target_dtype)
+
+        key_fp32 = key.to(torch.float32)
+        k_norm = key_fp32.norm(p=2, dim=-1, keepdim=True)
+        temp = self.temp.to(torch.float32).view(1, self.num_k_heads, 1)
+        if self.config.clamp_temp:
+            temp = torch.exp(torch.clamp(temp, 1e-7, 2.0))
+        key_out = (
+            key_fp32 * torch.rsqrt(k_norm * k_norm + eps) * sqrt_head_dim * temp
+        ).to(target_dtype)
+
+        return query_out, key_out
+
+    def conv_qk_dim_preserve(self, x: torch.Tensor) -> torch.Tensor:
+        """Decode-time conv path that avoids layout-heavy cuDNN transforms."""
+        w0 = self.conv_qk[0].weight.squeeze(1)
+        b0 = self.conv_qk[0].bias
+
+        kernel0 = w0.shape[1]
+        seq = x.shape[2]
+        mid_len = seq - kernel0 + 1
+
+        mid = x[:, :, :mid_len] * w0[:, 0:1]
+        for k in range(1, kernel0):
+            mid = mid + x[:, :, k:k + mid_len] * w0[:, k:k + 1]
+        if b0 is not None:
+            mid = mid + b0[:, None]
+
+        w1 = self.conv_qk[1].weight
+        b1 = self.conv_qk[1].bias
+        groups = self.num_k_heads + self.num_q_heads
+        head_dim = self.head_dim
+        batch = x.shape[0]
+
+        mid_g = mid.view(batch, groups, head_dim, mid_len)
+        w1_g = w1.view(groups, head_dim, head_dim, w1.shape[2])
+        out_g = torch.einsum("godk,sgdk->sgo", w1_g.float(), mid_g.float()).to(
+            mid.dtype
+        )
+        if b1 is not None:
+            out_g = out_g + b1.view(1, groups, head_dim)
+
+        return out_g.reshape(batch, groups * head_dim, 1)
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -212,31 +304,28 @@ class CCA(MambaBase, CustomOp):
             key_pre = key_pre.unsqueeze(-2).repeat(1, 1, self.gqa_groups, 1) \
                             .view(S, self.num_q_heads, self.head_dim)  # [S, qh, dh]
 
-            qk_mean_q = (query_pre + key_pre) / 2
+            qk_mean_q = (query_pre.float() + key_pre.float()) / 2
             qk_mean_k = qk_mean_q.view(S, self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
 
             qk_packed1 = qk_packed0.T.unsqueeze(0)  # [1, E, S]
             qk_packed2 = F.pad(qk_packed1, (self.total_padding, 0))
-            qk_packed3 = self.conv_qk(qk_packed2)[0].T  # [S, E]
+            qk_packed3 = self._conv_qk_apply(qk_packed2).permute(2, 0, 1)  # [S, B, E]
 
             query = qk_packed3[..., :self.latent_q_dim].view(
                 S, self.num_q_heads, self.head_dim
-            ) + qk_mean_q  # [S, qh, dh]
+            ).float() + qk_mean_q
 
             key = qk_packed3[..., self.latent_q_dim:].view(
                 S, self.num_k_heads, self.head_dim
-            ) + qk_mean_k  # [S, kh, dh]
+            ).float() + qk_mean_k
 
             v1 = self.val_proj1(hs)   # [S, latent_k_dim/2]
             v2 = self.val_proj2(hs_d) # [S, latent_k_dim/2]
             value = torch.cat([v1, v2], dim=-1).contiguous() \
                         .view(S, self.num_k_heads, self.head_dim)  # [S, kh, dh]
 
-            query_norm = query.norm(p=2, dim=-1, keepdim=True)
-            key_norm   = key.norm(p=2,   dim=-1, keepdim=True)
-            key = (key * (self.sqrt_head_dim / key_norm)) * self.temp[None, :, None]
-            query = query * (self.sqrt_head_dim / query_norm)
-            
+            query, key = self._rms_normalize_qk(query, key, hs.dtype)
+
             return hs
 
         num_prefills = attn_metadata.num_prefills  # request count
@@ -263,7 +352,7 @@ class CCA(MambaBase, CustomOp):
         key_pre = key_pre.unsqueeze(-2).repeat(1, 1, self.gqa_groups, 1) \
                           .view(num_actual_tokens, self.num_q_heads, self.head_dim)  # [S, qh, dh]
 
-        qk_mean_q = (query_pre + key_pre) / 2
+        qk_mean_q = (query_pre.float() + key_pre.float()) / 2
         qk_mean_k = qk_mean_q.view(num_actual_tokens, self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
 
         # NOTE: V1 puts decode before prefill
@@ -306,9 +395,9 @@ class CCA(MambaBase, CustomOp):
                 qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
                 
                 if has_initial_states_p[i]:
-                    hs2_cached = prev_hs[state_indices_tensor_p[i]].unsqueeze(0)  # [1, H]
+                    hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                     hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
-                    qk_packed0_cached = conv_states[state_indices_tensor_p[i]].unsqueeze(0)  # [1, E, total_padding]
+                    qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]
                     qk_packed2_cur = torch.cat([qk_packed0_cached, qk_packed1_cur], dim=-1)  # [1, E, S_cur + total_padding]
                 else:
                     hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 1, 0))
@@ -317,14 +406,16 @@ class CCA(MambaBase, CustomOp):
                 hs2[start_i:end_i] = hs2_cur
 
                 conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(conv_states.device)
+                conv_states[state_indices_tensor_p[i]] = conv_states_cur.squeeze(0).to(
+                    device=conv_states.device, dtype=conv_states.dtype)
                 
-                qk_packed3_cur = self.conv_qk(qk_packed2_cur)[0].T  # [S_cur, E]
+                # Computing conv
+                qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
                 qk_packed3_p[start_i:end_i] = qk_packed3_cur
 
             qk_packed3_output_list.append(qk_packed3_p)
             hs2_output_list.append(hs2)
-            prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(prev_hs.device)
+            prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
 
         if has_decode:
             # Generation
@@ -354,7 +445,8 @@ class CCA(MambaBase, CustomOp):
             )
 
             qk_packed0_cat = torch.cat([qk_packed0_cached, qk_packed0_d.unsqueeze(-1)], dim=-1)  # [S, E, total_padding + 1]
-            qk_packed3_d = self.conv_qk(qk_packed0_cat).squeeze(-1)  # [S, E]
+            qk_packed3_d = self._decode_conv(qk_packed0_cat).squeeze(-1)  # [S, E]
+            # Zero out conv output for padded positions (conv bias adds non-zero values even with zero input)
             qk_packed3_d = torch.where(
                 decode_is_pad.view(-1, 1),
                 qk_packed3_d.new_zeros(()),
@@ -392,28 +484,23 @@ class CCA(MambaBase, CustomOp):
         qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
         hs2 = torch.vstack(hs2_output_list)[:num_actual_tokens]
 
-        v1 = self.val_proj1(hs)   # [S, latent_k_dim/2]
-        v2 = self.val_proj2(hs2)
+        # Values from the two time streams
+        v1 = self.val_proj1(hs)   # [S, B, latent_k_dim/2]
+        # Keep the recurrent cache in its configured dtype, but project in the
+        # model activation dtype so the GEMM input matches the bf16 weights.
+        v2 = self.val_proj2(hs2.to(dtype=hs.dtype))
         value = torch.cat([v1, v2], dim=-1).contiguous()
         value = value.view(num_actual_tokens, self.num_k_heads, self.head_dim)  # [S, kh, dh]
 
         query = qk_packed3[..., :self.latent_q_dim].view(
             num_actual_tokens, self.num_q_heads, self.head_dim
-        ) + qk_mean_q  # [S, qh, dh]
+        ).float() + qk_mean_q
 
         key = qk_packed3[..., self.latent_q_dim:].view(
             num_actual_tokens, self.num_k_heads, self.head_dim
-        ) + qk_mean_k  # [S, kh, dh]
+        ).float() + qk_mean_k
 
-        query_norm = query.norm(p=2, dim=-1, keepdim=True)
-        key_norm   = key.norm(p=2,   dim=-1, keepdim=True)
-
-        # temp: [kh] -> [1, kh, 1]
-        if self.config.clamp_temp:
-            key = (key * (self.sqrt_head_dim / key_norm)) * torch.exp(torch.clamp(self.temp[None, :, None], 0.0000001, 2))
-        else:
-            key = (key * (self.sqrt_head_dim / key_norm)) * self.temp[None, :, None]
-        query = query * (self.sqrt_head_dim / query_norm)
+        query, key = self._rms_normalize_qk(query, key, hs.dtype)
         
         query = query.reshape(num_actual_tokens, self.num_q_heads * self.head_dim)
         key   = key.reshape(num_actual_tokens, self.num_k_heads * self.head_dim)
@@ -475,31 +562,28 @@ class CCA(MambaBase, CustomOp):
             key_pre = key_pre.unsqueeze(-2).repeat(1, 1, self.gqa_groups, 1) \
                             .view(S, self.num_q_heads, self.head_dim)  # [S, qh, dh]
 
-            qk_mean_q = (query_pre + key_pre) / 2
+            qk_mean_q = (query_pre.float() + key_pre.float()) / 2
             qk_mean_k = qk_mean_q.view(S, self.num_k_heads, self.gqa_groups, -1).mean(dim=-2)
 
             qk_packed1 = qk_packed0.T.unsqueeze(0)  # [1, E, S]
             qk_packed2 = F.pad(qk_packed1, (self.total_padding, 0))
-            qk_packed3 = self.conv_qk(qk_packed2)[0].T  # [S, E]
+            qk_packed3 = self._conv_qk_apply(qk_packed2).permute(2, 0, 1)  # [S, B, E]
 
             query = qk_packed3[..., :self.latent_q_dim].view(
                 S, self.num_q_heads, self.head_dim
-            ) + qk_mean_q  # [S, qh, dh]
+            ).float() + qk_mean_q
 
             key = qk_packed3[..., self.latent_q_dim:].view(
                 S, self.num_k_heads, self.head_dim
-            ) + qk_mean_k  # [S, kh, dh]
+            ).float() + qk_mean_k
 
             v1 = self.val_proj1(hs)   # [S, latent_k_dim/2]
             v2 = self.val_proj2(hs_d) # [S, latent_k_dim/2]
             value = torch.cat([v1, v2], dim=-1).contiguous() \
                         .view(S, self.num_k_heads, self.head_dim)  # [S, kh, dh]
 
-            query_norm = query.norm(p=2, dim=-1, keepdim=True)
-            key_norm   = key.norm(p=2,   dim=-1, keepdim=True)
-            key = (key * (self.sqrt_head_dim / key_norm)) * self.temp[None, :, None]
-            query = query * (self.sqrt_head_dim / query_norm)
-            
+            query, key = self._rms_normalize_qk(query, key, hs.dtype)
+
             return hs
 
         num_prefills = attn_metadata.num_prefills  # request count
@@ -530,11 +614,10 @@ class CCA(MambaBase, CustomOp):
             )
             key_pre = key_pre.unsqueeze(-2).repeat(1, 1, self.gqa_groups, 1) \
                               .view(num_actual_tokens, self.num_q_heads, self.head_dim)
-            qk_mean_q = (query_pre + key_pre) / 2
+            qk_mean_q = (query_pre.float() + key_pre.float()) / 2
             qk_mean_k = qk_mean_q.view(
                 num_actual_tokens, self.num_k_heads, self.gqa_groups, -1
             ).mean(dim=-2)
-
         qk_packed0_d, qk_packed0_p = torch.split(
             qk_packed0[:num_actual_tokens],
             [num_decodes, num_prefill_tokens],
@@ -572,7 +655,17 @@ class CCA(MambaBase, CustomOp):
                     self.gw_weight_flat,
                     self.gw_bias_flat,
                 )
-                if cca_prefill_fused_hip_available():
+                use_hip_prefill_fused = (
+                    cca_prefill_fused_hip_available()
+                    and prev_hs.dtype == hs_p.dtype
+                    and conv_states.dtype == qk_packed0_p.dtype
+                    and self.dw_weight_flat.dtype == qk_packed0_p.dtype
+                    and self.gw_weight_flat.dtype == qk_packed0_p.dtype
+                    and (self.conv_qk[0].bias is None
+                         or self.conv_qk[0].bias.dtype == qk_packed0_p.dtype)
+                    and self.gw_bias_flat.dtype == qk_packed0_p.dtype
+                )
+                if use_hip_prefill_fused:
                     hs2, qk_packed3_p = cca_prefill_fused_hip(
                         *_prefill_args)
                 else:
@@ -589,9 +682,9 @@ class CCA(MambaBase, CustomOp):
                     qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
                     
                     if has_initial_states_p[i]:
-                        hs2_cached = prev_hs[state_indices_tensor_p[i]].unsqueeze(0)  # [1, H]
+                        hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                         hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
-                        qk_packed0_cached = conv_states[state_indices_tensor_p[i]].unsqueeze(0)  # [1, E, total_padding]
+                        qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]
                         qk_packed2_cur = torch.cat([qk_packed0_cached, qk_packed1_cur], dim=-1)  # [1, E, S_cur + total_padding]
                     else:
                         hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 1, 0))
@@ -600,13 +693,15 @@ class CCA(MambaBase, CustomOp):
                     hs2[start_i:end_i] = hs2_cur
 
                     conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                    conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(conv_states.device)
+                    conv_states[state_indices_tensor_p[i]] = conv_states_cur.squeeze(0).to(
+                        device=conv_states.device, dtype=conv_states.dtype)
                     
-                    qk_packed3_cur = self.conv_qk(qk_packed2_cur)[0].T  # [S_cur, E]
+                    # Computing conv
+                    qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
                     qk_packed3_p[start_i:end_i] = qk_packed3_cur
                 qk_packed3_output_list.append(qk_packed3_p)
                 hs2_output_list.append(hs2)
-                prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(prev_hs.device)
+                prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
 
         _fused_decode_active = False
         if has_decode:
@@ -633,9 +728,11 @@ class CCA(MambaBase, CustomOp):
                     hs2_d.new_zeros(()),
                     hs2_d,
                 )
-                prev_hs[state_indices_tensor_d] = hs_d.to(prev_hs.device)
+                prev_hs[state_indices_tensor_d] = hs_d.to(
+                    device=prev_hs.device, dtype=prev_hs.dtype)
             hs2_output_list.insert(0, hs2_d)
 
+            use_decode_fused = False
             if cca_decode_fused_available():
                 # ── Fused decode path ──
                 # Single kernel: depthwise conv1d update + grouped conv + qk_mean
@@ -658,28 +755,38 @@ class CCA(MambaBase, CustomOp):
                 qk_mean_q_d = qk_mean_q[:num_decodes]  # [B, qh, dh]
                 qk_mean_k_d = qk_mean_k[:num_decodes]  # [B, kh, dh]
                 qk_mean_packed = torch.cat(
-                    [qk_mean_q_d, qk_mean_k_d], dim=1).contiguous()
+                    [qk_mean_q_d, qk_mean_k_d], dim=1).contiguous().to(hs.dtype)
 
-                fused_out = cca_decode_fused(
-                    first_input,
-                    dw_weight,
-                    self.conv_qk[0].bias,
-                    conv_states,
-                    state_indices_tensor_d,
-                    gw_weight,
-                    gw_bias,
-                    qk_mean_packed,
-                    self.temp.data,
-                    self.num_q_heads,
-                    self.sqrt_head_dim,
-                    self.config.clamp_temp,
-                )  # [B, G*dh]
+                use_decode_fused = (
+                    conv_states.dtype == first_input.dtype
+                    and dw_weight.dtype == first_input.dtype
+                    and gw_weight.dtype == first_input.dtype
+                    and qk_mean_packed.dtype == first_input.dtype
+                    and (self.conv_qk[0].bias is None
+                         or self.conv_qk[0].bias.dtype == first_input.dtype)
+                    and (gw_bias is None or gw_bias.dtype == first_input.dtype)
+                )
+                if use_decode_fused:
+                    fused_out = cca_decode_fused(
+                        first_input,
+                        dw_weight,
+                        self.conv_qk[0].bias,
+                        conv_states,
+                        state_indices_tensor_d,
+                        gw_weight,
+                        gw_bias,
+                        qk_mean_packed,
+                        self.temp.data,
+                        self.num_q_heads,
+                        self.sqrt_head_dim,
+                        self.config.clamp_temp,
+                    )  # [B, G*dh]
 
-                _fused_query_d = fused_out[:, :self.latent_q_dim]   # [B, qh*dh]
-                _fused_key_d   = fused_out[:, self.latent_q_dim:]   # [B, kh*dh]
-                _fused_decode_active = True
+                    _fused_query_d = fused_out[:, :self.latent_q_dim]   # [B, qh*dh]
+                    _fused_key_d   = fused_out[:, self.latent_q_dim:]   # [B, kh*dh]
+                    _fused_decode_active = True
 
-            else:
+            if not use_decode_fused:
                 # ── Original unfused decode path ──
                 dim, _, kernel_width = self.conv_qk[0].weight.shape
                 weights = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()
@@ -714,8 +821,11 @@ class CCA(MambaBase, CustomOp):
                 qk_packed3_output_list.insert(0, qk_packed3_d)
         hs2 = torch.vstack(hs2_output_list)[:num_actual_tokens]
 
-        v1 = self.val_proj1(hs)   # [S, latent_k_dim/2]
-        v2 = self.val_proj2(hs2)
+        # Values from the two time streams
+        v1 = self.val_proj1(hs)   # [S, B, latent_k_dim/2]
+        # Keep the recurrent cache in its configured dtype, but project in the
+        # model activation dtype so the GEMM input matches the bf16 weights.
+        v2 = self.val_proj2(hs2.to(dtype=hs.dtype))
         value = torch.cat([v1, v2], dim=-1).contiguous()
         value = value.view(num_actual_tokens, self.num_k_heads, self.head_dim)  # [S, kh, dh]
 
@@ -740,24 +850,13 @@ class CCA(MambaBase, CustomOp):
                 qk_packed3_pf = qk_packed3_p.contiguous()
                 prefill_query = qk_packed3_pf[..., :self.latent_q_dim].view(
                     num_prefill_tokens, self.num_q_heads, self.head_dim
-                ) + qk_mean_q[num_decodes:]
+                ).float() + qk_mean_q[num_decodes:]
                 prefill_key = qk_packed3_pf[..., self.latent_q_dim:].view(
                     num_prefill_tokens, self.num_k_heads, self.head_dim
-                ) + qk_mean_k[num_decodes:]
+                ).float() + qk_mean_k[num_decodes:]
 
-                prefill_query_norm = prefill_query.norm(p=2, dim=-1, keepdim=True)
-                prefill_key_norm = prefill_key.norm(p=2, dim=-1, keepdim=True)
-
-                if self.config.clamp_temp:
-                    prefill_key = (
-                        prefill_key * (self.sqrt_head_dim / prefill_key_norm)
-                    ) * torch.exp(torch.clamp(self.temp[None, :, None],
-                                              0.0000001, 2))
-                else:
-                    prefill_key = (
-                        prefill_key * (self.sqrt_head_dim / prefill_key_norm)
-                    ) * self.temp[None, :, None]
-                prefill_query = prefill_query * (self.sqrt_head_dim / prefill_query_norm)
+                prefill_query, prefill_key = self._rms_normalize_qk(
+                    prefill_query, prefill_key, hs.dtype)
 
                 query[num_decodes:] = prefill_query.reshape(
                     num_prefill_tokens, self.latent_q_dim)
@@ -767,22 +866,12 @@ class CCA(MambaBase, CustomOp):
             qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
             query_h = qk_packed3[..., :self.latent_q_dim].view(
                 num_actual_tokens, self.num_q_heads, self.head_dim
-            ) + qk_mean_q  # [S, qh, dh]
+            ).float() + qk_mean_q
             key_h = qk_packed3[..., self.latent_q_dim:].view(
                 num_actual_tokens, self.num_k_heads, self.head_dim
-            ) + qk_mean_k  # [S, kh, dh]
+            ).float() + qk_mean_k
 
-            query_norm = query_h.norm(p=2, dim=-1, keepdim=True)
-            key_norm = key_h.norm(p=2, dim=-1, keepdim=True)
-
-            # temp: [kh] -> [1, kh, 1]
-            if self.config.clamp_temp:
-                key_h = (key_h * (self.sqrt_head_dim / key_norm)) * torch.exp(
-                    torch.clamp(self.temp[None, :, None], 0.0000001, 2))
-            else:
-                key_h = (key_h * (self.sqrt_head_dim / key_norm)) * self.temp[
-                    None, :, None]
-            query_h = query_h * (self.sqrt_head_dim / query_norm)
+            query_h, key_h = self._rms_normalize_qk(query_h, key_h, hs.dtype)
 
             query = query_h.reshape(num_actual_tokens, self.latent_q_dim)
             key = key_h.reshape(num_actual_tokens, self.latent_k_dim)

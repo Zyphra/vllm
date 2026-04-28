@@ -13,7 +13,6 @@ VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
-import torch
 from torch import nn
 
 from vllm.model_executor.layers.attention import Attention
@@ -35,7 +34,8 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.layernorm import RMSNorm
@@ -46,6 +46,21 @@ from vllm.transformers_utils.configs import SMoEConfig
 
 import logging
 logger = logging.getLogger(__name__)
+
+class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
+    """LM-head projection that returns fp32 logits via out_dtype."""
+
+    def apply(self, layer, x, bias=None):
+        if not torch.is_floating_point(x):
+            return super().apply(layer, x, bias)
+        # ROCm does not support bf16->fp32 torch.mm via out_dtype, so upcast
+        # operands explicitly and keep the logits accumulation in fp32.
+        out = torch.mm(x.to(torch.float32),
+                       layer.weight.t().to(torch.float32))
+        if bias is not None:
+            out = out + bias.to(torch.float32)
+        return out
+
 
 class ResidualScaling(nn.Module):
     def __init__(
@@ -67,11 +82,26 @@ class ResidualScaling(nn.Module):
             self.residual_bias = torch.nn.Parameter(torch.zeros(self.config.hidden_size))
 
     def forward(self, residual: torch.Tensor, hidden_states: torch.Tensor):
-        hidden_states = (hidden_states + self.hidden_states_bias.expand(1, -1)) * self.hidden_states_scale.expand(1, -1)
-        if self.not_first_layer:
-                residual = (residual + self.residual_bias.expand(1, -1)) * self.residual_scale.expand(1, -1)
+        hs_expand_shape = (1,) * (hidden_states.dim() - 1) + (-1,)
+        hs_bias = self.hidden_states_bias.to(torch.float32).view(*hs_expand_shape)
+        hs_scale = self.hidden_states_scale.to(torch.float32).view(*hs_expand_shape)
+        hidden_states = (hidden_states.float() + hs_bias) * hs_scale
+        if self.not_first_layer and residual is not None:
+            res_expand_shape = (1,) * (residual.dim() - 1) + (-1,)
+            res_bias = self.residual_bias.to(torch.float32).view(*res_expand_shape)
+            res_scale = self.residual_scale.to(torch.float32).view(*res_expand_shape)
+            residual = (residual.float() + res_bias) * res_scale
         return residual, hidden_states
 
+def _apply_norm_with_fp32_residual(norm: nn.Module, residual: torch.Tensor,
+                                   target_dtype: torch.dtype) -> torch.Tensor:
+    if isinstance(norm, RMSNorm):
+        if residual.dtype != norm.weight.dtype:
+            hidden_states = norm.forward_native(residual)
+        else:
+            hidden_states = norm(residual)
+        return hidden_states.to(target_dtype)
+    return norm(residual.to(target_dtype))
 class SMoEAttention(nn.Module):
     def __init__(
         self,
@@ -140,6 +170,9 @@ class SMoEAttention(nn.Module):
         swa_layers = getattr(config, "swa_layers", None)
         swa_window = swa_layers[layer_n] if swa_layers is not None else None
         is_swa = swa_window is not None and swa_window != 0
+
+        if is_swa:
+            swa_window = swa_window + 1
 
         self.attn = Attention(
             self.cca_num_q_heads,
@@ -236,14 +269,17 @@ class SMoEDecoderATTLayer(nn.Module):
         prev_router_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
+        layer_input_dtype = (self.input_norm.weight.dtype
+                             if isinstance(self.input_norm, RMSNorm) else
+                             hidden_states.dtype)
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)      
         if residual is not None:
-            residual += hidden_states
-            hidden_states = residual
+            residual = residual.float() + hidden_states.float()
         else:
-            residual = hidden_states
-        hidden_states = self.input_norm(residual)
+            residual = hidden_states.float()
+        hidden_states = _apply_norm_with_fp32_residual(self.input_norm, residual,
+                                                       layer_input_dtype)
         
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -290,6 +326,7 @@ class SMoERouter(nn.Module):
         self.layer_n = layer_n
         self.hidden_size = int(hidden_size or getattr(config, "hidden_size"))
         self.layer_number = layer_number if layer_number is not None else 0
+        self.router_softmax_fp32 = bool(getattr(config, "smoe_high_prec", False))
 
         # MOD 
         self.use_mod = bool(getattr(config, "smoe_use_mod", False))
@@ -372,7 +409,10 @@ class SMoERouter(nn.Module):
 
         # 3) Expert probability distribution
         logits = self.router_mlp(hs_norm)
-        expert_prob = torch.softmax(logits, dim=-1)
+        if self.router_softmax_fp32:
+            expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)
+        else:
+            expert_prob = torch.softmax(logits, dim=-1)
 
         # 4) Expert choice with balancing biases (biases affect choice only, not probabilities)
         biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
@@ -387,11 +427,14 @@ class SMoERouter(nn.Module):
 
         # Gather the probabilities for the selected experts
         route_prob = torch.gather(expert_prob, dim=1, index=expert_choice_t)
+        if route_prob.dtype != hidden_states.dtype:
+            route_prob = route_prob.to(hidden_states.dtype)
         
         expert_choice_flat = expert_choice_t.reshape(-1, self.topk)
         route_prob_flat = route_prob.reshape(-1, self.topk)
 
-        return route_prob_flat, expert_choice_flat, router_hidden_states_next
+        return (route_prob_flat, expert_choice_flat,
+                router_hidden_states_next.to(hidden_states.dtype))
 
 
 class SMoEBlock(nn.Module):
@@ -541,14 +584,17 @@ class SMoEDecoderMLPLayer(nn.Module):
         prev_router_hidden_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
 
+        layer_input_dtype = (self.input_norm.weight.dtype
+                             if isinstance(self.input_norm, RMSNorm) else
+                             hidden_states.dtype)
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)               
         if residual is not None:
-            residual += hidden_states
-            hidden_states = residual
+            residual = residual.float() + hidden_states.float()
         else:
-            residual = hidden_states
-        hidden_states = self.input_norm(hidden_states)  
+            residual = hidden_states.float()
+        hidden_states = _apply_norm_with_fp32_residual(self.input_norm, residual,
+                                                       layer_input_dtype)
 
         hidden_states, prev_router_hidden_states = self.smoe_block(hidden_states, prev_router_hidden_states)
 
@@ -672,10 +718,16 @@ class SMoEModel(nn.Module):
 
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)
-
+        final_input_dtype = (self.final_norm.weight.dtype
+                             if isinstance(self.final_norm, RMSNorm) else
+                             hidden_states.dtype)
         if residual is not None:
-            hidden_states += residual
-        hidden_states = self.final_norm(hidden_states)
+            hidden_states = hidden_states.float() + residual.float()
+        else:
+            hidden_states = hidden_states.float()
+        hidden_states = _apply_norm_with_fp32_residual(self.final_norm,
+                                                       hidden_states,
+                                                       final_input_dtype)
     
         return hidden_states
 
@@ -802,6 +854,9 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
                                                 config.vocab_size)
+
+        if bool(getattr(config, "smoe_high_prec", False)):
+            self.lm_head.quant_method = _FP32EmbeddingMethod()
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
