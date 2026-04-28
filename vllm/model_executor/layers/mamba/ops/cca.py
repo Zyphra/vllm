@@ -359,9 +359,8 @@ def _causal_conv1d_update_kernel(
 
     # Update state: roll(-1) then append new token
     # new_state[0] = old_state[1] (= x1), new_state[1] = new_token (= x2)
-    # (store as original dtype)
-    tl.store(conv_states_base + 0 * stride_conv_state_tok, x1.to(tl.bfloat16), mask=mask_c)
-    tl.store(conv_states_base + 1 * stride_conv_state_tok, x2.to(tl.bfloat16), mask=mask_c)
+    tl.store(conv_states_base + 0 * stride_conv_state_tok, x1, mask=mask_c)
+    tl.store(conv_states_base + 1 * stride_conv_state_tok, x2, mask=mask_c)
 
 
 @triton.jit

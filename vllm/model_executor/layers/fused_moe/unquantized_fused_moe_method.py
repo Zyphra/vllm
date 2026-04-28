@@ -106,7 +106,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> FusedMoEPrepareAndFinalize | None:
         if self.unquantized_backend == UnquantizedMoeBackend.AITER:
-            return None
+            if not self.moe.moe_parallel_config.use_all2all_kernels:
+                return None
+            return super().maybe_make_prepare_finalize(routing_tables)
         else:
             return super().maybe_make_prepare_finalize(routing_tables)
 
@@ -126,6 +128,16 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
                 quant_config=self.moe_quant_config,
                 max_num_tokens=self.moe.max_num_tokens,
                 num_dispatchers=prepare_finalize.num_dispatchers(),
+            )
+        elif self.unquantized_backend == UnquantizedMoeBackend.AITER:
+            from vllm.model_executor.layers.fused_moe.rocm_aiter_fused_moe import (
+                AiterExperts,
+            )
+
+            logger.debug("AiterExperts %s", self.moe)
+            return AiterExperts(
+                moe_config=self.moe,
+                quant_config=self.moe_quant_config,
             )
         else:
             logger.debug("TritonExperts %s", self.moe)
@@ -208,24 +220,32 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w2: torch.Tensor,
     ) -> None:
         # Shuffle weights to runtime format.
-        w13, w2 = convert_to_unquantized_kernel_format(
+        w13_new, w2_new = convert_to_unquantized_kernel_format(
             self.unquantized_backend,
             layer=layer,
             w13_weight=w13,
             w2_weight=w2,
         )
-        replace_parameter(layer, "w13_weight", w13)
-        replace_parameter(layer, "w2_weight", w2)
 
-        # Setup Modular Kernel for TP Case
-        self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-        assert self.moe_quant_config is not None
+        if self.kernel is not None:
+            # Subsequent call (weight update): copy shuffled data into existing
+            # tensors to preserve addresses used by captured CUDA graphs.
+            layer.w13_weight.data.copy_(w13_new)
+            layer.w2_weight.data.copy_(w2_new)
+        else:
+            # First call (initial load): replace parameters as usual.
+            replace_parameter(layer, "w13_weight", w13_new)
+            replace_parameter(layer, "w2_weight", w2_new)
+            
+            # Setup Modular Kernel for TP Case
+            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
+            assert self.moe_quant_config is not None
 
-        self.kernel = make_unquantized_moe_kernel(
-            backend=self.unquantized_backend,
-            quant_config=self.moe_quant_config,
-            moe_config=self.moe,
-        )
+            self.kernel = make_unquantized_moe_kernel(
+                backend=self.unquantized_backend,
+                quant_config=self.moe_quant_config,
+                moe_config=self.moe,
+            )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         super().process_weights_after_loading(layer)

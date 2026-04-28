@@ -40,7 +40,8 @@ __global__ void cca_prefill_hs2_shift_kernel(
     const int32_t*  __restrict__ has_initial,  // [num_prefills] (0/1)
     const int64_t*  __restrict__ state_idx,    // [num_prefills]
     const int32_t*  __restrict__ req_idx,      // [T]
-    const int T, const int H)
+    const int T, const int H,
+    const int64_t prev_hs_stride_row)
 {
     const int t = blockIdx.x;
     const int h = blockIdx.y * BLOCK_H + threadIdx.x;
@@ -54,7 +55,7 @@ __global__ void cca_prefill_hs2_shift_kernel(
     float val;
     if (t == static_cast<int>(start_i)) {
         val = has_initial[ri]
-            ? static_cast<float>(prev_hs[slot * H + h])
+            ? static_cast<float>(prev_hs[slot * prev_hs_stride_row + h])
             : 0.0f;
     } else {
         val = static_cast<float>(hs_p[(t - 1) * H + h]);
@@ -62,7 +63,7 @@ __global__ void cca_prefill_hs2_shift_kernel(
     hs2[t * H + h] = static_cast<scalar_t>(val);
 
     if (t == static_cast<int>(end_i - 1))
-        prev_hs[slot * H + h] = hs_p[t * H + h];
+        prev_hs[slot * prev_hs_stride_row + h] = hs_p[t * H + h];
 }
 
 // ====================================================================
@@ -91,7 +92,9 @@ cca_prefill_conv_fused_kernel(
     const int32_t*  __restrict__ req_idx,
     scalar_t*       __restrict__ output,       // [T, E]
     const int G, const int D, const int E,
-    const int state_len, const int T)
+    const int state_len, const int T,
+    const int64_t cs_stride_row,
+    const int64_t cs_stride_ch)
 {
     const int t_out = blockIdx.x;
     const int g     = blockIdx.y;
@@ -113,7 +116,7 @@ cca_prefill_conv_fused_kernel(
     auto load_padded = [&](int p) -> float {
         if (p < 2)
             return has_init
-                ? static_cast<float>(conv_state[slot * E * state_len + ch * state_len + p])
+                ? static_cast<float>(conv_state[slot * cs_stride_row + ch * cs_stride_ch + p])
                 : 0.0f;
         return static_cast<float>(qk_p[(start_i + p - 2) * E + ch]);
     };
@@ -197,7 +200,9 @@ __global__ void cca_prefill_state_save_kernel(
     const int64_t*  __restrict__ qsl,
     const int32_t*  __restrict__ has_initial,
     const int64_t*  __restrict__ state_idx,
-    const int N, const int E, const int sl)
+    const int N, const int E, const int sl,
+    const int64_t cs_stride_row,
+    const int64_t cs_stride_ch)
 {
     const int ri = blockIdx.x;
     const int ch = blockIdx.y * BLOCK_E + threadIdx.x;
@@ -214,12 +219,12 @@ __global__ void cca_prefill_state_save_kernel(
         v1 = static_cast<float>(qk_p[(end_i - 1) * E + ch]);
     } else {
         v0 = has_initial[ri]
-           ? static_cast<float>(conv_state_in[slot * E * sl + ch * sl + 1])
+           ? static_cast<float>(conv_state_in[slot * cs_stride_row + ch * cs_stride_ch + 1])
            : 0.0f;
         v1 = static_cast<float>(qk_p[start_i * E + ch]);
     }
 
-    const int64_t base = slot * E * sl + ch * sl;
+    const int64_t base = slot * cs_stride_row + ch * cs_stride_ch;
     conv_state_out[base + 0] = static_cast<scalar_t>(v0);
     conv_state_out[base + 1] = static_cast<scalar_t>(v1);
 }
@@ -231,11 +236,13 @@ template <typename scalar_t, int BH>
 void launch_hs2_shift(
     const scalar_t* hs_p, scalar_t* prev_hs, scalar_t* hs2,
     const int64_t* qsl, const int32_t* hi, const int64_t* si,
-    const int32_t* ri, int T, int H, cudaStream_t stream)
+    const int32_t* ri, int T, int H, int64_t prev_hs_stride_row,
+    cudaStream_t stream)
 {
     dim3 grid(T, (H + BH - 1) / BH);
     cca_prefill_hs2_shift_kernel<scalar_t, BH>
-        <<<grid, BH, 0, stream>>>(hs_p, prev_hs, hs2, qsl, hi, si, ri, T, H);
+        <<<grid, BH, 0, stream>>>(hs_p, prev_hs, hs2, qsl, hi, si, ri, T, H,
+                                   prev_hs_stride_row);
 }
 
 template <typename scalar_t, int BLOCK_D,
@@ -245,7 +252,9 @@ void launch_prefill_conv(
     const scalar_t* cs, const scalar_t* gw_w, const scalar_t* gw_b,
     const int64_t* qsl, const int32_t* hi, const int64_t* si,
     const int32_t* ri, scalar_t* out,
-    int G, int D, int E, int sl, int T, cudaStream_t stream)
+    int G, int D, int E, int sl, int T,
+    int64_t cs_stride_row, int64_t cs_stride_ch,
+    cudaStream_t stream)
 {
     dim3 grid(T, G);
     int smem = D * 2 * static_cast<int>(sizeof(float));
@@ -254,18 +263,22 @@ void launch_prefill_conv(
         <<<grid, BLOCK_D, smem, stream>>>(
             qk_p, dw_w, dw_b, cs, gw_w, gw_b,
             qsl, hi, si, ri, out,
-            G, D, E, sl, T);
+            G, D, E, sl, T,
+            cs_stride_row, cs_stride_ch);
 }
 
 template <typename scalar_t, int BE>
 void launch_state_save(
     const scalar_t* qk_p, const scalar_t* cs_in, scalar_t* cs_out,
     const int64_t* qsl, const int32_t* hi, const int64_t* si,
-    int N, int E, int sl, cudaStream_t stream)
+    int N, int E, int sl,
+    int64_t cs_stride_row, int64_t cs_stride_ch,
+    cudaStream_t stream)
 {
     dim3 grid(N, (E + BE - 1) / BE);
     cca_prefill_state_save_kernel<scalar_t, BE>
-        <<<grid, BE, 0, stream>>>(qk_p, cs_in, cs_out, qsl, hi, si, N, E, sl);
+        <<<grid, BE, 0, stream>>>(qk_p, cs_in, cs_out, qsl, hi, si, N, E, sl,
+                                   cs_stride_row, cs_stride_ch);
 }
 
 }  // anonymous namespace
@@ -299,6 +312,21 @@ std::vector<torch::Tensor> cca_prefill_fused_hip(
 
     const bool has_dw_bias = dw_bias_opt.has_value() && dw_bias_opt->defined();
     const bool has_gw_bias = gw_bias_opt.has_value() && gw_bias_opt->defined();
+
+    TORCH_CHECK(conv_states.dim() == 3,
+                "conv_state must be 3-D [num_cache, E, state_len]");
+    TORCH_CHECK(conv_states.stride(2) == 1,
+                "conv_state innermost (state_len) dim must be contiguous, "
+                "got stride(2)=", conv_states.stride(2));
+    TORCH_CHECK(prev_hs.dim() == 2,
+                "prev_hs must be 2-D [num_cache, H]");
+    TORCH_CHECK(prev_hs.stride(1) == 1,
+                "prev_hs innermost (H) dim must be contiguous, "
+                "got stride(1)=", prev_hs.stride(1));
+
+    const int64_t cs_stride_row = conv_states.stride(0);
+    const int64_t cs_stride_ch  = conv_states.stride(1);
+    const int64_t prev_hs_stride_row = prev_hs.stride(0);
 
     auto hs_c  = hs_p.contiguous();
     auto qk_c  = qk_packed0_p.contiguous();
@@ -336,7 +364,7 @@ std::vector<torch::Tensor> cca_prefill_fused_hip(
             _PTR(hs_c), _PTR(prev_hs), _PTR(hs2),
             qsl.data_ptr<int64_t>(), hi.data_ptr<int32_t>(),
             si.data_ptr<int64_t>(), ri.data_ptr<int32_t>(),
-            T, H, stream));
+            T, H, prev_hs_stride_row, stream));
     }
 
     // ---- Kernel 2: fused DW + grouped conv ----
@@ -350,21 +378,24 @@ std::vector<torch::Tensor> cca_prefill_fused_hip(
                     _PTR(conv_states), _PTR(gww), _OPTR(gwb, has_gw_bias),
                     qsl.data_ptr<int64_t>(), hi.data_ptr<int32_t>(),
                     si.data_ptr<int64_t>(), ri.data_ptr<int32_t>(),
-                    _PTR(output), G, D, E, sl, T, stream));
+                    _PTR(output), G, D, E, sl, T,
+                    cs_stride_row, cs_stride_ch, stream));
             } else if (D <= 128) {
                 _DISPATCH(launch_prefill_conv<scalar_t, 128, DWB, GWB>(
                     _PTR(qk_c), _PTR(dww), _OPTR(dwb, has_dw_bias),
                     _PTR(conv_states), _PTR(gww), _OPTR(gwb, has_gw_bias),
                     qsl.data_ptr<int64_t>(), hi.data_ptr<int32_t>(),
                     si.data_ptr<int64_t>(), ri.data_ptr<int32_t>(),
-                    _PTR(output), G, D, E, sl, T, stream));
+                    _PTR(output), G, D, E, sl, T,
+                    cs_stride_row, cs_stride_ch, stream));
             } else {
                 _DISPATCH(launch_prefill_conv<scalar_t, 256, DWB, GWB>(
                     _PTR(qk_c), _PTR(dww), _OPTR(dwb, has_dw_bias),
                     _PTR(conv_states), _PTR(gww), _OPTR(gwb, has_gw_bias),
                     qsl.data_ptr<int64_t>(), hi.data_ptr<int32_t>(),
                     si.data_ptr<int64_t>(), ri.data_ptr<int32_t>(),
-                    _PTR(output), G, D, E, sl, T, stream));
+                    _PTR(output), G, D, E, sl, T,
+                    cs_stride_row, cs_stride_ch, stream));
             }
         };
         if (has_dw_bias) {
@@ -382,7 +413,8 @@ std::vector<torch::Tensor> cca_prefill_fused_hip(
         _DISPATCH(launch_state_save<scalar_t, BE>(
             _PTR(qk_c), _PTR(conv_states), _PTR(conv_states),
             qsl.data_ptr<int64_t>(), hi.data_ptr<int32_t>(),
-            si.data_ptr<int64_t>(), N, E, sl, stream));
+            si.data_ptr<int64_t>(), N, E, sl,
+            cs_stride_row, cs_stride_ch, stream));
     }
 
 #undef _DISPATCH

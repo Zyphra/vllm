@@ -25,6 +25,10 @@
  *   Phase 4 — Write to output q/k buffer
  *
  * gw_weight layout: TRANSPOSED [G, D*2, D] for coalesced reads.
+ *
+ * conv_state is accessed via explicit strides (cs_stride_row, cs_stride_ch)
+ * so that non-contiguous cache buffers (e.g. vLLM page-aligned allocations
+ * with row padding) are handled correctly.
  */
 
 #include <torch/all.h>
@@ -101,7 +105,9 @@ cca_decode_fused_kernel(
     const int num_q_heads,
     const float sqrt_head_dim,
     const int num_cache_lines,
-    const int64_t pad_slot_id)
+    const int64_t pad_slot_id,
+    const int64_t cs_stride_row,
+    const int64_t cs_stride_ch)
 {
     const int i_n   = blockIdx.x;
     const int i_g   = blockIdx.y;
@@ -124,7 +130,8 @@ cca_decode_fused_kernel(
         const int ch = i_g * D + d_out;
 
         if (valid_row) {
-            const int64_t cs_base = cache_row * E * state_len + ch * state_len;
+            const int64_t cs_base = cache_row * cs_stride_row
+                                  + ch * cs_stride_ch;
             float s0 = static_cast<float>(conv_state[cs_base + 0]);
             float s1 = static_cast<float>(conv_state[cs_base + 1]);
 
@@ -223,7 +230,9 @@ cca_decode_fused_tiled_kernel(
     const int num_q_heads,
     const float sqrt_head_dim,
     const int num_cache_lines,
-    const int64_t pad_slot_id)
+    const int64_t pad_slot_id,
+    const int64_t cs_stride_row,
+    const int64_t cs_stride_ch)
 {
     const int i_n   = blockIdx.x;
     const int i_g   = blockIdx.y;
@@ -252,7 +261,8 @@ cca_decode_fused_tiled_kernel(
         const int ch = i_g * D + d_out;
 
         if (valid_row) {
-            const int64_t cs_base = cache_row * E * state_len + ch * state_len;
+            const int64_t cs_base = cache_row * cs_stride_row
+                                  + ch * cs_stride_ch;
             float s0 = static_cast<float>(conv_state[cs_base + 0]);
             float s1 = static_cast<float>(conv_state[cs_base + 1]);
 
@@ -400,6 +410,7 @@ void launch_fused(
     int B, int G, int D, int E, int state_len,
     int num_q_heads, float sqrt_head_dim,
     int num_cache_lines, int64_t pad_slot_id,
+    int64_t cs_stride_row, int64_t cs_stride_ch,
     cudaStream_t stream)
 {
     dim3 grid(B, G);
@@ -411,7 +422,8 @@ void launch_fused(
             new_token, dw_weight, dw_bias, conv_state, state_idx,
             gw_weight_T, gw_bias, qk_mean, temp, output,
             G, D, E, state_len, num_q_heads, sqrt_head_dim,
-            num_cache_lines, pad_slot_id);
+            num_cache_lines, pad_slot_id,
+            cs_stride_row, cs_stride_ch);
 }
 
 template <typename scalar_t, int BLOCK_D, int TILES_K,
@@ -426,6 +438,7 @@ void launch_fused_tiled(
     int B, int G, int D, int E, int state_len,
     int num_q_heads, float sqrt_head_dim,
     int num_cache_lines, int64_t pad_slot_id,
+    int64_t cs_stride_row, int64_t cs_stride_ch,
     cudaStream_t stream)
 {
     dim3 grid(B, G);
@@ -438,7 +451,8 @@ void launch_fused_tiled(
             new_token, dw_weight, dw_bias, conv_state, state_idx,
             gw_weight_T, gw_bias, qk_mean, temp, output,
             G, D, E, state_len, num_q_heads, sqrt_head_dim,
-            num_cache_lines, pad_slot_id);
+            num_cache_lines, pad_slot_id,
+            cs_stride_row, cs_stride_ch);
 }
 
 }  // anonymous namespace
@@ -447,6 +461,8 @@ void launch_fused_tiled(
 // Public entry point
 //
 // gw_weight must be PRE-TRANSPOSED to [G, D*2, D] by the caller.
+// conv_state may be non-contiguous (e.g. vLLM padded cache); strides
+// are extracted from the tensor and forwarded to the kernel.
 //
 // Automatically selects between:
 //   - Original v2 kernel when B*G >= TILED_THRESHOLD (enough parallelism)
@@ -482,6 +498,15 @@ torch::Tensor cca_decode_fused(
     TORCH_CHECK(G * D == E, "G*D must equal E");
     TORCH_CHECK(DW == D * 2,
                 "gw_weight must be transposed to [G, D*2, D]");
+
+    TORCH_CHECK(conv_state.dim() == 3,
+                "conv_state must be 3-D [num_cache, E, state_len]");
+    TORCH_CHECK(conv_state.stride(2) == 1,
+                "conv_state innermost (state_len) dim must be contiguous, "
+                "got stride(2)=", conv_state.stride(2));
+
+    const int64_t cs_stride_row = conv_state.stride(0);
+    const int64_t cs_stride_ch  = conv_state.stride(1);
 
     const bool has_dw_bias = dw_bias_opt.has_value() && dw_bias_opt->defined();
     const bool has_gw_bias = gw_bias_opt.has_value() && gw_bias_opt->defined();
@@ -521,7 +546,8 @@ torch::Tensor cca_decode_fused(
     B, G, D, E, state_len,                                                   \
     static_cast<int>(num_q_heads),                                           \
     static_cast<float>(sqrt_head_dim),                                       \
-    num_cache_lines, pad_slot_id, stream
+    num_cache_lines, pad_slot_id,                                            \
+    cs_stride_row, cs_stride_ch, stream
 
     auto run = [&](auto dw_tag, auto gw_tag, auto ct_tag) {
         constexpr bool DWB = decltype(dw_tag)::value;
