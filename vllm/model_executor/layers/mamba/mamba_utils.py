@@ -81,7 +81,7 @@ class MambaStateDtypeCalculator:
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
     ) -> tuple[torch.dtype, ...]:
-        conv_state_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
+        conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         prev_hs_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
         return (conv_state_dtype, prev_hs_dtype)
 
