@@ -351,7 +351,7 @@ class SMoERouter(nn.Module):
         use_eda_cfg = bool(getattr(config, "smoe_use_eda", False))
         self.use_eda = use_eda_cfg and (smoe_first_layer is not None) and (self.layer_number != smoe_first_layer)
 
-        ln_eps = float(getattr(config, "layernorm_epsilon", 1e-6))
+        ln_eps = float(getattr(config, "layernorm_epsilon", 1e-5))
         self.rmsnorm_eda = RMSNorm(self.mlp_expansion, eps=ln_eps)
         if self.use_eda:
             # eda
