@@ -100,6 +100,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "InklingMMConfig": "vllm.models.inkling.configs",
     # Special case: DeepseekV3Config is from HuggingFace Transformers
     "DeepseekV3Config": "transformers",
+    "ZayaConfig": "vllm.transformers_utils.configs.zaya",
 }
 
 __all__ = [
@@ -182,6 +183,8 @@ __all__ = [
     "InklingAudioConfig",
     "InklingVisionConfig",
     "InklingMMConfig",
+    "Tarsier2Config",
+    "ZayaConfig",
 ]
 
 

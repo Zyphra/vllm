@@ -1069,6 +1069,11 @@ def get_moe_configs(
     if envs.VLLM_BATCH_INVARIANT:
         return None
 
+    # Tuned-config discovery is performance-only. Avoid tracing filesystem
+    # operations such as realpath/exists/open through torch.compile.
+    if torch.compiler.is_compiling():
+        return None
+
     # First look up if an optimized configuration is available in the configs
     # directory
     block_shape = [block_n, block_k] if block_n and block_k else None
@@ -1111,6 +1116,19 @@ def get_moe_configs(
         ", ".join(config_file_paths),
     )
     return None
+
+
+@functools.lru_cache
+def _get_moe_config_device_name_eager() -> str:
+    return current_platform.get_device_name()
+
+
+def _get_moe_config_device_name() -> str:
+    # Device-name lookup is only used to select an optional tuned MoE config
+    # file. Avoid tracing NVML-backed metadata queries through torch.compile.
+    if torch.compiler.is_compiling():
+        return current_platform.device_name
+    return _get_moe_config_device_name_eager()
 
 
 def _ensure_block_size_k_divisible(
