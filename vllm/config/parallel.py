@@ -476,6 +476,21 @@ class ParallelConfig:
     def local_world_size(self) -> int:
         return self.world_size // self.nnodes_within_dp
 
+    @property
+    def is_external_executor(self) -> bool:
+        """True when workers are managed externally (torchrun, verl, etc.).
+
+        Verl passes a class type for ``distributed_executor_backend`` rather
+        than the string ``"external_launcher"``, so a naive string compare
+        fails to recognize it as an external launcher and silently activates
+        in-process DP collectives that conflict with HIP graph capture.
+        """
+        if self.distributed_executor_backend == "external_launcher":
+            return True
+        if isinstance(self.distributed_executor_backend, type):
+            return True
+        return False
+
     @staticmethod
     def has_unfinished_dp(dp_group: ProcessGroup, has_unfinished: bool) -> bool:
         tensor = torch.tensor([has_unfinished], dtype=torch.int32, device="cpu")
@@ -552,7 +567,7 @@ class ParallelConfig:
             * self.prefill_context_parallel_size
         )
 
-        if self.distributed_executor_backend == "external_launcher":
+        if self.is_external_executor:
             logger.info("Using external launcher for distributed inference.")
             self.world_size *= self.data_parallel_size
 
@@ -593,7 +608,7 @@ class ParallelConfig:
 
         self.data_parallel_index = self.data_parallel_rank
 
-        if self.distributed_executor_backend == "external_launcher":
+        if self.is_external_executor:
             os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
             logger.info("Disabling V1 multiprocessing for external launcher.")
 

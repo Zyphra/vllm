@@ -613,7 +613,7 @@ class VllmConfig:
             "mp",
             "uni",
             "external_launcher",
-        )
+        ) or self.parallel_config.is_external_executor
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.

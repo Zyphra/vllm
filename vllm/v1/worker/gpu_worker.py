@@ -191,8 +191,8 @@ class Worker(WorkerBase):
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config
             if (
-                parallel_config.distributed_executor_backend
-                not in ("ray", "external_launcher")
+                not parallel_config.is_external_executor
+                and parallel_config.distributed_executor_backend != "ray"
                 and parallel_config.data_parallel_backend != "ray"
                 and parallel_config.nnodes_within_dp == 1
             ):
@@ -206,13 +206,18 @@ class Worker(WorkerBase):
                     * self.parallel_config.tensor_parallel_size
                 )
 
+                visible_device_count = current_platform.device_count()
+
+                # Some external DP launchers already mask each worker down to its
+                # own local device. In that case, keep local_rank within the
+                # visible-device view instead of offsetting by DP rank again.
+                if visible_device_count <= tp_pp_world_size:
+                    dp_local_rank = 0
+
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
-                assert self.local_rank < torch.cuda.device_count(), (
+                assert self.local_rank < visible_device_count, (
                     f"DP adjusted local rank {self.local_rank} is out of bounds. "
-                )
-                visible_device_count = (
-                    torch.cuda.device_count() if torch.cuda.is_available() else 0
                 )
                 assert self.parallel_config.local_world_size <= visible_device_count, (
                     f"local_world_size ({self.parallel_config.local_world_size}) must "

@@ -74,7 +74,7 @@ class LLMEngine:
         self.external_launcher_dp = (
             parallel_config.data_parallel_size > 1
             and executor_backend == "external_launcher"
-        )
+        ) or parallel_config.is_external_executor
         # important: init dp group before init the engine_core
         # In the decoupled engine case this is handled in EngineCoreProc.
         if (

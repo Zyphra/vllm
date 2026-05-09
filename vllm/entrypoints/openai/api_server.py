@@ -36,7 +36,16 @@ from vllm.entrypoints.openai.server_utils import (
     log_response,
     validation_exception_handler,
 )
-from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
+try:
+    from vllm.entrypoints.sagemaker.api_router import (
+        attach_router as register_sagemaker_api_router,
+    )
+    from vllm.entrypoints.sagemaker.api_router import sagemaker_standards_bootstrap
+except ModuleNotFoundError:
+    register_sagemaker_api_router = None
+
+    def sagemaker_standards_bootstrap(app: FastAPI) -> FastAPI:
+        return app
 from vllm.entrypoints.serve.elastic_ep.middleware import (
     ScalingMiddleware,
 )
@@ -182,9 +191,15 @@ def build_app(
 
     register_basic_api_routers(app)
 
-    from vllm.entrypoints.serve import register_vllm_serve_api_routers
+    try:
+        from vllm.entrypoints.serve import register_vllm_serve_api_routers
 
-    register_vllm_serve_api_routers(app)
+        register_vllm_serve_api_routers(app)
+    except ModuleNotFoundError as exc:
+        logger.warning(
+            "Skipping optional serve API routers because dependency %s is missing",
+            exc.name,
+        )
 
     from vllm.entrypoints.openai.models.api_router import (
         attach_router as register_models_api_router,
@@ -192,11 +207,8 @@ def build_app(
 
     register_models_api_router(app)
 
-    from vllm.entrypoints.sagemaker.api_router import (
-        attach_router as register_sagemaker_api_router,
-    )
-
-    register_sagemaker_api_router(app, supported_tasks)
+    if register_sagemaker_api_router is not None:
+        register_sagemaker_api_router(app, supported_tasks)
 
     if "generate" in supported_tasks:
         from vllm.entrypoints.openai.generate.api_router import (
