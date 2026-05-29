@@ -1899,6 +1899,13 @@ class OpenAIServingChat(OpenAIServing):
         is a tool call with arguments.
         """
 
+        if self.tool_parser:
+            should_check = (
+                self.tool_parser.parser_should_check_for_unstreamed_tool_arg_tokens()
+            )
+            if not should_check:
+                return False
+
         return bool(
             # if there is a delta message that includes tool calls which
             # include a function that has arguments

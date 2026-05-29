@@ -1068,6 +1068,10 @@ class SMOEXMLToolParser(ToolParser):
         super().__init__(tokenizer)
         self.parser = StreamingXMLToolCallParser()
 
+        # Keep vLLM's streaming serving layer in sync with emitted tool deltas.
+        self.prev_tool_call_arr: list[dict] = []
+        self.streamed_args_for_tool: list[str] = []
+
         logger.info("vLLM Successfully import tool parser %s !",
                     self.__class__.__name__)
 
@@ -1117,6 +1121,8 @@ class SMOEXMLToolParser(ToolParser):
     ) -> Union[DeltaMessage, None]:
         if not previous_text:
             self.parser.reset_streaming_state()
+            self.prev_tool_call_arr = []
+            self.streamed_args_for_tool = []
             if request:
                 self.parser.set_tools(request.tools)
 
@@ -1129,7 +1135,6 @@ class SMOEXMLToolParser(ToolParser):
                 self.parser.tool_call_start_token) - current_text.count(
                     self.parser.tool_call_end_token)
             if open_calls == 0 and self.parser.tool_call_index > 0:
-                # If current_call_id is None, use last_completed_call_id
                 call_id = self.parser.current_call_id or \
                     self.parser.last_completed_call_id
                 return DeltaMessage(tool_calls=[
@@ -1141,4 +1146,42 @@ class SMOEXMLToolParser(ToolParser):
                     )
                 ])
 
-        return self.parser.parse_single_streaming_chunks(delta_text)
+        result = self.parser.parse_single_streaming_chunks(delta_text)
+        if result and result.tool_calls:
+            for tool_call in result.tool_calls:
+                if not tool_call.function:
+                    continue
+
+                tool_index = (
+                    tool_call.index if tool_call.index is not None
+                    else len(self.prev_tool_call_arr) - 1
+                )
+
+                while len(self.prev_tool_call_arr) <= tool_index:
+                    self.prev_tool_call_arr.append({"name": "", "arguments": ""})
+                while len(self.streamed_args_for_tool) <= tool_index:
+                    self.streamed_args_for_tool.append("")
+
+                if tool_call.function.name:
+                    self.prev_tool_call_arr[tool_index]["name"] = (
+                        tool_call.function.name
+                    )
+
+                if tool_call.function.arguments is not None:
+                    self.prev_tool_call_arr[tool_index]["arguments"] += (
+                        tool_call.function.arguments
+                    )
+                    self.streamed_args_for_tool[tool_index] += (
+                        tool_call.function.arguments
+                    )
+
+        return result
+
+    @staticmethod
+    def parser_should_check_for_unstreamed_tool_arg_tokens() -> bool:
+        """
+        Zaya XML streams its argument JSON directly as deltas, so the generic
+        final-chunk partial JSON repair would re-serialize already streamed
+        arguments and can duplicate/escape the tail.
+        """
+        return False
