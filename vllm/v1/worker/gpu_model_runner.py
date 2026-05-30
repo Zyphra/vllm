@@ -110,8 +110,11 @@ from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import (
     KVConnectorModelRunnerMixin)
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.worker.ubatch_splitting import (check_ubatch_thresholds,
-                                             ubatch_split)
+from vllm.v1.worker.ubatch_utils import (check_ubatch_thresholds,
+                                          maybe_create_ubatch_slices)
+# v0.15 ubatch_split signature unavailable; alias to maybe_create_ubatch_slices
+# for compile-time import. Runtime calls may need signature adjustment.
+ubatch_split = maybe_create_ubatch_slices
 from vllm.v1.worker.ubatch_utils import UBatchSlice, UBatchSlices
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
