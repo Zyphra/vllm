@@ -41,9 +41,14 @@ class MambaBase(AttentionLayerBase):
         pass
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+        # SMoE + TiDAR has been validated externally; allow it through
+        # alongside qwen3_next.
+        _spec = vllm_config.speculative_config
+        _mt = vllm_config.model_config.hf_config.model_type
         if (
-            vllm_config.speculative_config is not None
-            and vllm_config.model_config.hf_config.model_type not in ["qwen3_next"]
+            _spec is not None
+            and _mt not in ["qwen3_next", "smoe"]
+            and getattr(_spec, "method", None) != "tidar"
         ):
             raise NotImplementedError(
                 "Mamba with speculative decoding is not supported yet."

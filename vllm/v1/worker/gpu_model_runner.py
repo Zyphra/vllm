@@ -155,6 +155,7 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.tidar import TiDARProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -448,6 +449,7 @@ class GPUModelRunner(
                 NgramProposer  # noqa: F823
                 | SuffixDecodingProposer
                 | EagleProposer
+                | TiDARProposer
                 | DraftModelProposer
                 | MedusaProposer
             )
@@ -463,6 +465,8 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.method == "tidar":
+                self.drafter = TiDARProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -667,6 +671,21 @@ class GPUModelRunner(
         # Cached outputs.
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         self._draft_token_req_ids: list[str] | None = None
+        # === TiDAR Block 1: per-request draft distribution stash =====
+        # Per-request draft probability distributions stashed after each
+        # drafter call (TiDAR with T_Diff > 0 only). Keyed by req_id;
+        # each value is a [num_speculative_tokens, vocab_size] float32
+        # tensor. Reassembled in input-batch order at the next step's
+        # input prep and threaded through SpecDecodeMetadata.draft_probs.
+        self._draft_probs_by_req_id: dict[str, torch.Tensor] = {}
+        # Raw drafter logits stashed in parallel with draft_probs.
+        # Always populated when the TiDAR drafter runs (even at
+        # T_Diff == 0 where draft_probs is None). Threaded through
+        # SpecDecodeMetadata.draft_logits so the mix-logit v1 sampler
+        # can construct mixed_logits = w*target + (1-w)*draft without
+        # depending on the (None-at-Dirac) draft_probs.
+        self._draft_logits_by_req_id: dict[str, torch.Tensor] = {}
+        # === end TiDAR Block 1 =====================================
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -2212,6 +2231,14 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
+        # === TiDAR Block 4: thread draft_probs/draft_logits through ====
+        # TiDAR drafter (T_Diff > 0) stashes per-req draft_probs in
+        # self._draft_probs_by_req_id; gather them in current input-batch
+        # order and slice to num_draft_tokens. Returns None at T_Diff == 0
+        # or for non-TiDAR drafters — routes the rejection sampler to its
+        # NO_DRAFT_PROBS branch. draft_logits is the parallel raw-logits
+        # plumbing used by mix-logit v1.
+        # === end TiDAR Block 4 =========================================
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2220,7 +2247,59 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
+            draft_probs=self._gather_draft_probs(num_draft_tokens),
+            draft_logits=self._gather_draft_logits(num_draft_tokens),
         )
+
+    # === TiDAR Block 2: _gather_draft_probs ===========================
+    def _gather_draft_probs(
+        self,
+        num_draft_tokens: np.ndarray,
+    ) -> torch.Tensor | None:
+        # Concatenate per-req draft_probs (stashed by the previous step's
+        # drafter call) in current input-batch order, sliced to the actual
+        # num_draft_tokens for this step. Returns None if no probs were
+        # stashed (e.g., T_Diff == 0 on TiDAR, or any non-TiDAR drafter).
+        if not self._draft_probs_by_req_id:
+            return None
+        chunks: list[torch.Tensor] = []
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            n = int(num_draft_tokens[i])
+            if n == 0:
+                continue
+            probs = self._draft_probs_by_req_id.get(req_id)
+            if probs is None:
+                return None
+            chunks.append(probs[:n])
+        if not chunks:
+            return None
+        return torch.cat(chunks, dim=0).contiguous()
+    # === end TiDAR Block 2 ============================================
+
+    # === TiDAR Block 3: _gather_draft_logits ==========================
+    def _gather_draft_logits(
+        self,
+        num_draft_tokens: np.ndarray,
+    ) -> torch.Tensor | None:
+        # Parallel to _gather_draft_probs but for raw drafter logits
+        # (pre-softmax, pre-temperature). Used by mix-logit v1 to
+        # construct mixed_logits = w*target + (1-w)*draft without
+        # depending on draft_probs (None at T_Diff == 0).
+        if not self._draft_logits_by_req_id:
+            return None
+        chunks: list[torch.Tensor] = []
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            n = int(num_draft_tokens[i])
+            if n == 0:
+                continue
+            logits_i = self._draft_logits_by_req_id.get(req_id)
+            if logits_i is None:
+                return None
+            chunks.append(logits_i[:n])
+        if not chunks:
+            return None
+        return torch.cat(chunks, dim=0).contiguous()
+    # === end TiDAR Block 3 ============================================
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -2870,9 +2949,17 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # === TiDAR Block 5 (minimal): thread draft_probs through =====
+        # Use the per-req draft probs stashed by the TiDAR drafter (None at
+        # T_Diff == 0 / non-TiDAR \u2014 routes to NO_DRAFT_PROBS branch).
+        # Full v1 mix-logit / no_bonus / drafts_only / ar_only paths from
+        # jinzhao/tidar are NOT yet ported \u2014 they require slicing target
+        # logits ourselves (aiter-moe\u0027s rejection_sampler signature
+        # changed and now handles target/bonus splitting internally).
+        # === end TiDAR Block 5 =======================================
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
-            None,  # draft_probs
+            spec_decode_metadata.draft_probs,
             logits,
             sampling_metadata,
         )
@@ -3990,7 +4077,34 @@ class GPUModelRunner(
                 slot_mappings=slot_mappings,
             )
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+            assert isinstance(self.drafter, EagleProposer | TiDARProposer | DraftModelProposer)
+
+            # === TiDAR Block 6: SF early-exit (skip propose) ============
+            # Single-forward TiDAR: drafts come from the verify-pass's
+            # K+1 mask block hidden states; no second forward needed.
+            # Only fires when SF mode is on, spec_decode_metadata exists
+            # (i.e., not the bootstrap step), and the drafter has run at
+            # least once (last_inflated_total set). sampled_token_ids is
+            # list[list[int]] in the non-padded path.
+            if (spec_config.use_tidar()
+                    and getattr(self.drafter, "single_forward_mode", False)
+                    and spec_decode_metadata is not None
+                    and getattr(self.drafter, "last_inflated_total", None) is not None
+                    and isinstance(sampled_token_ids, list)):
+                num_accepted_per_req = torch.tensor(
+                    [max(0, len(tokens) - 1) for tokens in sampled_token_ids],
+                    dtype=torch.int32, device=self.device,
+                )
+                draft_token_ids = self.drafter.extract_drafts_from_hidden(
+                    hidden_states=hidden_states,
+                    num_accepted_per_req=num_accepted_per_req,
+                )
+                # SF path does not populate last_draft_probs/logits;
+                # clear the stash so next step uses NO_DRAFT_PROBS.
+                self._draft_probs_by_req_id.clear()
+                self._draft_logits_by_req_id.clear()
+                return draft_token_ids
+            # === end TiDAR Block 6 ======================================
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -4100,6 +4214,29 @@ class GPUModelRunner(
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
             )
+
+            # === TiDAR Block 7: stash drafter outputs for next-step ====
+            # Reassembled in input-batch order by _gather_draft_probs /
+            # _gather_draft_logits on the next spec_decode_metadata build.
+            # Cleared each step so old entries can't leak.
+            if spec_config.use_tidar():
+                self._draft_probs_by_req_id.clear()
+                self._draft_logits_by_req_id.clear()
+                tidar_drafter = self.drafter
+                num_spec = spec_config.num_speculative_tokens
+                last_probs = getattr(tidar_drafter, "last_draft_probs", None)
+                if last_probs is not None and num_spec is not None:
+                    per_req = last_probs.view(-1, num_spec, last_probs.shape[-1])
+                    for i, req_id in enumerate(self.input_batch.req_ids):
+                        if i < per_req.shape[0]:
+                            self._draft_probs_by_req_id[req_id] = per_req[i]
+                last_logits = getattr(tidar_drafter, "last_draft_logits", None)
+                if last_logits is not None and num_spec is not None:
+                    per_req_l = last_logits.view(-1, num_spec, last_logits.shape[-1])
+                    for i, req_id in enumerate(self.input_batch.req_ids):
+                        if i < per_req_l.shape[0]:
+                            self._draft_logits_by_req_id[req_id] = per_req_l[i]
+            # === end TiDAR Block 7 =====================================
 
         return draft_token_ids
 

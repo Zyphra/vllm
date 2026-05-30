@@ -642,11 +642,14 @@ class TiDARProposer(EagleProposer):
         exceeds_max_model_len = draft_positions >= self.max_model_len
         clamped_positions = torch.where(exceeds_max_model_len, 0,
                                         draft_positions)
-        block_numbers = clamped_positions // self.block_size
+        # v0.16: block_size lives on attn_metadata_builder.kv_cache_spec,
+        # not as a cached self.block_size attribute. (eagle.py:624)
+        _bs = self.attn_metadata_builder.kv_cache_spec.block_size
+        block_numbers = clamped_positions // _bs
         block_ids = common_attn_metadata.block_table_tensor.gather(
             dim=1, index=block_numbers)
-        slot_mapping = (block_ids * self.block_size +
-                        clamped_positions % self.block_size)
+        slot_mapping = (block_ids * _bs +
+                        clamped_positions % _bs)
         slot_mapping.masked_fill_(exceeds_max_model_len, PAD_SLOT_ID)
 
         # Layout: position 0 = next_token (real), positions 1..K = K masks.
@@ -702,8 +705,10 @@ class TiDARProposer(EagleProposer):
             query_start_loc=query_start_loc,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens_cpu,
-            num_computed_tokens_cpu=common_attn_metadata.seq_lens_cpu,
+            # v0.16: seq_lens_cpu is a @property; private field is
+            # _seq_lens_cpu. Pass through if available.
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=common_attn_metadata.seq_lens_cpu,
             num_reqs=batch_size,
             num_actual_tokens=n_tokens,
             max_query_len=query_len,
@@ -721,12 +726,28 @@ class TiDARProposer(EagleProposer):
         target_positions: torch.Tensor,
         target_hidden_states: torch.Tensor,
         next_token_ids: torch.Tensor,
-        last_token_indices: Optional[torch.Tensor],
-        common_attn_metadata: CommonAttentionMetadata,
-        sampling_metadata: SamplingMetadata,
+        # v0.16 EagleProposer renamed last_token_indices ->
+        # token_indices_to_sample; accept the new name and keep
+        # the old as a compat alias.
+        token_indices_to_sample: Optional[torch.Tensor] = None,
+        common_attn_metadata: Optional[CommonAttentionMetadata] = None,
+        sampling_metadata: Optional[SamplingMetadata] = None,
+        # v0.16 renamed mm_embeds -> mm_embed_inputs
+        mm_embed_inputs: Optional[list[torch.Tensor]] = None,
+        # v0.16 added; TiDAR's SF eager path doesn't use these.
+        num_rejected_tokens_gpu: Optional[torch.Tensor] = None,
+        slot_mappings: Optional[dict[str, torch.Tensor]] = None,
+        # v0.15 compat aliases
+        last_token_indices: Optional[torch.Tensor] = None,
         mm_embeds: Optional[list[torch.Tensor]] = None,
     ) -> torch.Tensor:
+        # Resolve v0.15/v0.16 arg name aliases.
+        if last_token_indices is None:
+            last_token_indices = token_indices_to_sample
+        if mm_embeds is None:
+            mm_embeds = mm_embed_inputs
         del target_token_ids, target_hidden_states, sampling_metadata
+        del num_rejected_tokens_gpu, slot_mappings
 
         if mm_embeds is not None:
             raise NotImplementedError(
@@ -799,7 +820,12 @@ class TiDARProposer(EagleProposer):
                 per_layer_attn_metadata[layer_name] = cca_attn_metadata
 
         num_tokens = draft_input_ids.shape[0]
-        if self.use_cuda_graph and num_tokens <= self.cudagraph_batch_sizes[-1]:
+        # v0.16 removed self.use_cuda_graph / self.cudagraph_batch_sizes
+        # on EagleProposer; use getattr with safe defaults so the eager
+        # path keeps working.
+        _ucg = getattr(self, "use_cuda_graph", False)
+        _cgbs = getattr(self, "cudagraph_batch_sizes", None)
+        if _ucg and _cgbs and num_tokens <= _cgbs[-1]:
             num_input_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
         else:
             num_input_tokens = num_tokens
@@ -833,9 +859,10 @@ class TiDARProposer(EagleProposer):
         # registered this descriptor, dispatch returns NONE and the
         # wrapper passes through to eager (no perf gain, no breakage).
         from vllm.forward_context import BatchDescriptor as _BD
-        _draft_desc = _BD(num_tokens=num_input_tokens,
-                          uniform_decode=True,
-                          is_drafter_pass=True)
+        # v0.16: uniform_decode -> uniform; is_drafter_pass removed.
+        # Phase 1 SF eager mode dispatches to CUDAGraphMode.NONE
+        # regardless, so the captured-graph branch below is inert.
+        _draft_desc = _BD(num_tokens=num_input_tokens, uniform=True)
         _cg_mode, _draft_desc = runner.cudagraph_dispatcher.dispatch(
             _draft_desc)
 
@@ -916,8 +943,14 @@ class TiDARProposer(EagleProposer):
     def dummy_run(
         self,
         num_tokens: int,
+        use_cudagraphs: bool = True,
+        is_graph_capturing: bool = False,
+        slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        del num_tokens
+        # TiDAR reuses the target model forward; no separate drafter
+        # warmup pass is required at profile time. Accept v0.16's
+        # extended kwargs from EagleProposer's dummy_run signature.
+        del num_tokens, use_cudagraphs, is_graph_capturing, slot_mappings
 
     def validate_same_kv_cache_group(self,
                                      kv_cache_config: KVCacheConfig) -> None:
