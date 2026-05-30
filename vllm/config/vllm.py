@@ -1235,6 +1235,57 @@ class VllmConfig:
                 "when using cuda graph."
             )
 
+            # === TiDAR Block 8: SF capture-shape override =============
+            # If TiDAR is active and the user hasn't manually set
+            # cudagraph_capture_sizes, populate it with multiples of K+1
+            # (TF verify shape) AND sf_per_req (SF combined-forward shape).
+            # Default stride-8 misses K+1=17 and SF shape, causing acceptance
+            # collapse or NaN-padded logits. See docs/diffusion_vllm_handoff.md
+            # and project_sf_kp1_layout_required memory.
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and self.speculative_config.num_speculative_tokens is not None
+                and self.compilation_config.cudagraph_capture_sizes is None
+            ):
+                K_plus_1 = (
+                    self.speculative_config.num_speculative_tokens + 1)
+                max_b = self.scheduler_config.max_num_seqs
+                cap = max_cudagraph_capture_size
+                spec_sizes = [
+                    b * K_plus_1 for b in range(1, max_b + 1)
+                    if b * K_plus_1 <= cap
+                ]
+                # SF single-forward shape: per-req length is
+                # K(1+P)+1 where P = number of pre-draft proposals.
+                # Read P from env (matches the proposer); default 3.
+                import os as _os
+                _sf_levels_env = _os.environ.get(
+                    "VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
+                if _sf_levels_env.strip():
+                    _P = len([
+                        x for x in _sf_levels_env.split(",") if x.strip()
+                    ])
+                else:
+                    _P = 3
+                K = K_plus_1 - 1
+                sf_per_req = K_plus_1 + _P * K_plus_1
+                sf_sizes = [
+                    b * sf_per_req for b in range(1, max_b + 1)
+                    if b * sf_per_req <= cap
+                ]
+                small_grid = [1, 2, 4, 8]
+                explicit = sorted(
+                    set(small_grid) | set(spec_sizes) | set(sf_sizes))
+                logger.info(
+                    "TiDAR detected: setting cudagraph_capture_sizes "
+                    "to explicit list %s (K+1=%d up to b=%d; "
+                    "sf_per_req=%d P=%d up to cap=%d). Plus {1,2,4,8} "
+                    "for AR/non-spec-decode.",
+                    explicit, K_plus_1, max_b, sf_per_req, _P, cap)
+                self.compilation_config.cudagraph_capture_sizes = explicit
+            # === end TiDAR Block 8 ====================================
+
             # determine the cudagraph_capture_sizes
             if self.compilation_config.cudagraph_capture_sizes is not None:
                 assert len(self.compilation_config.cudagraph_capture_sizes) > 0, (

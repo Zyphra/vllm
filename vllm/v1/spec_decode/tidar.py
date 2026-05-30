@@ -859,12 +859,13 @@ class TiDARProposer(EagleProposer):
         # registered this descriptor, dispatch returns NONE and the
         # wrapper passes through to eager (no perf gain, no breakage).
         from vllm.forward_context import BatchDescriptor as _BD
-        # v0.16: uniform_decode -> uniform; is_drafter_pass removed.
-        # Phase 1 SF eager mode dispatches to CUDAGraphMode.NONE
-        # regardless, so the captured-graph branch below is inert.
-        _draft_desc = _BD(num_tokens=num_input_tokens, uniform=True)
+        # v0.16 dispatcher: takes individual kwargs (num_tokens,
+        # uniform_decode), not a BatchDescriptor. Returns
+        # (CUDAGraphMode, BatchDescriptor).
         _cg_mode, _draft_desc = runner.cudagraph_dispatcher.dispatch(
-            _draft_desc)
+            num_tokens=num_input_tokens,
+            uniform_decode=True,
+        )
 
         # Tier 3 lazy capture: the first time we hit this shape, the
         # CUDAGraphWrapper has no entry for the drafter-pass descriptor
