@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -22,6 +23,16 @@ class SpecDecodeMetadata:
     bonus_logits_indices: torch.Tensor
     # [num_tokens + batch_size]
     logits_indices: torch.Tensor
+    # [num_tokens, vocab_size] — full draft probability distribution per
+    # draft position. None when the drafter is a Dirac (e.g. argmax /
+    # ngram), which lets the rejection sampler stay on its NO_DRAFT_PROBS
+    # branch (acceptance = p_AR(v*), residual = p_AR masked excluding v*).
+    draft_probs: Optional[torch.Tensor] = None
+    # [num_tokens, vocab_size] — raw drafter logits per draft position.
+    # When set, downstream consumers should use these directly for
+    # mix-logit (mixed = a*target + (1-a)*draft) instead of
+    # softmax→log roundtripping through draft_probs.
+    draft_logits: Optional[torch.Tensor] = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

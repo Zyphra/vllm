@@ -49,6 +49,7 @@ SpeculativeMethod = Literal[
     "mlp_speculator",
     "draft_model",
     "suffix",
+    "tidar",
     EagleModelTypes,
 ]
 
@@ -125,6 +126,13 @@ class SpeculativeConfig:
     in parallel rather than sequentially. This can improve performance but
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
+
+    tidar_diff_temperature: float = 0.0
+    """Sampling temperature for TiDAR's diffusion drafter. 0.0 means argmax
+    drafting (the original Dirac drafter, no draft_probs returned). Values
+    > 0.0 enable categorical sampling from softmax(diff_logits / T_Diff)
+    and produce a full draft probability tensor for exact Leviathan-style
+    rejection sampling. Engine-wide; per-request override is a TODO."""
 
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
@@ -309,6 +317,15 @@ class SpeculativeConfig:
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
+            elif self.method == "tidar":
+                if self.target_model_config is None:
+                    raise ValueError(
+                        "target_model_config must be present for tidar")
+                # TiDAR reuses the target checkpoint for both verification
+                # and drafting.
+                self.model = self.target_model_config.model
+                if not self.quantization:
+                    self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "suffix":
@@ -362,6 +379,47 @@ class SpeculativeConfig:
             self.draft_parallel_config = self.target_parallel_config
         elif self.method == "suffix":
             self._validate_suffix_decoding()
+        elif self.method == "tidar":
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            if self.target_model_config is None:
+                raise ValueError(
+                    "target_model_config must be present for tidar")
+            if self.target_parallel_config is None:
+                raise ValueError(
+                    "target_parallel_config must be present for tidar")
+
+            if self.model not in (None, self.target_model_config.model):
+                raise ValueError(
+                    "TiDAR currently reuses the target model checkpoint, "
+                    "so `speculative_config.model` must match the target "
+                    "model.")
+
+            if (self.draft_tensor_parallel_size is not None
+                    and self.draft_tensor_parallel_size
+                    != self.target_parallel_config.tensor_parallel_size):
+                raise ValueError(
+                    "TiDAR reuses the target model execution path, so "
+                    "`draft_tensor_parallel_size` must match the target "
+                    "TP size.")
+
+            self.model = self.target_model_config.model
+            self.draft_tensor_parallel_size = \
+                self.target_parallel_config.tensor_parallel_size
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+
+            if self.num_speculative_tokens is not None:
+                if self.speculative_token_tree is None:
+                    self.speculative_token_tree = str([
+                        (i + 1) * (0,)
+                        for i in range(self.num_speculative_tokens)
+                    ])
+                else:
+                    tree_choices = ast.literal_eval(
+                        self.speculative_token_tree)
+                    self.speculative_token_tree = str(
+                        sorted(tree_choices, key=lambda t: (len(t), t)))
         else:
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
@@ -728,7 +786,10 @@ class SpeculativeConfig:
                 )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        return self.method in ("eagle", "eagle3", "mtp", "tidar")
+
+    def use_tidar(self) -> bool:
+        return self.method == "tidar"
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

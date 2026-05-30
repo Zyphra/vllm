@@ -400,3 +400,147 @@ if is_torch_equal("2.9.0"):
 
     PythonWrapperCodegen.memory_plan_reuse = memory_plan_reuse_patched
     GraphLowering._update_scheduler = _update_scheduler_patched
+
+# =====================================================================
+# TiDAR SF cudagraph-capture workarounds (ported from jinzhao/tidar)
+# =====================================================================
+# These monkey-patches are required for SF (single-forward) TiDAR to
+# capture its verify forward under cudagraph without raising
+# cudaErrorStreamCaptureUnsupported on first verify-shape compile.
+# See ``project_sf_captured_cudagraph_fixes`` memory for context.
+
+# Raise dynamo's recompile cache limit. vLLM's flex_attention path
+# recompiles per (B, total_per_req, hidden) shape combo at startup;
+# with TiDAR's SF + varying batch shapes this exceeds the default 8.
+import torch._dynamo  # noqa: F401
+torch._dynamo.config.cache_size_limit = 256
+torch._dynamo.config.recompile_limit = 256
+
+# Disable inductor's SDPA pattern matcher. It calls dummy SDPA kernels
+# during compile to identify scaled-dot-product-attention fusion
+# patterns; those kernels trigger cudaErrorStreamCaptureUnsupported when
+# the compile runs inside an active cudagraph capture.
+torch._inductor.config.pattern_matcher = False
+# Disable inductor's joint-graph constant folding. It evaluates
+# constant ops like aten.full.default on the target device during
+# compile; under capture this triggers
+# cudaErrorStreamCaptureUnsupported. Triggered by torch.zeros_like(
+# scalar, dtype=torch.bool) calls in flex_attention mask_mod, which
+# lower to aten.full([], False, dtype=bool, device=cuda).
+torch._inductor.config.joint_graph_constant_folding = False
+
+# Pre-initialize SDPA pattern matcher at import time. Otherwise it
+# lazy-inits on first inductor compile, which can fire inside an active
+# cudagraph capture stream.
+try:
+    from torch._inductor.fx_passes.fuse_attention import _sfdp_init
+    _sfdp_init()
+    logger.info("env_override: SDPA pattern matcher pre-initialized "
+                "(no-op if already)")
+except Exception as _e:
+    logger.warning("env_override: _sfdp_init failed: %s", _e)
+
+# Workaround for dynamo's RNG-state read during cudagraph capture.
+# torch._dynamo.convert_frame._fn calls torch.cuda.get_rng_state() to
+# track RNG-state changes that would invalidate the compiled graph.
+# Inside an active cudagraph capture stream this triggers
+#   RuntimeError: Cannot call CUDAGeneratorImpl::current_seed during
+#   CUDA graph capture
+# which kills SF's verify-pass capture in flex_attention.py forward(),
+# where new shapes trigger lazy dynamo compilation inside the capture
+# region.
+_orig_get_rng_state = torch.cuda.get_rng_state
+_cached_rng_states: "dict[int, torch.Tensor]" = {}
+
+
+def _safe_get_rng_state(device='cuda'):
+    global _cached_rng_states
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+    try:
+        if isinstance(device, str):
+            dev_obj = torch.device(device)
+        elif isinstance(device, int):
+            dev_obj = torch.device('cuda', device)
+        else:
+            dev_obj = device
+        if dev_obj.index is None:
+            dev_idx = torch.cuda.current_device()
+        else:
+            dev_idx = dev_obj.index
+    except Exception:
+        dev_idx = torch.cuda.current_device()
+    if capturing:
+        cached = _cached_rng_states.get(int(dev_idx))
+        if cached is not None:
+            return cached
+    state = _orig_get_rng_state(device)
+    if not capturing:
+        _cached_rng_states[int(dev_idx)] = state
+    return state
+
+
+torch.cuda.get_rng_state = _safe_get_rng_state
+
+
+# Companion to _safe_get_rng_state: dynamo's frame entry also calls
+# torch.cuda.set_rng_state(saved_state) to restore RNG after the
+# compile probe. Suppress the set during capture; the cached get_state
+# already returned the same tensor.
+_orig_set_rng_state = torch.cuda.set_rng_state
+
+
+def _safe_set_rng_state(new_state, device='cuda'):
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+    if capturing:
+        return
+    return _orig_set_rng_state(new_state, device)
+
+
+torch.cuda.set_rng_state = _safe_set_rng_state
+
+
+# Workaround for inductor Triton kernel precompile calling
+# torch.cuda.synchronize() during cudagraph capture. When inductor
+# loads a cached Triton kernel inside an active capture (first verify
+# forward with a new dynamo cache key), _make_launchers calls
+# device_interface.synchronize -> torch._C._cuda_synchronize, which
+# raises cudaErrorStreamCaptureUnsupported. Suppress sync calls while
+# a capture is active.
+_orig_cuda_synchronize = torch.cuda.synchronize
+
+
+def _safe_cuda_synchronize(device=None):
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+    if capturing:
+        return
+    return (_orig_cuda_synchronize(device) if device is not None
+            else _orig_cuda_synchronize())
+
+
+torch.cuda.synchronize = _safe_cuda_synchronize
+
+# torch._C._cuda_synchronize is the underlying C-API call; some paths
+# bypass torch.cuda.synchronize and call _C directly. Wrap both.
+_orig_C_cuda_synchronize = torch._C._cuda_synchronize
+
+
+def _safe_C_cuda_synchronize(*args, **kwargs):
+    try:
+        capturing = torch.cuda.is_current_stream_capturing()
+    except Exception:
+        capturing = False
+    if capturing:
+        return
+    return _orig_C_cuda_synchronize(*args, **kwargs)
+
+
+torch._C._cuda_synchronize = _safe_C_cuda_synchronize
