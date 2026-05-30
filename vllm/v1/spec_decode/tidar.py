@@ -8,7 +8,7 @@ import os
 import torch
 import torch.nn as nn
 
-from vllm.attention.layer import Attention
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
 from vllm.forward_context import set_forward_context
