@@ -13,15 +13,16 @@ from torch.nn.attention.flex_attention import (BlockMask, _mask_mod_signature,
                                                create_block_mask,
                                                flex_attention)
 
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata, AttentionType,
-                                              is_quantized_kv_cache)
+from vllm.v1.attention.backend import (AttentionBackend, AttentionImpl,
+                                       AttentionMetadata, AttentionType,
+                                       is_quantized_kv_cache)
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils import cdiv, is_torch_equal_or_newer
-from vllm.v1.attention.backends.utils import (AttentionCGSupport,
-                                              AttentionMetadataBuilder,
-                                              CommonAttentionMetadata)
+from vllm.utils.math_utils import cdiv
+from vllm.utils.torch_utils import is_torch_equal_or_newer
+from vllm.v1.attention.backend import (AttentionCGSupport,
+                                       AttentionMetadataBuilder,
+                                       CommonAttentionMetadata)
 from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.v1.spec_decode.tidar_single_forward import tidar_mask_mod
 

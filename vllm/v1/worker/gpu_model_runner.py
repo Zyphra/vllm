@@ -18,13 +18,13 @@ from tqdm import tqdm
 from typing_extensions import TypeAlias
 
 import vllm.envs as envs
-from vllm.attention import Attention, AttentionType
-from vllm.attention.backends.abstract import AttentionBackend
+from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.attention.backend import AttentionType, AttentionBackend
 from vllm.model_executor.layers.attention.chunked_local_attention import ChunkedLocalAttention
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.cuda_graph import CUDAGraphWrapper
 from vllm.compilation.monitor import set_cudagraph_capturing_enabled
-from vllm.config import (CompilationLevel, CUDAGraphMode, VllmConfig,
+from vllm.config import (CompilationMode, CUDAGraphMode, VllmConfig,
                          get_layers_from_vllm_config, update_config)
 from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import (get_kv_transfer_group,
@@ -60,18 +60,23 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingType
 from vllm.sequence import IntermediateTensors
 from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
-from vllm.utils import (STR_DTYPE_TO_TORCH_DTYPE, DeviceMemoryProfiler,
-                        GiB_bytes, cdiv, check_use_alibi, get_dtype_size,
-                        is_pin_memory_available,
-                        length_from_prompt_token_ids_or_embeds, round_up,
-                        supports_dynamo)
+from vllm.utils import length_from_prompt_token_ids_or_embeds
+from vllm.utils.math_utils import cdiv, round_up
+from vllm.utils.mem_constants import GiB_bytes
+from vllm.utils.mem_utils import DeviceMemoryProfiler
+from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE,
+                                    get_dtype_size)
 from vllm.utils.jsontree import json_map_leaves
-from vllm.v1.attention.backends.flash_attn import AttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backend import (AttentionCGSupport,
+                                       AttentionMetadataBuilder,
+                                       CommonAttentionMetadata)
 from vllm.v1.attention.backends.utils import (
-    AttentionCGSupport, AttentionMetadataBuilder, CommonAttentionMetadata,
     create_fast_prefill_custom_backend,
-    reorder_batch_to_split_decodes_and_prefills, split_attn_metadata)
+    reorder_batch_to_split_decodes_and_prefills)
+from vllm.v1.worker.ubatch_utils import split_attn_metadata
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -234,7 +239,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.hidden_size = model_config.get_hidden_size()
         self.attention_chunk_size = model_config.attention_chunk_size
         # Only relevant for models using ALiBi (e.g, MPT)
-        self.use_alibi = check_use_alibi(model_config)
+        self.use_alibi = model_config.uses_alibi
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
 
@@ -3476,7 +3481,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         if (
             self.vllm_config.compilation_config.level == \
-                CompilationLevel.DYNAMO_AS_IS and supports_dynamo()
+                CompilationMode.STOCK_TORCH_COMPILE
         ):
             backend = self.vllm_config.compilation_config.init_backend(
                 self.vllm_config)
@@ -4485,7 +4490,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             msg = (f"CUDAGraphMode.{cudagraph_mode.name} is not supported "
                    f"with {min_cg_builder_name} backend (support: "
                    f"{min_cg_support})")
-            if (self.compilation_config.level == CompilationLevel.PIECEWISE and
+            if (self.compilation_config.mode == CompilationMode.VLLM_COMPILE and
                 (self.compilation_config.splitting_ops_contain_attention()
                  or self.compilation_config.use_inductor_graph_partition)):
                 msg += "; setting cudagraph_mode=PIECEWISE because "\
