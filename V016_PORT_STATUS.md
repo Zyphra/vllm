@@ -1,67 +1,101 @@
-# jinzhao/tidar_v016 — WIP port status
+# jinzhao/tidar_v016 — WIP port status (updated 2026-05-30)
 
 Branched from `origin/smoe-aiter-moe` on 2026-05-30 to port `jinzhao/tidar`'s
 TiDAR (TF + SF) onto vLLM v0.16.0. Phase 1 scope: SF-only minimum viable,
 eager mode first.
 
-## What's done
+## Current state
 
-| file | status | notes |
+| commit | what | status |
 |---|---|---|
-| `vllm/v1/spec_decode/tidar.py` | new + 1 import fix | `vllm.attention.layer` → `vllm.model_executor.layers.attention.attention` |
-| `vllm/v1/spec_decode/tidar_single_forward.py` | new (copied verbatim) | |
-| `vllm/v1/spec_decode/cca.py` | new (copied verbatim) | spec_decode CCA support |
-| `vllm/v1/spec_decode/metadata.py` | merged | added `draft_probs` + `draft_logits` Optional fields onto aiter-moe's `cu_num_sampled_tokens` addition |
-| `vllm/attention/ops/sf_attention.py` | new (copied verbatim) | paged Triton SF kernel |
-| `vllm/env_override.py` | merged | appended SF cudagraph workarounds after aiter-moe's torch 2.9 inductor patches |
-| `vllm/config/speculative.py` | minimal port | added `"tidar"` to `SpeculativeMethod`, `tidar_diff_temperature` field, `__post_init__` tidar branches (drafter setup + token-tree), `use_tidar()` method. Skipped: `compute_hash` refactor to `uses_aux_hidden_state_outputs()`, `deepseek_v32` handling, MTP consolidation (those are general v0.16 vLLM-side changes, not TiDAR-specific) |
-| `vllm/v1/attention/backends/flex_attention.py` | **brute-force copy from jinzhao/tidar** | aiter-moe's structural changes (method renames, new `supports_attn_type`, `supports_mm_prefix`, `get_prefix_lm_mask_mod`, etc.) are NOT preserved. Will likely need adapting at runtime |
-| `vllm/v1/worker/gpu_model_runner.py` | **brute-force copy from jinzhao/tidar** + 1 import fix | aiter-moe's ~3000-line refactor lost; `vllm.attention.layers.chunked_local_attention` → `vllm.model_executor.layers.attention.chunked_local_attention` |
-| `scripts/_sf_mmlu_sweep.py` | new (with hmmt dataset) | |
-| `handoff.md`, `SF_proposal_layouts.md`, `accept_comparison_OPD.md` | new (docs) | |
-| `docs/imgs/acc_dist_p17_thinking.png` | new | |
-| CCA model arch files (`vllm/model_executor/layers/mamba/cca.py`, `vllm/v1/attention/backends/cca_attn.py`) | **kept aiter-moe's versions** | aiter-moe has their own SMoE arch CCA implementation; ours would conflict |
+| `b54275125` | tidar-only files + small shared (metadata, env_override, speculative) | ✓ imports |
+| `b106800a0` | brute-force copy flex_attention.py + gpu_model_runner.py from jinzhao/tidar; first 2 import-path fixes | ✗ many APIs drifted |
+| `dd7c7caaf` | flex_attention.py batch fixes; first wave gpu_model_runner.py fixes | flex_attention.py imports ✓ |
+| `c527ac174` | more gpu_model_runner.py import fixes; **announced strategy pivot** | gpu_model_runner.py still failing |
+| **`HEAD` (uncommitted)** | **gpu_model_runner.py reset to aiter-moe — clean baseline** | all targeted imports pass |
 
-## What's NOT done
+The full vLLM build succeeded on vp-dgx-51 with `VLLM_USE_PRECOMPILED=0`
+in `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016` (~20 min,
+torch 2.9.1+cu126, vllm-0.16.1.dev37+gb106800a0.cu128).
 
-| step | reason |
-|---|---|
-| `vllm/config/vllm.py` cuda_graph_sizes override for TiDAR K+1 capture shapes | Phase 2 — only fires under captured mode, deferred to start with eager |
-| `vllm/v1/attention/backends/flex_attention.py` — adapt to aiter-moe's `supports_attn_type` / `supports_mm_prefix` / `get_prefix_lm_mask_mod` / etc. | Will surface as build/runtime errors; fix iteratively after first build |
-| `vllm/v1/worker/gpu_model_runner.py` — adapt to aiter-moe's ~3000-line refactor (model loader, KV cache manager, scheduler hooks, etc.) | Same — fix iteratively after first build |
-| `pip install -e . VLLM_USE_PRECOMPILED=0` recompile | Not run. Required before any import test will succeed (existing venv has v0.15 `_custom_ops` already registered → `register_fake` collision when v0.16's `_custom_ops` tries to register the same op) |
-| Smoke test TF + SF on iter_0012000 | Blocked on build |
+## What works now (after the reset)
 
-## How to continue
-
-```bash
-cd /tmp/_v016_port  # on vp-dgx-4 OR clone fresh from jinzhao/tidar_v016
-# Set up a clean venv (don't use the shared /data/home/jinzhao/workspace/tidar/.venv,
-# which the other worktrees depend on)
-python -m venv .venv-v016
-source .venv-v016/bin/activate
-pip install --upgrade pip wheel ninja
-VLLM_USE_PRECOMPILED=0 pip install -e . --no-build-isolation
-# ^ expect 30-60 min on H100 node for the full C/Triton/CUDA build
-
-# Try imports
-python -c "from vllm import LLM"
-
-# Fix errors iteratively, recompile only if C-side changes
-# (Python-only changes don't need re-pip-install with editable mode)
+```python
+import vllm                                            # OK
+from vllm.config.speculative import SpeculativeConfig  # OK, has use_tidar()
+from vllm.v1.spec_decode.metadata import SpecDecodeMetadata  # OK, has draft_probs/draft_logits
+from vllm.v1.spec_decode.tidar import TiDARProposer    # OK
+from vllm.v1.spec_decode.tidar_single_forward import * # OK (verbatim)
+import vllm.v1.attention.backends.flex_attention       # OK (after batch fixes)
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner  # OK (aiter-moe's version, NO TiDAR hooks yet)
+from vllm import LLM                                   # OK
 ```
 
-## Anticipated breakages (rough order of likelihood)
+## What still needs to be done
 
-1. **Import path changes** — any `from vllm.X import Y` where X moved. Already hit 2; many more likely. Run `python -c "from vllm.v1.spec_decode.tidar import TiDARProposer"` for the first wave.
-2. **`EagleProposer` base class API** — TiDARProposer extends EagleProposer. If EagleProposer's method signatures (`propose`, `prepare_inputs`) changed between v0.15 and v0.16, our overrides will break.
-3. **`FlexAttentionMetadata` field names** — we add SF-specific fields (`tidar_single_forward_proposal_acc_levels`); aiter-moe added their own fields (`logical_block_ids` etc.). Need to add ours to the new dataclass.
-4. **`SpecDecodeMetadata.make_dummy` signature** — aiter-moe added `cu_num_sampled_tokens`; our `draft_probs` / `draft_logits` are kwarg-defaulted so should be backward-compat, but verify.
-5. **`gpu_model_runner.py` model-loading code** — we have the v0.15 model loader call; aiter-moe restructured this. May need surgical replacement of our entire model-loading block with aiter-moe's.
+After my reset, `gpu_model_runner.py` is **aiter-moe's pristine version with
+no TiDAR hooks**. SF won't actually function until the following blocks are
+re-injected. I've labeled them by what they do and roughly where they go.
+The reference source for each is `origin/jinzhao/tidar:vllm/v1/worker/gpu_model_runner.py`.
+
+| # | block | size | what | injection point in aiter-moe gpu_model_runner.py |
+|---|---|---|---|---|
+| 1 | `_draft_probs_by_req_id` + `_draft_logits_by_req_id` dicts | ~12 lines | per-step stash of drafter outputs keyed by req_id | end of `GPUModelRunner.__init__` |
+| 2 | `_gather_draft_probs()` method | ~25 lines | reassemble per-req draft_probs in input-batch order for the next step | new method on GPUModelRunner |
+| 3 | `_gather_draft_logits()` method | ~25 lines | parallel plumbing for raw drafter logits (mix-logit v1 needs these) | new method on GPUModelRunner |
+| 4 | `spec_decode_metadata.draft_probs/draft_logits` population | ~10 lines | wire the gathered dicts onto the metadata dataclass each step | wherever aiter-moe builds the SpecDecodeMetadata for spec-decode |
+| 5 | v1 mix-logit + no_bonus sampler block | ~50 lines | the `if _mix_dt_v1` / `elif _drafts_only` / etc. branches that intercept `target_logits` before `self.rejection_sampler(...)` | wherever aiter-moe calls `self.rejection_sampler` |
+| 6 | TiDAR SF drafter-prep | ~80 lines | when `tidar_drafter.single_forward_mode`, take the `_propose` early-exit path that calls `extract_drafts_from_hidden` instead of `self.drafter.propose(...)` | wherever aiter-moe invokes the drafter |
+| 7 | drafter stash hook | ~20 lines | after each `self.drafter.propose(...)`, copy `tidar_drafter.last_draft_probs` and `last_draft_logits` into the per-req dicts | right after the propose call |
+
+Total estimated injection: ~220 lines spread across 6-7 distinct anchor
+points. Each anchor needs to be located in aiter-moe's restructured
+file by grepping for the surrounding context (`bonus_logits_indices`,
+`rejection_sampler`, `self.drafter.propose`, etc.).
+
+After all blocks are injected:
+- Re-add the SF capture-shape override to `vllm/config/vllm.py` (Phase 2; only matters for captured mode)
+- Smoke-test SF eager mode on `iter_0012000` AIME25 thinking-off
+
+## Anticipated runtime breakages after injection
+
+Even with all hooks injected, runtime can break because:
+1. **`EagleProposer` base class API may have changed** — TiDARProposer extends EagleProposer; if `propose`, `prepare_inputs`, etc. have new signatures, our overrides break.
+2. **`SpecDecodeMetadata.make_dummy` signature** — aiter-moe added `cu_num_sampled_tokens`; need a kwarg-default-free call.
+3. **FlexAttentionMetadata SF fields** — we add `tidar_single_forward_proposal_acc_levels`; aiter-moe added `logical_block_ids` etc. The two field sets must coexist in the new dataclass.
+4. **CCA model arch** — aiter-moe has their own SMoE CCA impl; our `vllm/v1/spec_decode/cca.py` may reference fields/methods their CCA doesn't expose.
+
+## Continuation recipe
+
+```bash
+ssh vp-dgx-51  # or 147.68.0.51
+cd /data/home/jinzhao/workspace/tidar/Zvllm-v016
+git status                                          # should be clean after the reset commit lands
+git pull origin jinzhao/tidar_v016 --ff-only
+
+# verify imports still work after pull
+source .venv-v016/bin/activate
+python -c "from vllm.v1.worker.gpu_model_runner import GPUModelRunner"
+
+# diff aiter-moe vs jinzhao/tidar to find injection contexts:
+git diff $(git merge-base origin/smoe-aiter-moe origin/jinzhao/tidar) origin/jinzhao/tidar -- vllm/v1/worker/gpu_model_runner.py | less
+
+# Inject blocks 1-7 per the table above into vllm/v1/worker/gpu_model_runner.py
+# (a careful 3-5h task)
+
+# Test: smoke run on iter_0012000
+VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
+VLLM_ATTENTION_BACKEND=FLEX_ATTENTION \
+python scripts/_sf_mmlu_sweep.py \
+  --ckpt /data/checkpoints/smoediffusion_128k_64node-hf/iter_0012000 \
+  --thinking off --max-tokens 128 --max-model-len 4096 \
+  --batch 1 --K 16 --n 1 --mode tidar --eager \
+  --t-ar 0.0 --dataset aime25 --tag v016_smoke
+```
 
 ## Memory references
 
-- [[project_sf_captured_cudagraph_fixes]] — the 5 env_override patches needed; ported.
-- [[project_sf_kp1_layout_required]] — K+1 layout requirement; respected.
-- [[project_sf_requires_flex_backend]] — FLEX_ATTENTION backend requirement; respected.
-- [[project_sf_multi_call_acceptance_regression]] — multi-call FA path is eager-only bug; preserved.
+- [[project_sf_captured_cudagraph_fixes]] — ported
+- [[project_sf_kp1_layout_required]] — respected
+- [[project_sf_requires_flex_backend]] — respected
+- [[project_sf_multi_call_acceptance_regression]] — preserved (eager-only)
