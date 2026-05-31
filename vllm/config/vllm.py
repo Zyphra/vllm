@@ -1316,20 +1316,20 @@ class VllmConfig:
                     "for AR/non-spec-decode.",
                     explicit, K_plus_1, max_b, sf_per_req, _P, cap)
                 self.compilation_config.cudagraph_capture_sizes = explicit
-                # TiDAR FULL captured replay was found to need
-                # copy_inputs=True earlier in the port (lazy scratch-block
-                # allocator + per-step set_tidar_single_forward_metadata
-                # produced pointers that drifted between capture-time and
-                # replay-time -> cudaErrorIllegalAddress). After Block 10
-                # shape-based SF detection fires during capture-warmup,
-                # the metadata pointers may be stable enough to skip the
-                # copy. Default to True only if the user did not set it.
-                if (self.compilation_config.cudagraph_copy_inputs
-                        is False):
-                    # user explicitly opted out; honor it
-                    pass
-                else:
-                    self.compilation_config.cudagraph_copy_inputs = True
+                # TiDAR captured replay needs copy_inputs=True: the
+                # lazy scratch-block allocator and per-step
+                # set_tidar_single_forward_metadata produce tensor
+                # pointers that drift between capture-time and replay-
+                # time, causing cudaErrorIllegalAddress under TF (and
+                # SF historically). copy_inputs=True forces the runner
+                # to memcpy fresh inputs into the captured buffers each
+                # step. SF measured identical 176 tok/s for both, TF
+                # crashes without it -> just force True unconditionally
+                # under TiDAR. (The bool default-False field has no
+                # tri-state to distinguish user-False from default-
+                # False, so honoring "explicit opt-out" is unsafe and
+                # was removed.)
+                self.compilation_config.cudagraph_copy_inputs = True
             # === end TiDAR Block 8 ====================================
 
             # determine the cudagraph_capture_sizes

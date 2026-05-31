@@ -865,6 +865,7 @@ class TiDARProposer(EagleProposer):
         _cg_mode, _draft_desc = runner.cudagraph_dispatcher.dispatch(
             num_tokens=num_input_tokens,
             uniform_decode=True,
+            is_drafter_pass=True,
         )
 
         # Tier 3 lazy capture: the first time we hit this shape, the

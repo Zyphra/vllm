@@ -56,6 +56,18 @@ class BatchDescriptor(NamedTuple):
     to be properly captured.
     """
 
+    is_drafter_pass: bool = False
+    """
+    True when the captured graph is for a TiDAR drafter forward (path 2:
+    read=AR slot, write=draft scratch slot). The verifier forward (path 1:
+    read=AR, write=AR) gets a separate captured graph at the same shape,
+    because the captured kernels bake gather/scatter operand pointers at
+    warmup and the two passes need different write-side slots. Sharing
+    a single captured graph between verifier and drafter would cause the
+    drafter to write to AR (verifier semantics frozen at capture),
+    corrupting the post-acceptance CCA state.
+    """
+
     def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
         Return a relaxed version of current batch descriptor that is still compatible
@@ -67,6 +79,7 @@ class BatchDescriptor(NamedTuple):
             uniform=False,
             has_lora=self.has_lora,
             num_active_loras=self.num_active_loras,
+            is_drafter_pass=self.is_drafter_pass,
         )
 
 

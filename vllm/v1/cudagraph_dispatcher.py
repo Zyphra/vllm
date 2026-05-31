@@ -125,6 +125,7 @@ class CudagraphDispatcher:
         uniform_decode: bool,
         has_lora: bool,
         num_active_loras: int = 0,
+        is_drafter_pass: bool = False,
     ) -> BatchDescriptor:
         max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
         uniform_decode_query_len = self.uniform_decode_query_len
@@ -143,6 +144,7 @@ class CudagraphDispatcher:
             uniform=uniform_decode,
             has_lora=has_lora,
             num_active_loras=num_active_loras,
+            is_drafter_pass=is_drafter_pass,
         )
 
     def add_cudagraph_key(
@@ -215,6 +217,23 @@ class CudagraphDispatcher:
                         bs, True, num_active_loras > 0, num_active_loras
                     ),
                 )
+                # TiDAR TF: register a separate FULL key per shape with
+                # is_drafter_pass=True. The drafter forward (path 2:
+                # read=AR, write=draft scratch) needs its own captured
+                # graph because the captured CCA gather/scatter operand
+                # pointers are baked at warmup. Sharing the verifier
+                # graph (write=AR) would corrupt the post-acceptance
+                # state. The drafter graph is captured lazily on first
+                # propose() call -- see TiDARProposer.propose's Tier 3
+                # logic in vllm/v1/spec_decode/tidar.py.
+                # NOTE: v0.16 does NOT rebind drafter.model to the
+                # CUDAGraphWrapper-wrapped model (v0.15 did:
+                # `self.drafter.model = self.model` after wrapping).
+                # In v0.16 `drafter.model = target_model` (unwrapped) in
+                # TiDARProposer.load_model, so drafter.forward bypasses
+                # the wrapper entirely and runs eager. There is no
+                # captured "drafter graph" to dispatch to, so we do NOT
+                # register an is_drafter_pass=True key here.
 
         self.keys_initialized = True
 
@@ -226,6 +245,7 @@ class CudagraphDispatcher:
         disable_full: bool = False,
         disable_piecewise: bool = False,
         num_active_loras: int = 0,
+        is_drafter_pass: bool = False,
     ) -> tuple[CUDAGraphMode, BatchDescriptor]:
         """
         Given conditions(e.g.,batch descriptor and if using piecewise only),
@@ -270,7 +290,8 @@ class CudagraphDispatcher:
                 effective_num_active_loras = self.vllm_config.lora_config.max_loras + 1
 
         batch_desc = self._create_padded_batch_descriptor(
-            num_tokens, uniform_decode, has_lora, effective_num_active_loras
+            num_tokens, uniform_decode, has_lora, effective_num_active_loras,
+            is_drafter_pass=is_drafter_pass,
         )
         relaxed_batch_desc = batch_desc.relax_for_mixed_batch_cudagraphs()
 
