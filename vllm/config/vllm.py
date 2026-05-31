@@ -1316,6 +1316,14 @@ class VllmConfig:
                     "for AR/non-spec-decode.",
                     explicit, K_plus_1, max_b, sf_per_req, _P, cap)
                 self.compilation_config.cudagraph_capture_sizes = explicit
+                # TiDAR FULL captured replay needs copy_inputs=True so that
+                # per-step input/metadata pointers stay valid (the lazy
+                # scratch-block allocator and various
+                # set_tidar_single_forward_metadata fields would otherwise
+                # become stale between capture-time pointers and
+                # replay-time data). Without it, captured FULL crashes
+                # with cudaErrorIllegalAddress at first replay.
+                self.compilation_config.cudagraph_copy_inputs = True
             # === end TiDAR Block 8 ====================================
 
             # determine the cudagraph_capture_sizes
