@@ -189,6 +189,20 @@ class CCA(MambaBase, CustomOp):
             self._spec_stash_hs = None
             self._spec_stash_slots = None
 
+        # Whether the captured-friendly vectorized prefill path is REQUIRED
+        # this run. True only when FULL_DECODE_ONLY (or FULL_AND_PIECEWISE)
+        # cudagraph mode is enabled — under PIECEWISE the eager Python loop
+        # runs out-of-graph and is faster (no stash, no reshape contiguity
+        # churn). Under eager, both paths are valid but the loop is faster.
+        from vllm.config import CUDAGraphMode
+        _cg_mode = getattr(compilation_config, "cudagraph_mode", None)
+        self._use_spec_vectorized = bool(
+            self._spec_stash_conv is not None
+            and _cg_mode is not None
+            and _cg_mode != CUDAGraphMode.NONE
+            and _cg_mode.decode_mode() == CUDAGraphMode.FULL
+        )
+
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.to(torch.float32)
 
@@ -288,30 +302,32 @@ class CCA(MambaBase, CustomOp):
     def _conv_qk_decode(self, x: torch.Tensor) -> torch.Tensor:
         """Manual conv_qk for decode-sized inputs.
 
-        Decode uses tiny sequence windows (total_padding + 1 or
-        total_padding + K), so the generic conv path can spend a
-        disproportionate amount of time on layout transforms and
-        kernel setup. This manual implementation preserves the
-        two-stage depthwise+grouped conv math while operating
-        directly on the compact decode tensor.
+        Runs in fp32 (same as _conv_qk_apply) to keep CCA acceptance
+        rates matching the eager Python-loop path. The Python-loop
+        path uses _conv_qk_apply (fp32), so this method must too —
+        bf16 here introduced ~37% mean-acceptance regression vs eager
+        on AIME25 thinking-off.
 
         Input:  [N, C, S]
         Output: [N, C, S_out]
         """
+        orig_dtype = x.dtype
         # Stage 1: depthwise conv over sequence.
-        w0 = self.conv_qk[0].weight.squeeze(1)  # [C, K0]
-        b0 = self.conv_qk[0].bias               # [C] or None
+        w0 = self.conv_qk[0].weight.squeeze(1).to(torch.float32)  # [C, K0]
+        b0 = self.conv_qk[0].bias
+        b0_fp32 = b0.to(torch.float32) if b0 is not None else None
 
-        x = x.to(w0.dtype)
+        x = x.to(torch.float32)
         k0 = w0.shape[1]
-        x_windows = x.unfold(-1, k0, 1)  # [N, C, L_mid, K0]
-        mid = (x_windows * w0[:, None, :]).sum(dim=-1)  # [N, C, L_mid]
-        if b0 is not None:
-            mid = mid + b0[None, :, None]
+        x_windows = x.unfold(-1, k0, 1)
+        mid = (x_windows * w0[:, None, :]).sum(dim=-1)
+        if b0_fp32 is not None:
+            mid = mid + b0_fp32[None, :, None]
 
         # Stage 2: grouped conv over the depthwise output.
-        w1 = self.conv_qk[1].weight  # [C, D, K1]
-        b1 = self.conv_qk[1].bias    # [C] or None
+        w1 = self.conv_qk[1].weight.to(torch.float32)
+        b1 = self.conv_qk[1].bias
+        b1_fp32 = b1.to(torch.float32) if b1 is not None else None
         g = self.num_k_heads + self.num_q_heads
         d = self.head_dim
         k1 = w1.shape[2]
@@ -319,9 +335,9 @@ class CCA(MambaBase, CustomOp):
                        .unfold(-1, k1, 1))
         w1_grouped = w1.view(g, d, d, k1)
         out = torch.einsum("godk,sgdtk->sgot", w1_grouped, mid_windows)
-        if b1 is not None:
-            out = out + b1.view(1, g, d, 1)
-        return out.reshape(x.shape[0], g * d, out.shape[-1])
+        if b1_fp32 is not None:
+            out = out + b1_fp32.view(1, g, d, 1)
+        return out.reshape(x.shape[0], g * d, out.shape[-1]).to(orig_dtype)
 
     def _spec_decode_prefill_vectorized(
         self,
@@ -939,7 +955,7 @@ class CCA(MambaBase, CustomOp):
                 sf_K = (S_uniform - sf_verify_len) // sf_P_props
                 sf_total_S = sf_verify_len + sf_P_props * sf_K
             use_vectorized_prefill = (
-                self._spec_stash_conv is not None
+                self._use_spec_vectorized
                 and P_pref > 0
                 and num_prefill_tokens == P_pref * S_uniform
                 and S_uniform == self._spec_max_S
@@ -948,7 +964,7 @@ class CCA(MambaBase, CustomOp):
             )
             use_single_forward_prefill = (
                 single_forward_mode
-                and self._spec_stash_conv is not None
+                and self._use_spec_vectorized
                 and P_pref > 0
                 and num_prefill_tokens == P_pref * sf_total_S
                 and sf_verify_len <= self._spec_max_S
