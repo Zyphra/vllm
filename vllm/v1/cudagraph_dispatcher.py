@@ -159,6 +159,10 @@ class CudagraphDispatcher:
         # This should be called only after attention backend is initialized. So we can
         # get the correct cudagraph mode after backend support is resolved.
         self.cudagraph_mode = cudagraph_mode
+        # Sync uniform_decode_query_len with the runner. Required when TiDAR
+        # SF bumps it from K+1 to verify_len + P*(K+1) under FULL cudagraph
+        # so the captured graph dispatcher computes num_reqs correctly.
+        self.uniform_decode_query_len = uniform_decode_query_len
 
         # Early exit if cudagraphs are disabled
         if cudagraph_mode == CUDAGraphMode.NONE:

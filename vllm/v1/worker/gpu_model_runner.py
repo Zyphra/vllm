@@ -652,6 +652,36 @@ class GPUModelRunner(
 
         self.uniform_decode_query_len = 1 + self.num_spec_tokens
 
+        # === TiDAR Block 12: bump uniform_decode_query_len under FULL =
+        # TiDAR SF inflates per-req tokens from K+1 to verify_len + P*(K+1)
+        # in Block 9 before the captured forward runs. For FULL cudagraph
+        # capture to hit the inflated layout, override to the inflated
+        # value — but ONLY when FULL cudagraph is active. Under PIECEWISE,
+        # the override would break the uniform_decode dispatch check at
+        # _prepare_inputs (which uses K+1, the pre-inflation shape).
+        # Rejection sampler, _commit_tidar_cca_state etc. all still key
+        # off num_speculative_tokens = K, not this value.
+        _cg_mode = getattr(self.compilation_config, "cudagraph_mode", None)
+        _full_active = (_cg_mode is not None
+                        and hasattr(_cg_mode, "has_full_cudagraphs")
+                        and _cg_mode.has_full_cudagraphs())
+        if (_full_active
+                and self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and getattr(self, "drafter", None) is not None
+                and getattr(self.drafter, "single_forward_mode", False)):
+            K = self.speculative_config.num_speculative_tokens
+            P = len(getattr(self.drafter, "proposal_acc_levels", ()))
+            if P > 0:
+                verify_len = self.drafter.verify_len
+                self.uniform_decode_query_len = (
+                    verify_len + P * (K + 1))
+                logger.info(
+                    "TiDAR SF: bumped uniform_decode_query_len to %d "
+                    "(verify_len=%d, P=%d, K=%d)",
+                    self.uniform_decode_query_len, verify_len, P, K)
+        # === end TiDAR Block 12 ======================================
+
         # Cudagraph dispatcher for runtime cudagraph dispatching.
         self.cudagraph_dispatcher = CudagraphDispatcher(self.vllm_config)
 
@@ -1878,12 +1908,33 @@ class GPUModelRunner(
         # so the FlexAttention mask_mod can use the SF K+1 + P*(K+1) layout
         # to produce useful proposal hidden_states (which Block 6's SF
         # early-exit later extracts via extract_drafts_from_hidden).
+        # Fire when (a) inflation occurred this step (eager/PIECEWISE
+        # path) OR (b) the batch SHAPE matches sf_per_req (capture +
+        # capture-warmup path: last_inflated_total stays None because no
+        # real Block 9 ran, but cudagraph requires SF metadata for both
+        # warmup (so Triton autotune fires in eager) and capture (so
+        # downstream CCA + FlexAttention take the vectorized path).
+        _drafter = getattr(self, "drafter", None)
         _sf_meta_fire = (
             self.speculative_config
             and self.speculative_config.use_tidar()
-            and getattr(self.drafter, "single_forward_mode", False)
-            and getattr(self.drafter, "last_inflated_total", None) is not None
+            and getattr(_drafter, "single_forward_mode", False)
         )
+        if _sf_meta_fire:
+            _inflated = (getattr(_drafter, "last_inflated_total", None)
+                         is not None)
+            if not _inflated:
+                # Shape-based SF detection: sf_per_req = K+1 + P*(K+1).
+                _K = self.speculative_config.num_speculative_tokens or 0
+                _P = len(getattr(_drafter, "proposal_acc_levels", ()))
+                _sf_per_req = (_K + 1) + _P * (_K + 1)
+                _looks_like_sf = (
+                    _sf_per_req > 0
+                    and num_reqs_padded > 0
+                    and num_tokens_padded == _sf_per_req * num_reqs_padded
+                )
+                if not _looks_like_sf:
+                    _sf_meta_fire = False
         # === end TiDAR Block 10 prep ================================
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy

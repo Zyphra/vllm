@@ -1230,6 +1230,38 @@ class VllmConfig:
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
+            # === TiDAR Block 8a: bump cap for SF inflated shape =======
+            # The default decode_query_len = 1 + K = K+1 = 17 only sizes
+            # the cap for TF verify. SF's combined-forward inflates to
+            # sf_per_req = (P+1) * (K+1) per req. Without bumping the cap
+            # to fit sf_per_req * max_num_seqs, SF's inflated shape falls
+            # back to eager and FULL_DECODE_ONLY doesn't capture anything
+            # useful for SF.
+            if (
+                self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and self.speculative_config.num_speculative_tokens is not None
+            ):
+                _K_plus_1 = (
+                    self.speculative_config.num_speculative_tokens + 1)
+                import os as _os
+                _sf_levels_env = _os.environ.get(
+                    "VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
+                if _sf_levels_env.strip():
+                    _P = len([
+                        x for x in _sf_levels_env.split(",") if x.strip()
+                    ])
+                else:
+                    _P = 3
+                _sf_per_req = _K_plus_1 + _P * _K_plus_1
+                _needed = (
+                    _sf_per_req * self.scheduler_config.max_num_seqs)
+                max_cudagraph_capture_size = max(
+                    max_cudagraph_capture_size,
+                    min(_needed, max_num_tokens),
+                )
+            # === end TiDAR Block 8a ===================================
+
             assert max_cudagraph_capture_size >= 1, (
                 "Maximum cudagraph size should be greater than or equal to 1 "
                 "when using cuda graph."
