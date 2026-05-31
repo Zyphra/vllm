@@ -3047,20 +3047,125 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
-        # === TiDAR Block 5 (minimal): thread draft_probs through =====
-        # Use the per-req draft probs stashed by the TiDAR drafter (None at
-        # T_Diff == 0 / non-TiDAR \u2014 routes to NO_DRAFT_PROBS branch).
-        # Full v1 mix-logit / no_bonus / drafts_only / ar_only paths from
-        # jinzhao/tidar are NOT yet ported \u2014 they require slicing target
-        # logits ourselves (aiter-moe\u0027s rejection_sampler signature
-        # changed and now handles target/bonus splitting internally).
+        # === TiDAR Block 5: mix-logit / drafts-only / ar-only sampler ===
+        # Optional alternative samplers gated on env vars. All bypass or
+        # modify the rejection-sampler standard path. None of these
+        # change anything when their env var is unset (default = standard
+        # rejection sampling with possibly-None draft_probs at T_Diff=0).
+        #
+        # In v0.16 the rejection_sampler internally splits the
+        # [num_tokens + batch] logits tensor into bonus_logits and
+        # target_logits using metadata.bonus_logits_indices /
+        # target_logits_indices (vs v0.15 where the runner pre-split).
+        # To inject mixed target logits we write into
+        # logits[target_logits_indices] in-place BEFORE calling
+        # rejection_sampler. For drafts-only / ar-only we bypass the
+        # rejection sampler and build a SamplerOutput directly with the
+        # bonus token from a single self.sampler call on bonus_logits.
+        import os as _os_b5
+        import dataclasses as _dc_b5
+        from vllm.v1.outputs import SamplerOutput as _SO_b5
+
+        _ar_only = _os_b5.environ.get("TIDAR_AR_ONLY")
+        _drafts_only = _os_b5.environ.get("TIDAR_DRAFTS_ONLY")
+        _mix_v1 = _os_b5.environ.get("TIDAR_MIX_DRAFT_TARGET_V1")
+        _v1_w_runtime = None
+        try:
+            with open("/tmp/tidar_mix_w") as _fh:
+                _v1_w_runtime = float(_fh.read().strip())
+        except Exception:
+            pass
+        if _v1_w_runtime is not None:
+            _mix_v1 = "1" if _v1_w_runtime > 0 else None
+
+        def _truthy_b5(v):
+            return v is not None and v not in ("", "0", "false", "False")
+
+        _bli = spec_decode_metadata.bonus_logits_indices
+        _tli = spec_decode_metadata.target_logits_indices
+        _has_spec_meta = (_bli is not None and _bli.numel() > 0
+                          and _tli is not None)
+
+        if (_truthy_b5(_ar_only) and _has_spec_meta
+                and sampling_metadata.temperature is not None):
+            # AR-ONLY: drafter ran (KV state advanced) but the K target
+            # positions are direct-sampled at per-row T_AR.
+            _num_reqs = _bli.numel()
+            _K = _tli.numel() // max(_num_reqs, 1)
+            _bonus_out = self.sampler(
+                logits=logits[_bli],
+                sampling_metadata=_dc_b5.replace(
+                    sampling_metadata, max_num_logprobs=-1),
+            )
+            _bonus_ids = _bonus_out.sampled_token_ids
+            _target_logits = logits[_tli].to(torch.float32)
+            _temp_per_t = (
+                sampling_metadata.temperature.to(torch.float32)
+                .repeat_interleave(_K))
+            _ar_meta = _dc_b5.replace(
+                sampling_metadata,
+                temperature=_temp_per_t,
+                all_greedy=False,
+                all_random=True,
+            )
+            _ar_out = self.sampler(
+                logits=_target_logits, sampling_metadata=_ar_meta)
+            _ar_ids = _ar_out.sampled_token_ids.view(_num_reqs, _K)
+            sampler_output = _SO_b5(
+                sampled_token_ids=torch.cat(
+                    [_ar_ids, _bonus_ids.view(_num_reqs, 1)], dim=1),
+                logprobs_tensors=None,
+            )
+        elif (_truthy_b5(_drafts_only) and _has_spec_meta
+                and spec_decode_metadata.draft_token_ids is not None):
+            # DRAFTS-ONLY: commit drafts unchanged + AR bonus.
+            _num_reqs = _bli.numel()
+            _K = _tli.numel() // max(_num_reqs, 1)
+            _bonus_out = self.sampler(
+                logits=logits[_bli],
+                sampling_metadata=_dc_b5.replace(
+                    sampling_metadata, max_num_logprobs=-1),
+            )
+            _bonus_ids = _bonus_out.sampled_token_ids
+            _drafts = (spec_decode_metadata.draft_token_ids
+                       .view(_num_reqs, _K))
+            sampler_output = _SO_b5(
+                sampled_token_ids=torch.cat(
+                    [_drafts, _bonus_ids.view(_num_reqs, 1)], dim=1),
+                logprobs_tensors=None,
+            )
+        elif (_truthy_b5(_mix_v1) and _has_spec_meta
+                and spec_decode_metadata.draft_logits is not None
+                and sampling_metadata.temperature is not None):
+            # MIX-LOGIT V1: blend target + draft logits in-place, pass
+            # to rejection sampler. mixed = w*target + (1-w)*draft.
+            # Default w=0.5. draft_probs stays None at T_diff=0
+            # (rejection_sampler routes to its NO_DRAFT_PROBS branch).
+            # Do NOT synthesize a soft q -- see jinzhao/tidar 583479480.
+            _v1_w = (_v1_w_runtime if _v1_w_runtime is not None else
+                     float(_os_b5.environ.get(
+                         "TIDAR_MIX_LOGIT_TARGET_WEIGHT", "0.5")))
+            _target_dtype = logits.dtype
+            _target_logits = logits[_tli].to(torch.float32)
+            _draft_logits = (
+                spec_decode_metadata.draft_logits.to(torch.float32))
+            _mixed = (_v1_w * _target_logits
+                      + (1.0 - _v1_w) * _draft_logits)
+            logits[_tli] = _mixed.to(_target_dtype)
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                spec_decode_metadata.draft_probs,
+                logits,
+                sampling_metadata,
+            )
+        else:
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                spec_decode_metadata.draft_probs,
+                logits,
+                sampling_metadata,
+            )
         # === end TiDAR Block 5 =======================================
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            spec_decode_metadata.draft_probs,
-            logits,
-            sampling_metadata,
-        )
         return sampler_output
 
     def _bookkeeping_sync(
