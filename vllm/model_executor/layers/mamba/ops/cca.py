@@ -985,6 +985,10 @@ def cca_prefill_fused(
     dw_bias,             # [E] or None
     gw_weight,           # [G, D, D, K1]  (flattened grouped weight)
     gw_bias,             # [G, D]
+    req_idx=None,        # [T] precomputed token->req mapping (optional)
+    dw_start_loc=None,   # [num_prefills] precomputed (optional)
+    skip_writes=False,   # TiDAR drafter pass: skip stash writes
+    state_indices_p_write=None,  # [num_prefills] write-side slots (optional)
 ):
     """Fused CCA prefill: hs2-shift + depthwise conv1d + grouped conv1d.
 
@@ -992,6 +996,11 @@ def cca_prefill_fused(
     Triton kernels.  Mutates *prev_hs* and *conv_states* in-place.
 
     Returns (hs2, qk_packed3_p) both shaped [T, ...].
+
+    For cudagraph-safe use: pre-compute ``req_idx`` and ``dw_start_loc``
+    outside the captured graph (the legacy inline path uses
+    ``torch.repeat_interleave(arange, gpu_tensor)`` which requires a
+    GPU->CPU sync to determine the output size and breaks capture).
     """
     device = hs_p.device
     T = hs_p.shape[0]
@@ -1005,11 +1014,12 @@ def cca_prefill_fused(
     has_initial_states_p = has_initial_states_p.to(device=device)
     state_indices_p = state_indices_p.to(device=device, dtype=torch.int64)
 
-    seq_lens = query_start_loc_p[1:] - query_start_loc_p[:-1]
-    req_idx = torch.repeat_interleave(
-        torch.arange(num_prefills, device=device, dtype=torch.int32),
-        seq_lens.int(),
-    )
+    if req_idx is None:
+        seq_lens = query_start_loc_p[1:] - query_start_loc_p[:-1]
+        req_idx = torch.repeat_interleave(
+            torch.arange(num_prefills, device=device, dtype=torch.int32),
+            seq_lens.int(),
+        )
 
     hs_p_2d = hs_p.contiguous()
     qk_p_2d = qk_packed0_p.contiguous()
@@ -1028,8 +1038,9 @@ def cca_prefill_fused(
         BLOCK_H=BLOCK_H,
     )
 
-    dw_start_loc = query_start_loc_p[:-1] + torch.arange(
-        num_prefills, device=device, dtype=query_start_loc_p.dtype)
+    if dw_start_loc is None:
+        dw_start_loc = query_start_loc_p[:-1] + torch.arange(
+            num_prefills, device=device, dtype=query_start_loc_p.dtype)
     total_dw = T + num_prefills
     dw_out = torch.empty((total_dw, E), device=device, dtype=hs_p.dtype)
 
