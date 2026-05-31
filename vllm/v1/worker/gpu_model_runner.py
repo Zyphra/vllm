@@ -1871,8 +1871,24 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
+        # === TiDAR Block 10: SF metadata attachment =================
+        # When TiDAR SF is active AND inflation fired this step (i.e.,
+        # last_inflated_total is set), attach the proposal_acc_levels
+        # + verify_len fields to each kv_cache_group's common_attn_metadata
+        # so the FlexAttention mask_mod can use the SF K+1 + P*(K+1) layout
+        # to produce useful proposal hidden_states (which Block 6's SF
+        # early-exit later extracts via extract_drafts_from_hidden).
+        _sf_meta_fire = (
+            self.speculative_config
+            and self.speculative_config.use_tidar()
+            and getattr(self.drafter, "single_forward_mode", False)
+            and getattr(self.drafter, "last_inflated_total", None) is not None
+        )
+        # === end TiDAR Block 10 prep ================================
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
+            if _sf_meta_fire:
+                self.drafter.set_tidar_single_forward_metadata(cm)
 
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.
@@ -3471,6 +3487,61 @@ class GPUModelRunner(
                 num_scheduled_tokens_np,
             )
 
+            # === TiDAR Block 9: SF verify-input inflation ==============
+            # The TiDAR SF path needs the verify forward to process
+            # K+1 + P*(K+1) tokens per request (verify + P proposal
+            # sub-segments), not just K+1. `maybe_extend_verify_input`
+            # inflates the scheduler's token allocation in-place and
+            # rewrites seq_lens / query_start_loc / slot_mapping. Must
+            # fire BEFORE `_build_attention_metadata` so the attention
+            # metadata builders see the inflated shapes.
+            # Precondition: uniform K+1 verify state (no chunked-prefill
+            # mixed in). Mixed batches fall back to TF mode silently.
+            if (self.speculative_config
+                    and self.speculative_config.use_tidar()
+                    and getattr(self.drafter,
+                                "single_forward_mode", False)):
+                self.drafter.last_inflated_total = None
+            _sf_verify_len = (
+                self.drafter.verify_len
+                if (self.speculative_config
+                    and self.speculative_config.use_tidar()
+                    and getattr(self.drafter,
+                                "single_forward_mode", False))
+                else None)
+            _sf_inflation_fired = False
+            _use_spec_block9 = len(scheduler_output.scheduled_spec_decode_tokens) > 0
+            if (_use_spec_block9 and _sf_verify_len is not None
+                    and max_num_scheduled_tokens == _sf_verify_len
+                    and num_tokens_unpadded == num_reqs * _sf_verify_len):
+                _sf_inflation_fired = True
+                new_total = self.drafter.maybe_extend_verify_input(
+                    num_reqs=num_reqs,
+                    num_scheduled_tokens=num_tokens_unpadded,
+                )
+                num_tokens_unpadded = new_total
+                verify_len = self.drafter.verify_len
+                P_props = len(self.drafter.proposal_acc_levels)
+                K_drafts = self.drafter.num_speculative_tokens
+                proposal_seg_len = K_drafts + 1
+                new_stride = verify_len + P_props * proposal_seg_len
+                max_num_scheduled_tokens = new_stride
+                # Remap logits_indices: post-inflation hidden_states is
+                # [B*new_stride, H] (not [B*verify_len, H]). Old idx j
+                # in req j//verify_len shifts to
+                # (j//verify_len)*new_stride + (j%verify_len).
+                # target_logits_indices / bonus_logits_indices are NOT
+                # remapped (they point into the post-slicing logits
+                # tensor whose shape stays B*verify_len).
+                if spec_decode_metadata is not None:
+                    old_idx = spec_decode_metadata.logits_indices
+                    req_idx = old_idx // verify_len
+                    within = old_idx % verify_len
+                    spec_decode_metadata.logits_indices = (
+                        req_idx * new_stride + within)
+                    logits_indices = spec_decode_metadata.logits_indices
+            # === end TiDAR Block 9 =====================================
+
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
             if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
@@ -4084,26 +4155,42 @@ class GPUModelRunner(
             # K+1 mask block hidden states; no second forward needed.
             # Only fires when SF mode is on, spec_decode_metadata exists
             # (i.e., not the bootstrap step), and the drafter has run at
-            # least once (last_inflated_total set). sampled_token_ids is
-            # list[list[int]] in the non-padded path.
+            # least once (last_inflated_total set). In v0.16,
+            # sampled_token_ids is either list[list[int]] (non-padded
+            # path, disable_padded_drafter_batch=True) or torch.Tensor
+            # of shape [num_reqs, K+1] with -1 for rejected positions
+            # (padded path, default).
             if (spec_config.use_tidar()
                     and getattr(self.drafter, "single_forward_mode", False)
                     and spec_decode_metadata is not None
-                    and getattr(self.drafter, "last_inflated_total", None) is not None
-                    and isinstance(sampled_token_ids, list)):
-                num_accepted_per_req = torch.tensor(
-                    [max(0, len(tokens) - 1) for tokens in sampled_token_ids],
-                    dtype=torch.int32, device=self.device,
-                )
-                draft_token_ids = self.drafter.extract_drafts_from_hidden(
-                    hidden_states=hidden_states,
-                    num_accepted_per_req=num_accepted_per_req,
-                )
-                # SF path does not populate last_draft_probs/logits;
-                # clear the stash so next step uses NO_DRAFT_PROBS.
-                self._draft_probs_by_req_id.clear()
-                self._draft_logits_by_req_id.clear()
-                return draft_token_ids
+                    and getattr(self.drafter, "last_inflated_total", None)
+                    is not None):
+                if isinstance(sampled_token_ids, list):
+                    # Non-padded path: per-req list length includes bonus.
+                    num_accepted_per_req = torch.tensor(
+                        [max(0, len(tokens) - 1)
+                         for tokens in sampled_token_ids],
+                        dtype=torch.int32, device=self.device,
+                    )
+                elif isinstance(sampled_token_ids, torch.Tensor):
+                    # Padded path (v0.16 default): -1 marks rejected.
+                    # Count valid entries per row, minus 1 for the bonus.
+                    _valid = (sampled_token_ids != -1).sum(dim=1)
+                    num_accepted_per_req = (_valid - 1).clamp_min_(0).to(
+                        dtype=torch.int32, device=self.device)
+                else:
+                    num_accepted_per_req = None
+                if num_accepted_per_req is not None:
+                    draft_token_ids = (
+                        self.drafter.extract_drafts_from_hidden(
+                            hidden_states=hidden_states,
+                            num_accepted_per_req=num_accepted_per_req,
+                        ))
+                    # SF path does not populate last_draft_probs/logits;
+                    # clear the stash so next step uses NO_DRAFT_PROBS.
+                    self._draft_probs_by_req_id.clear()
+                    self._draft_logits_by_req_id.clear()
+                    return draft_token_ids
             # === end TiDAR Block 6 ======================================
 
             if spec_config.disable_padded_drafter_batch:
