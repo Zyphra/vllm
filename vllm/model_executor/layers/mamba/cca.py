@@ -190,17 +190,29 @@ class CCA(MambaBase, CustomOp):
             self._spec_stash_slots = None
 
         # Whether the captured-friendly vectorized prefill path is REQUIRED
-        # this run. True only when FULL_DECODE_ONLY (or FULL_AND_PIECEWISE)
-        # cudagraph mode is enabled — under PIECEWISE the eager Python loop
-        # runs out-of-graph and is faster (no stash, no reshape contiguity
-        # churn). Under eager, both paths are valid but the loop is faster.
+        # this run. True when:
+        #   (a) FULL_DECODE_ONLY (or FULL_AND_PIECEWISE) cudagraph mode is
+        #       enabled — the eager Python loop is cudagraph-unsafe, OR
+        #   (b) TiDAR is active — the vectorized path stashes K+1 conv
+        #       state candidates per req, which commit_spec_decode_state
+        #       needs to write the post-acceptance state back to AR.
+        #       The Python loop doesn't stash, so under TF mode (where SF
+        #       inflation doesn't run) the state would be over-advanced by
+        #       (K - num_accepted) positions and the next forward gets
+        #       garbage → token loop degeneration after ~25 tokens.
+        # Under PIECEWISE non-spec the eager loop is still faster (no
+        # stash overhead) and self._spec_stash_conv is None there anyway.
         from vllm.config import CUDAGraphMode
         _cg_mode = getattr(compilation_config, "cudagraph_mode", None)
+        _full_active = (_cg_mode is not None
+                        and _cg_mode != CUDAGraphMode.NONE
+                        and _cg_mode.decode_mode() == CUDAGraphMode.FULL)
+        # _spec_stash_conv is non-None whenever TiDAR is active (SF or TF).
+        # We need vectorized path whenever stash is needed — that's any
+        # TiDAR run, because commit_spec_decode_state always wants the
+        # stashed candidate state.
         self._use_spec_vectorized = bool(
             self._spec_stash_conv is not None
-            and _cg_mode is not None
-            and _cg_mode != CUDAGraphMode.NONE
-            and _cg_mode.decode_mode() == CUDAGraphMode.FULL
         )
 
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
