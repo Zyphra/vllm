@@ -917,7 +917,20 @@ class CCA(MambaBase, CustomOp):
             dim=0,
         )
 
-        # print(f"MAX INDEX: {state_indices_tensor_d.max()}")
+        # TiDAR drafter pass: writes go to scratch (state_indices_tensor_write)
+        # NOT the AR slot (state_indices_tensor). Without this split the Python
+        # loop below scrambles the AR-side CCA state, garbage propagates to
+        # the next verify forward, and the model collapses (mean accept = K+1
+        # with 100% acceptance of degenerate tokens).
+        state_indices_tensor_write_d = None
+        state_indices_tensor_write_p = None
+        if state_indices_tensor_write is not None:
+            state_indices_tensor_write_d, state_indices_tensor_write_p = (
+                torch.split(
+                    state_indices_tensor_write[:num_actual_tokens],
+                    [num_decodes, num_prefills],
+                    dim=0,
+                ))
 
         # TODO: allocate memory for output tensors
         qk_packed3_output_list = []
@@ -1099,12 +1112,18 @@ class CCA(MambaBase, CustomOp):
             else:
                 hs2 = torch.zeros((num_prefill_tokens, self.hidden_size), device=hs.device, dtype=hs.dtype)
                 qk_packed3_p = torch.zeros((num_prefill_tokens, self.in_out_ch), device=hs.device, dtype=hs.dtype)
+                # TiDAR: writes go to write-side slot if override is set
+                # (drafter pass: AR-read, scratch-write). Otherwise mirror
+                # the read slot (verify pass / non-spec).
+                _sit_write_p = (state_indices_tensor_write_p
+                                if state_indices_tensor_write_p is not None
+                                else state_indices_tensor_p)
                 for i in range(len(query_start_loc_p) - 1):
                     start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
                     hs2_cur = hs_p[start_i:end_i]  # [S_cur, H]
                     qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                     qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
-                    
+
                     if has_initial_states_p[i]:
                         hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                         hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
@@ -1113,19 +1132,21 @@ class CCA(MambaBase, CustomOp):
                     else:
                         hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 1, 0))
                         qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
-                        
+
                     hs2[start_i:end_i] = hs2_cur
 
-                    conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                    conv_states[state_indices_tensor_p[i]] = conv_states_cur.squeeze(0).to(
-                        device=conv_states.device, dtype=conv_states.dtype)
-                    
+                    if not drafter_pass:
+                        conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
+                        conv_states[_sit_write_p[i]] = conv_states_cur.squeeze(0).to(
+                            device=conv_states.device, dtype=conv_states.dtype)
+
                     # Computing conv
                     qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
                     qk_packed3_p[start_i:end_i] = qk_packed3_cur
                 qk_packed3_output_list.append(qk_packed3_p)
                 hs2_output_list.append(hs2)
-                prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
+                if not drafter_pass:
+                    prev_hs[_sit_write_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
 
         _fused_decode_active = False
         if has_decode:
