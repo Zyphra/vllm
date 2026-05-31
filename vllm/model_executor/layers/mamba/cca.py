@@ -149,11 +149,45 @@ class CCA(MambaBase, CustomOp):
         else:
             self._decode_conv = self._conv_qk_apply
 
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_cfg = get_current_vllm_config()
+        compilation_config = vllm_cfg.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
+
+        # === TiDAR spec-decode stash buffers ====================
+        # Pre-allocated GPU buffers for K+1 candidate (conv_state, hs)
+        # pairs per request. The forward path writes via pure GPU ops
+        # so cudagraph replay sees fresh values; commit_spec_decode_state
+        # consumes them outside the captured graph after rejection
+        # sampling, writing the post-acceptance candidate back to
+        # conv_states / prev_hs.
+        spec = vllm_cfg.speculative_config
+        if (spec is not None and getattr(spec, "use_tidar", lambda: False)()
+                and spec.num_speculative_tokens is not None):
+            self._spec_max_P = vllm_cfg.scheduler_config.max_num_seqs
+            self._spec_max_S = spec.num_speculative_tokens + 1
+            stash_dtype = vllm_cfg.model_config.dtype
+            stash_device = torch.device(
+                f"cuda:{torch.cuda.current_device()}"
+                if torch.cuda.is_available() else "cpu")
+            self._spec_stash_conv = torch.zeros(
+                (self._spec_max_P, self._spec_max_S, self.in_out_ch,
+                 self.cca_time0),
+                dtype=stash_dtype, device=stash_device)
+            self._spec_stash_hs = torch.zeros(
+                (self._spec_max_P, self._spec_max_S, self.hidden_size),
+                dtype=stash_dtype, device=stash_device)
+            self._spec_stash_slots = torch.zeros(
+                (self._spec_max_P, ), dtype=torch.int64,
+                device=stash_device)
+        else:
+            self._spec_max_P = 0
+            self._spec_max_S = 0
+            self._spec_stash_conv = None
+            self._spec_stash_hs = None
+            self._spec_stash_slots = None
 
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.to(torch.float32)
@@ -247,6 +281,225 @@ class CCA(MambaBase, CustomOp):
             out_g = out_g + b1.view(1, groups, head_dim)
 
         return out_g.reshape(batch, groups * head_dim, 1)
+
+    # ================================================================
+    # TiDAR spec-decode helpers (ported from jinzhao/tidar v0.15.x)
+    # ================================================================
+    def _conv_qk_decode(self, x: torch.Tensor) -> torch.Tensor:
+        """Manual conv_qk for decode-sized inputs.
+
+        Decode uses tiny sequence windows (total_padding + 1 or
+        total_padding + K), so the generic conv path can spend a
+        disproportionate amount of time on layout transforms and
+        kernel setup. This manual implementation preserves the
+        two-stage depthwise+grouped conv math while operating
+        directly on the compact decode tensor.
+
+        Input:  [N, C, S]
+        Output: [N, C, S_out]
+        """
+        # Stage 1: depthwise conv over sequence.
+        w0 = self.conv_qk[0].weight.squeeze(1)  # [C, K0]
+        b0 = self.conv_qk[0].bias               # [C] or None
+
+        x = x.to(w0.dtype)
+        k0 = w0.shape[1]
+        x_windows = x.unfold(-1, k0, 1)  # [N, C, L_mid, K0]
+        mid = (x_windows * w0[:, None, :]).sum(dim=-1)  # [N, C, L_mid]
+        if b0 is not None:
+            mid = mid + b0[None, :, None]
+
+        # Stage 2: grouped conv over the depthwise output.
+        w1 = self.conv_qk[1].weight  # [C, D, K1]
+        b1 = self.conv_qk[1].bias    # [C] or None
+        g = self.num_k_heads + self.num_q_heads
+        d = self.head_dim
+        k1 = w1.shape[2]
+        mid_windows = (mid.view(mid.shape[0], g, d, mid.shape[-1])
+                       .unfold(-1, k1, 1))
+        w1_grouped = w1.view(g, d, d, k1)
+        out = torch.einsum("godk,sgdtk->sgot", w1_grouped, mid_windows)
+        if b1 is not None:
+            out = out + b1.view(1, g, d, 1)
+        return out.reshape(x.shape[0], g * d, out.shape[-1])
+
+    def _spec_decode_prefill_vectorized(
+        self,
+        hs_p: torch.Tensor,                   # [P*S, 1, hidden_size]
+        qk_packed0_p: torch.Tensor,           # [P*S, 1, in_out_ch]
+        state_indices_p: torch.Tensor,        # [P] int64 GPU — read slots
+        has_initial_states_p: torch.Tensor,   # [P] bool GPU (unused; cached path)
+        prev_hs: torch.Tensor,
+        conv_states: torch.Tensor,
+        P: int, S: int,
+        hs2_prefill: torch.Tensor,
+        qk_packed3_prefill: torch.Tensor,
+        state_indices_p_write: Optional[torch.Tensor] = None,
+        skip_writes: bool = False,
+    ) -> None:
+        """Cudagraph-replay-safe vectorized prefill for uniform (P, S).
+
+        Eliminates Python-state-on-metadata branches from the captured
+        path. ALWAYS performs the "default commit" + "stash" writes
+        unless ``skip_writes`` is set (TiDAR drafter scratch path).
+        ``commit_spec_decode_state`` runs post-rejection-sampling and
+        overwrites the default-commit with the right candidate.
+        """
+        H_conv = self.in_out_ch
+        H_hs = self.hidden_size
+        cca_time0 = self.cca_time0
+        total_padding = self.total_padding
+
+        if state_indices_p_write is None:
+            state_indices_p_write = state_indices_p
+
+        # Inputs are either [P*S, H] (v0.16 path) or [P*S, 1, H] (v0.15.x).
+        # view(P, S, H_*) works for both since total element count matches.
+        hs_p_2d = hs_p.reshape(P, S, H_hs)
+        qk_packed0_p_2d = qk_packed0_p.reshape(P, S, H_conv)
+
+        # Cached state reads. In steady-state captured replay,
+        # has_initial_states_p is always True; cold prefills live on
+        # the eager fallback path.
+        hs_cached = prev_hs[state_indices_p].to(hs_p_2d.dtype)
+        qk_cached = conv_states[state_indices_p].to(
+            qk_packed0_p_2d.dtype)
+
+        # hs2 context: [hs_cached, hs_p[:, :-1]] -> [P, S, H_hs].
+        hs2_p_2d = torch.cat(
+            [hs_cached.unsqueeze(1), hs_p_2d[:, :-1, :]], dim=1)
+
+        # qk_packed2: [qk_cached, qk_packed1_p]
+        qk_packed1_p = qk_packed0_p_2d.permute(0, 2, 1)
+        qk_packed2_p = torch.cat([qk_cached, qk_packed1_p], dim=-1)
+
+        # Conv: [P, H_conv, total_padding + S] -> [P, H_conv, S]
+        qk_packed3_p = self._conv_qk_decode(qk_packed2_p)
+        qk_packed3_prefill.copy_(
+            qk_packed3_p.permute(0, 2, 1).contiguous()
+            .reshape(qk_packed3_prefill.shape))
+
+        hs2_prefill.copy_(hs2_p_2d.reshape(hs2_prefill.shape))
+
+        if not skip_writes:
+            # Default commit + stash all K+1 candidates.
+            last_conv = qk_packed2_p[..., -cca_time0:].contiguous()
+            last_hs = hs_p_2d[:, -1, :]
+            conv_states[state_indices_p_write] = last_conv.to(
+                device=conv_states.device, dtype=conv_states.dtype)
+            prev_hs[state_indices_p_write] = last_hs.to(
+                device=prev_hs.device, dtype=prev_hs.dtype)
+
+            start_off = total_padding - cca_time0 + 1
+            windowed = (qk_packed2_p[..., start_off:]
+                        .unfold(-1, cca_time0, 1))
+            # [P, H_conv, S, cca_time0] -> [P, S, H_conv, cca_time0]
+            cand_conv = windowed.permute(0, 2, 1, 3).contiguous().to(
+                dtype=self._spec_stash_conv.dtype)
+            cand_hs = hs_p_2d.to(dtype=self._spec_stash_hs.dtype)
+            self._spec_stash_conv[:P, :S].copy_(cand_conv)
+            self._spec_stash_hs[:P, :S].copy_(cand_hs)
+            self._spec_stash_slots[:P].copy_(
+                state_indices_p.to(torch.int64))
+
+    def _spec_decode_proposal_sub_loop(
+        self,
+        hs_p_props: torch.Tensor,
+        qk_packed0_p_props: torch.Tensor,
+        proposal_acc_levels: torch.Tensor,
+        P: int, P_props: int, K: int,
+        hs2_prefill_props: torch.Tensor,
+        qk_packed3_prefill_props: torch.Tensor,
+    ) -> None:
+        """TiDAR single-forward proposal sub-loop.
+
+        For each request i and proposal p_idx, run conv starting from
+        the verify-segment stash entry at acc_level = proposal_acc_levels[p_idx].
+        No commit/no stash for the proposal segment.
+        """
+        H_conv = self.in_out_ch
+        H_hs = self.hidden_size
+        total_padding = self.total_padding
+
+        hs_p_3d = hs_p_props.reshape(P, P_props, K, H_hs)
+        qk_packed0_p_3d = qk_packed0_p_props.reshape(P, P_props, K, H_conv)
+
+        # init_conv: [P, P_props, H_conv, cca_time0=total_padding]
+        init_conv = (
+            self._spec_stash_conv[:P][:, proposal_acc_levels]
+            .to(qk_packed0_p_3d.dtype))
+        init_hs = (
+            self._spec_stash_hs[:P][:, proposal_acc_levels]
+            .to(hs_p_3d.dtype))
+
+        # qk_packed2: [P, P_props, H_conv, total_padding + K]
+        qk_packed1 = qk_packed0_p_3d.permute(0, 1, 3, 2)
+        qk_packed2 = torch.cat([init_conv, qk_packed1], dim=-1)
+
+        qk_packed2_flat = qk_packed2.reshape(
+            P * P_props, H_conv, total_padding + K)
+        qk_packed3_flat = self._conv_qk_decode(qk_packed2_flat)
+        # [P*P_props, H_conv, K] -> [P*P_props*K, 1, H_conv]
+        qk_packed3_out = (
+            qk_packed3_flat
+            .view(P, P_props, H_conv, K)
+            .permute(0, 1, 3, 2)
+            .contiguous()
+            .reshape(qk_packed3_prefill_props.shape))
+        qk_packed3_prefill_props.copy_(qk_packed3_out)
+
+        # hs2: [init_hs, mask_hs[0..K-2]] -> [P, P_props, K, H_hs].
+        hs2 = torch.cat(
+            [init_hs.unsqueeze(2), hs_p_3d[:, :, :-1, :]], dim=2)
+        hs2_prefill_props.copy_(
+            hs2.reshape(hs2_prefill_props.shape))
+
+    @torch.inference_mode()
+    def commit_spec_decode_state(
+        self,
+        num_accepted_per_batch_idx: list,
+        virtual_engine: int = 0,
+        idx_gpu: Optional[torch.Tensor] = None,
+        arange_gpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Overwrite conv_states / prev_hs with the post-acceptance state.
+
+        Called by the model runner after rejection sampling, OUTSIDE the
+        captured cudagraph.
+        """
+        n_used = min(len(num_accepted_per_batch_idx), self._spec_max_P)
+        if (n_used == 0 or self._spec_stash_conv is None
+                or self._spec_stash_hs is None
+                or self._spec_stash_slots is None):
+            return
+        self_kv_cache = self.kv_cache[virtual_engine]
+        conv_states = self_kv_cache[0]
+        prev_hs = self_kv_cache[1]
+
+        if idx_gpu is None or arange_gpu is None:
+            K_max = self._spec_max_S - 1
+            accepted = [
+                min(max(0, n), K_max)
+                for n in num_accepted_per_batch_idx[:n_used]
+            ]
+            if len(accepted) < n_used:
+                accepted.extend([0] * (n_used - len(accepted)))
+            idx = torch.as_tensor(accepted, dtype=torch.long,
+                                  device=self._spec_stash_conv.device)
+            arange = torch.arange(n_used, device=idx.device)
+        else:
+            idx = idx_gpu
+            arange = arange_gpu
+
+        selected_conv = self._spec_stash_conv[arange, idx]
+        selected_hs = self._spec_stash_hs[arange, idx]
+
+        slots = self._spec_stash_slots[:n_used].to(torch.long)
+        conv_states[slots] = selected_conv.to(
+            device=conv_states.device, dtype=conv_states.dtype)
+        prev_hs[slots] = selected_hs.to(
+            device=prev_hs.device, dtype=prev_hs.dtype)
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
@@ -533,6 +786,11 @@ class CCA(MambaBase, CustomOp):
     ):
         forward_context = get_forward_context()
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
+        # TiDAR fields (set below from CCAAttentionMetadata)
+        state_indices_tensor_write = None
+        drafter_pass = False
+        tidar_sf_verify_len = None
+        tidar_sf_acc_levels = None
         if attn_metadata is not None:
             assert isinstance(attn_metadata, dict)
             attn_metadata = attn_metadata[self.prefix]
@@ -543,6 +801,13 @@ class CCA(MambaBase, CustomOp):
             state_indices_tensor = attn_metadata.state_indices_tensor
             has_initial_states_p = attn_metadata.has_initial_states_p
             query_start_loc_p = attn_metadata.query_start_loc_p
+            state_indices_tensor_write = (
+                attn_metadata.state_indices_tensor_write)
+            drafter_pass = attn_metadata.drafter_pass
+            tidar_sf_verify_len = (
+                attn_metadata.tidar_single_forward_verify_len)
+            tidar_sf_acc_levels = (
+                attn_metadata.tidar_single_forward_proposal_acc_levels)
         if attn_metadata is None:
             # V1 profile run
             hs = hidden_states  # [S, H]
@@ -644,7 +909,150 @@ class CCA(MambaBase, CustomOp):
         decode_is_pad: Optional[torch.Tensor] = None
 
         if has_prefill:
-            if _CCA_FUSED_ENABLED:
+            # === TiDAR vectorized prefill gate ====================
+            # Route uniform-S prefill batches (the TiDAR verify steady
+            # state) through a vectorized, GPU-tensor-only path that's
+            # cudagraph-replay-safe. Uses ONLY batch-shape Python ints
+            # for the gate decision — no metadata-flag branching — so
+            # capture vs replay never disagree on which branch is
+            # recorded.
+            P_pref = num_prefills
+            S_uniform = (num_prefill_tokens // P_pref) if P_pref > 0 else 0
+            single_forward_mode = (
+                tidar_sf_verify_len is not None
+                and tidar_sf_acc_levels is not None)
+            sf_total_S = 0
+            sf_P_props = 0
+            sf_K = 0
+            sf_verify_len = 0
+            if single_forward_mode:
+                sf_P_props = int(tidar_sf_acc_levels.shape[0])
+                sf_verify_len = int(tidar_sf_verify_len)
+                if sf_P_props == 0:
+                    raise ValueError(
+                        "tidar_single_forward_proposal_acc_levels must have "
+                        "at least one proposal; got empty tensor.")
+                if (S_uniform - sf_verify_len) % sf_P_props != 0:
+                    raise ValueError(
+                        f"SF layout mismatch: S_uniform={S_uniform}, "
+                        f"verify_len={sf_verify_len}, P_props={sf_P_props}")
+                sf_K = (S_uniform - sf_verify_len) // sf_P_props
+                sf_total_S = sf_verify_len + sf_P_props * sf_K
+            use_vectorized_prefill = (
+                self._spec_stash_conv is not None
+                and P_pref > 0
+                and num_prefill_tokens == P_pref * S_uniform
+                and S_uniform == self._spec_max_S
+                and P_pref <= self._spec_max_P
+                and not single_forward_mode
+            )
+            use_single_forward_prefill = (
+                single_forward_mode
+                and self._spec_stash_conv is not None
+                and P_pref > 0
+                and num_prefill_tokens == P_pref * sf_total_S
+                and sf_verify_len <= self._spec_max_S
+                and P_pref <= self._spec_max_P
+            )
+
+            if use_vectorized_prefill:
+                hs2 = torch.empty(
+                    (num_prefill_tokens, self.hidden_size),
+                    device=hs.device, dtype=hs.dtype)
+                qk_packed3_p = torch.empty(
+                    (num_prefill_tokens, self.in_out_ch),
+                    device=hs.device, dtype=hs.dtype)
+                self._spec_decode_prefill_vectorized(
+                    hs_p=hs_p,
+                    qk_packed0_p=qk_packed0_p,
+                    state_indices_p=state_indices_tensor_p,
+                    has_initial_states_p=has_initial_states_p,
+                    prev_hs=prev_hs,
+                    conv_states=conv_states,
+                    P=P_pref, S=S_uniform,
+                    hs2_prefill=hs2,
+                    qk_packed3_prefill=qk_packed3_p,
+                    state_indices_p_write=state_indices_tensor_write,
+                    skip_writes=drafter_pass,
+                )
+                qk_packed3_output_list.append(qk_packed3_p)
+                hs2_output_list.append(hs2)
+            elif use_single_forward_prefill:
+                # TiDAR single-forward: verify segment + P proposal
+                # sub-loops in one CCA call.
+                H_hs_loc = self.hidden_size
+                H_conv_loc = self.in_out_ch
+                hs2 = torch.empty(
+                    (num_prefill_tokens, H_hs_loc),
+                    device=hs.device, dtype=hs.dtype)
+                qk_packed3_p = torch.empty(
+                    (num_prefill_tokens, H_conv_loc),
+                    device=hs.device, dtype=hs.dtype)
+
+                hs_p_4d = hs_p.reshape(P_pref, sf_total_S, H_hs_loc)
+                qk_packed0_p_4d = qk_packed0_p.reshape(
+                    P_pref, sf_total_S, H_conv_loc)
+                hs2_4d = hs2.view(P_pref, sf_total_S, H_hs_loc)
+                qk_packed3_p_4d = qk_packed3_p.view(
+                    P_pref, sf_total_S, H_conv_loc)
+
+                # Verify slice (first sf_verify_len rows per req).
+                hs_p_verify = (
+                    hs_p_4d[:, :sf_verify_len].contiguous()
+                    .view(P_pref * sf_verify_len, H_hs_loc))
+                qk_packed0_p_verify = (
+                    qk_packed0_p_4d[:, :sf_verify_len].contiguous()
+                    .view(P_pref * sf_verify_len, H_conv_loc))
+                verify_hs2_tmp = torch.empty_like(hs_p_verify)
+                verify_qk_tmp = torch.empty_like(qk_packed0_p_verify)
+
+                self._spec_decode_prefill_vectorized(
+                    hs_p=hs_p_verify,
+                    qk_packed0_p=qk_packed0_p_verify,
+                    state_indices_p=state_indices_tensor_p,
+                    has_initial_states_p=has_initial_states_p,
+                    prev_hs=prev_hs,
+                    conv_states=conv_states,
+                    P=P_pref, S=sf_verify_len,
+                    hs2_prefill=verify_hs2_tmp,
+                    qk_packed3_prefill=verify_qk_tmp,
+                    state_indices_p_write=state_indices_tensor_write,
+                    skip_writes=drafter_pass,
+                )
+                hs2_4d[:, :sf_verify_len].copy_(
+                    verify_hs2_tmp.view(
+                        P_pref, sf_verify_len, H_hs_loc))
+                qk_packed3_p_4d[:, :sf_verify_len].copy_(
+                    verify_qk_tmp.view(
+                        P_pref, sf_verify_len, H_conv_loc))
+
+                # Proposal slice.
+                hs_p_props = (
+                    hs_p_4d[:, sf_verify_len:].contiguous()
+                    .view(P_pref * sf_P_props * sf_K, H_hs_loc))
+                qk_packed0_p_props = (
+                    qk_packed0_p_4d[:, sf_verify_len:].contiguous()
+                    .view(P_pref * sf_P_props * sf_K, H_conv_loc))
+                prop_hs2_tmp = torch.empty_like(hs_p_props)
+                prop_qk_tmp = torch.empty_like(qk_packed0_p_props)
+
+                self._spec_decode_proposal_sub_loop(
+                    hs_p_props=hs_p_props,
+                    qk_packed0_p_props=qk_packed0_p_props,
+                    proposal_acc_levels=tidar_sf_acc_levels,
+                    P=P_pref, P_props=sf_P_props, K=sf_K,
+                    hs2_prefill_props=prop_hs2_tmp,
+                    qk_packed3_prefill_props=prop_qk_tmp,
+                )
+                hs2_4d[:, sf_verify_len:].copy_(
+                    prop_hs2_tmp.view(
+                        P_pref, sf_P_props * sf_K, H_hs_loc))
+                qk_packed3_p_4d[:, sf_verify_len:].copy_(
+                    prop_qk_tmp.view(
+                        P_pref, sf_P_props * sf_K, H_conv_loc))
+                qk_packed3_output_list.append(qk_packed3_p)
+                hs2_output_list.append(hs2)
+            elif _CCA_FUSED_ENABLED:
                 _prefill_args = (
                     hs_p, qk_packed0_p,
                     prev_hs, conv_states,

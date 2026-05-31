@@ -85,6 +85,11 @@ def build_llm(ckpt: str, mode: str, K: int, t_diff: float,
         seed=0, disable_log_stats=False,
         swap_space=16.0,
     )
+    # v0.16 removed env var auto-selection; honor VLLM_ATTENTION_BACKEND
+    # here for backward compatibility with v0.15.x recipes.
+    _backend_env = os.environ.get("VLLM_ATTENTION_BACKEND")
+    if _backend_env:
+        kwargs["attention_backend"] = _backend_env
     if mode == "tidar":
         kwargs["speculative_config"] = {
             "method": "tidar",

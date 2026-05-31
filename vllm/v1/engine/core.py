@@ -271,6 +271,13 @@ class EngineCore:
         num_gpu_blocks = scheduler_kv_cache_config.num_blocks
         num_cpu_blocks = 0
 
+        # TiDAR/FlexAttention need num_gpu_blocks visible BEFORE warmup
+        # so build_for_cudagraph_capture can size persistent buffers.
+        # The official assignment at the call site below stays for
+        # workers — this just primes cache_config in the driver process.
+        vllm_config.cache_config.num_gpu_blocks = num_gpu_blocks
+        vllm_config.cache_config.num_cpu_blocks = num_cpu_blocks
+
         # Initialize kv cache and warmup the execution
         self.model_executor.initialize_from_config(kv_cache_configs)
 

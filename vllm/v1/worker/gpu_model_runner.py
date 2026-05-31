@@ -2317,6 +2317,37 @@ class GPUModelRunner(
         return torch.cat(chunks, dim=0).contiguous()
     # === end TiDAR Block 3 ============================================
 
+    # === TiDAR Block 11: commit CCA spec-decode state =================
+    def _commit_tidar_cca_state(
+        self,
+        valid_sampled_token_ids: list,
+    ) -> None:
+        """Write the post-acceptance candidate state into each CCA layer.
+
+        For each TiDAR-verified request, the rejection sampler emitted
+        ``num_accepted + 1`` tokens (accepted drafts + bonus/recovered).
+        The CCA layer's vectorized prefill stashed K+1 candidate states
+        per req; here we pass num_accepted per req in batch order so
+        each layer writes the matching candidate to conv_states /
+        prev_hs. Required for FULL_DECODE_ONLY because the captured
+        graph cannot do this step itself.
+        """
+        from vllm.config import get_layers_from_vllm_config
+        from vllm.model_executor.layers.mamba.cca import CCA
+        if not hasattr(self, "_cca_layers_cache"):
+            self._cca_layers_cache = get_layers_from_vllm_config(
+                self.vllm_config, CCA)
+        if not self._cca_layers_cache:
+            return
+        num_accepted_per_batch_idx = [
+            max(0, len(tokens) - 1) for tokens in valid_sampled_token_ids
+        ]
+        if not num_accepted_per_batch_idx:
+            return
+        for cca_layer in self._cca_layers_cache.values():
+            cca_layer.commit_spec_decode_state(num_accepted_per_batch_idx)
+    # === end TiDAR Block 11 ===========================================
+
     def _prepare_kv_sharing_fast_prefill(
         self,
         logits_indices: torch.Tensor,
@@ -3041,6 +3072,15 @@ class GPUModelRunner(
                     discard_sampled_tokens_req_indices,
                     logprobs_tensors=logprobs_tensors,
                 )
+                # TiDAR-only: write the post-acceptance candidate state
+                # into each CCA layer's conv_states / prev_hs slot. This
+                # call must fire OUTSIDE the captured cudagraph (here,
+                # post rejection sampling). Without it, CCA state would
+                # be over-advanced by (K - num_accepted) positions and
+                # the next forward's logits would be garbage.
+                if (self.speculative_config is not None
+                        and self.speculative_config.use_tidar()):
+                    self._commit_tidar_cca_state(valid_sampled_token_ids)
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()

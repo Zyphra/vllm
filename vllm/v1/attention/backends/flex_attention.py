@@ -839,7 +839,7 @@ class FlexAttentionMetadataBuilder(
     # single-forward). Achieved by static block_mask shapes (uses
     # max_model_len's worth of blocks, not max_seq_len's) so the caching
     # allocator returns stable pointers across build() calls.
-    cudagraph_support: ClassVar[AttentionCGSupport] = \
+    _cudagraph_support: ClassVar[AttentionCGSupport] = \
         AttentionCGSupport.UNIFORM_BATCH
 
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str],
@@ -934,7 +934,7 @@ class FlexAttentionMetadataBuilder(
         # Allocated on first build() because num_gpu_blocks is only
         # set after KV-cache init.
         if self.use_full_cuda_graph and self._persistent_kv_indices is None:
-            max_cap = self.compilation_config.max_capture_size or 0
+            max_cap = self.compilation_config.max_cudagraph_capture_size or 0
             max_num_seqs = self.vllm_config.scheduler_config.max_num_seqs
             max_q_blocks = cdiv(max_cap, self.q_block_size)
             # unique_static_unsorted preserves input shape, so kv_indices
