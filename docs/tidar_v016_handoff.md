@@ -32,6 +32,13 @@ export VLLM_ATTENTION_BACKEND=FLEX_ATTENTION
 export VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 # (SF needs FLEX backend; the env var fallback is silent if missing — see
 #  reference_zvllm_inference_env memory.)
+
+# Perf knob — set to 1 to wrap the SMoE cat()+FusedMoE call in an opaque
+# custom op, hiding the cat() from inductor and forcing probs to
+# materialize once. +45% on TF FULL b=1 dense, +54% on SF sparse P;
+# ~neutral (-3%) on SF dense P b=3. See "Custom-op-wrapped MoE call"
+# below. Default OFF.
+# export VLLM_TIDAR_SMOE_MOE_OP=1
 ```
 
 ### Run SF FULL captured (the supported path)
@@ -180,6 +187,28 @@ The cat() that v0.16's `FusedMoE.forward(packed_logits)` requires is what trigge
 2. **Restore v0.15's 3-arg expert API** by replacing `FusedMoE.forward(hidden_states, packed_logits)` with a direct call to `fused_experts(hidden_states, w13_weight, w2_weight, probs, indices, ...)` — bypasses FusedMoE.forward entirely. **Tried and it regresses 50%+** because the `fused_experts` direct path lacks the cudagraph-friendly dispatch machinery FusedMoE wraps it in. Would need a custom wrapper that's cudagraph-friendly AND takes probs/indices separately.
 3. **Hand-tuned MoE router Triton kernel** that does `down_proj → rmsnorm → router_mlp → softmax → topk → gather → MOD_mask` in one well-tuned kernel. Beats inductor's auto-fusion. Highest potential impact but most work.
 4. **Investigate `FillFunctor<int>` 103k calls** — that's ~4700 int-zero fills per step. If reducible (FlexAttention SF mask bookkeeping is the suspect), saves ~27% of GPU time.
+
+#### Custom-op-wrapped MoE call — SHIPPED, opt-in via `VLLM_TIDAR_SMOE_MOE_OP=1`
+
+Idea (1) plus a wrinkle: instead of a barrier op that consumes-and-returns probs (tried earlier as `vllm::smoe_pack_logits` with `mutates_args=[]` — didn't help), wrap **the entire MoE call including the cat()** in an opaque custom op. The op takes `(hidden_states, probs, indices, layer_name)` and runs `torch.cat(...)` + `FusedMoE.forward_impl(...)` internally; inductor sees just an opaque dispatch and must materialize `probs` as the op's input. Downstream `hidden_states * probs` then reads the materialized buffer instead of re-firing softmax+gather inline.
+
+Shipped as `torch.ops.vllm.tidar_smoe_moe_with_probs` (commit `b03144b13`), opt-in via `VLLM_TIDAR_SMOE_MOE_OP=1`. Default OFF.
+
+**Measured (smoediffusion iter_0012000, node 2 GPU 4, max_tokens=200/400):**
+
+| config                     | baseline | +moe_op | gain  | notes |
+|----------------------------|---------:|--------:|------:|-------|
+| SF FULL b=3 P=0,5          |   103.99 |  159.74 |  **+54%** | sparse-proposal SF |
+| SF FULL b=3 P=0..16 dense  |    63.92 |   61.63 |   -3% | large M absorbs the recompute |
+| **TF FULL b=1 P=0..16 dense** |    14.25 |   **20.73** |  **+45%** | per-step is always K+1=17 tokens |
+
+The fix is **M-dependent**: helps when the MoE call sees small M (TF's always-K+1 layout, or SF's sparse proposal config), neutral at large M (SF dense's 306 tokens/req). At large M the inline softmax recompute is amortized across many MoE expert-kernel runs; at small M the recompute dominates and the materialize-once path saves ~half.
+
+Outputs verified coherent (math-reasoning prompts, mean acceptance length 5+).
+
+**Failed earlier attempt: probs-materialization barrier** (no-op custom op with `mutates_args=["t"]`). The idea was to fence inductor at the probs site so downstream reads couldn't fuse back to softmax. **Hurt perf** (SF b=3 P=0,5: 104 → 59 tok/s, -43%) — likely inductor emitted extra stores around the mutates-args fence. Discarded.
+
+Approaches still untried that could close the dense-P SF gap: hand-tuned MoE router Triton kernel; `FillFunctor<int>` reduction; combining moe_op with FlexAttention SF mask_mod refactor.
 
 ## Smaller follow-ups
 
