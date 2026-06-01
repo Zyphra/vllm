@@ -127,7 +127,7 @@ Same `SMoERouter` code as v0.15 (zero diff in the class). v0.15's `SMoExperts(pr
 
 | attempt | b=1 | b=8 | b=16 |
 |---|---:|---:|---:|
-| baseline (`9da7f7d07`) | 176 | 361 | 619 |
+| baseline (`9da7f7d07`, P=0,5) | 120 | 392 | 681 |
 | `cudagraph_copy_inputs=False` | same | same | same |
 | `cca_prefill_fused` (bf16 Triton) in SF vectorized | 5× SLOWER + degenerate output |
 | `@torch.compiler.disable` on `SMoERouter.forward` | dynamo hard-fails, rejected |
@@ -136,13 +136,24 @@ Same `SMoERouter` code as v0.15 (zero diff in the class). v0.15's `SMoExperts(pr
 | `custom_ops=["+rms_norm"]` | **185** (+5%) | **295** (-18%) | **516** (-17%) |
 | `custom_ops=["+rms_norm","+silu_and_mul","+rotary_embedding"]` | 128 | — | — |
 | `combo_kernels=False` | same | — | — |
+| **`torch.ops.vllm.smoe_pack_logits` custom op wrapping the cat()** | 121 (=) | 396 (=) | — |
+| **direct `fused_experts(probs, indices)` bypass, skip FusedMoE.forward** | **57 (−52%)** | **169 (−57%)** | **306 (−55%)** |
+| **`probs.contiguous()` to force materialization** | 48 (−60%) | — | — |
+
+#### Root cause identified (kernel diff vs v0.15)
+
+Diffed the cached Triton kernels v0.15 vs v0.16. v0.15's equivalent fused kernel is named `triton_red_fused__to_copy_add_bitwise_not_mean_mul_ne_pow_rsqrt_5` (residual + MOD + RMSNorm). v0.16's is `triton_red_fused__softmax__to_copy_add_bitwise_not_gather_mean_mul_ne_pow_rsqrt_view_5` — **v0.16 ALSO has `softmax`, `gather`, `view`** fused in.
+
+Reading the inductor-generated Triton: the v0.16 kernel literally **recomputes softmax inline** (`exp(logit-max)/sum`) for the MOD passthrough's `hidden_states * probs`. v0.15 just looked up the already-materialized `probs[topk_id]`. Inductor decided that re-computing softmax+gather was cheaper than keeping `probs` in memory.
+
+The cat() that v0.16's `FusedMoE.forward(packed_logits)` requires is what triggered this. `probs` flows into TWO downstream consumers: (a) the cat for FusedMoE, (b) `hidden_states_mod = hidden_states * probs`. With the cat in v0.16, inductor's heuristic re-fires softmax+gather rather than reusing the stored `probs`.
 
 #### What's likely to help
 
-1. **Rewrite SMoEBlock + SMoERouter** to avoid the cat()+MOD inductor fusion. Either restore the 3-arg `SMoExperts` API or unroll the cat differently. Highest potential impact.
-2. **Hand-tuned MoE router Triton kernel** that does `down_proj → rmsnorm → router_mlp → softmax → topk → gather → MOD_mask` in one well-tuned kernel. Beats inductor's auto-fusion.
-3. **Investigate `FillFunctor<int>` 103k calls** — that's ~4700 int-zero fills per step. If reducible (FlexAttention SF mask bookkeeping is the suspect), saves ~27% of GPU time.
-4. **Try direct `fused_experts` call** in place of `FusedMoE.forward()` — bypass the generic vLLM class entirely.
+1. **Force inductor to materialize probs** — but `.contiguous()` and `.clone()` both regress (cudagraph buffer reallocation overhead larger than the recompute savings). Need a custom-op black box that consumes `probs` and returns it unchanged.
+2. **Restore v0.15's 3-arg expert API** by replacing `FusedMoE.forward(hidden_states, packed_logits)` with a direct call to `fused_experts(hidden_states, w13_weight, w2_weight, probs, indices, ...)` — bypasses FusedMoE.forward entirely. **Tried and it regresses 50%+** because the `fused_experts` direct path lacks the cudagraph-friendly dispatch machinery FusedMoE wraps it in. Would need a custom wrapper that's cudagraph-friendly AND takes probs/indices separately.
+3. **Hand-tuned MoE router Triton kernel** that does `down_proj → rmsnorm → router_mlp → softmax → topk → gather → MOD_mask` in one well-tuned kernel. Beats inductor's auto-fusion. Highest potential impact but most work.
+4. **Investigate `FillFunctor<int>` 103k calls** — that's ~4700 int-zero fills per step. If reducible (FlexAttention SF mask bookkeeping is the suspect), saves ~27% of GPU time.
 
 ## Smaller follow-ups
 
