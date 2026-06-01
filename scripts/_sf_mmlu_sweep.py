@@ -211,10 +211,13 @@ def main():
                     batch=args.batch,
                     explicit_captures=args.explicit_captures)
 
-    # Warmup so first-step compilation/capture isn't timed.
-    _ = llm.generate(["hi"],
-                     SamplingParams(temperature=0.0, max_tokens=4),
-                     use_tqdm=False)
+    # NOTE: a previous "warmup" call (`llm.generate(["hi"], max_tokens=4)`)
+    # caused a deterministic cudaErrorIllegalAddress on the very next
+    # llm.generate() call under SF FULL_DECODE_ONLY captured. The short
+    # "hi" prompt + tiny max_tokens leaves the engine in a state the next
+    # call can't recover from. torch.compile + cudagraph capture already
+    # happen during LLM(...) construction, so a warmup generate() isn't
+    # needed for correctness -- skip it.
 
     sp = SamplingParams(n=1, temperature=args.t_ar,
                         max_tokens=args.max_tokens, seed=0)
