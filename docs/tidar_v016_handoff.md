@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ❌ | Segfault in `cudaGraphLaunch` |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **22 tok/s b=1**, coherent. Requires `VLLM_TIDAR_ROUTER_PAD=1` env var. Without it, still crashes at step 3. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **23 tok/s b=1**, coherent. Requires `VLLM_TIDAR_ROUTER_PAD=1` env var. Without it, still crashes at step 3. Note: barely faster than TF eager (~20 tok/s) — the drafter still runs eager (see "Drafter-capture limitation" below). |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -70,9 +70,12 @@ llm = LLM(
 )
 ```
 
-22 tok/s at b=1 on iter_0012000. The padded-router workaround is dormant
-without `VLLM_TIDAR_ROUTER_PAD=1`, so SF (which doesn't need the fix)
-stays on the baseline path by default.
+23.5 tok/s at b=1 on iter_0012000 (steady state, after a warmup call).
+Barely faster than TF eager — drafter still runs eager; see "Drafter-
+capture limitation" below for what's needed to make TF FULL genuinely
+fast. The padded-router workaround is dormant without
+`VLLM_TIDAR_ROUTER_PAD=1`, so SF (which doesn't need the fix) stays on
+the baseline path by default.
 
 ### Run TF eager (fallback)
 
@@ -100,9 +103,19 @@ llm = LLM(
 
 **Why opt-in:** SF FULL captured doesn't hit the buggy kernel at its runtime shapes, and the padded matmul has small overhead at b=16 in noisy benchmarks. SF stays on the baseline path by default.
 
-**Validation (smoediffusion iter_0012000, b=1, max_tokens=500):**
-- `VLLM_TIDAR_TWO_FORWARD=1` `VLLM_TIDAR_ROUTER_PAD=1` `cudagraph_mode=FULL_DECODE_ONLY` → **22.4 tok/s, coherent math reasoning end-to-end**. Was 0 tok/s (engine crashed at step 3 = ~5 tokens).
+**Validation (smoediffusion iter_0012000, b=1, max_tokens=1000 after warmup):**
+- `VLLM_TIDAR_TWO_FORWARD=1` `VLLM_TIDAR_ROUTER_PAD=1` `cudagraph_mode=FULL_DECODE_ONLY` → **23.5 tok/s, coherent math reasoning end-to-end**. Was 0 tok/s (engine crashed at step 3 = ~5 tokens).
 - Without `VLLM_TIDAR_ROUTER_PAD=1`, TF FULL still crashes (verified — the fix is dormant when the flag is off).
+
+**Drafter-capture limitation (why TF FULL is only ~23 tok/s, not closer to SF's 100+):**
+
+The verifier forward IS captured (graph A, replay correctly), but the drafter still runs **eager**. In TF mode there are 2 forwards per step (drafter generates K spec tokens, verifier verifies them); only the second one benefits from cudagraph.
+
+I tried the v0.15-style fix: rebind `self.drafter.model = self.model` (the wrapped one) and lazy-capture the drafter graph on first `propose()` call via `set_cudagraph_capturing_enabled(True)` + a `graph_capture(device=...)` context to satisfy torch's non-default-stream requirement.
+
+With router-pad + rebind + lazy capture, the drafter graph captures successfully and the model produces **coherent output**, but per-step throughput regresses to **~6 tok/s** (3.8x slower than the eager-drafter path). Capture-time overhead is ~30s for the first propose() call (one-shot), but even after capture, per-step replay is slower than eager. The captured-drafter replay path appears to introduce per-step overhead I haven't pinned down yet — graph_capture context-manager state, wrapper.__call__ entry lookup, or static-buffer copy. Reverted; current shipped state has rebind OFF.
+
+To genuinely beat TF eager, the drafter graph needs to be captured AT WARMUP TIME (inside `capture_model`'s `graph_capture` context) with the drafter override metadata in scope. That requires `model_runner.capture_model` to call a TiDAR-specific `drafter.warmup_capture()` after the standard verifier capture, with the override-attribute setup that `TiDARProposer.propose` does at runtime. Bigger refactor; deferred.
 
 ### TF PIECEWISE captured — still broken
 
