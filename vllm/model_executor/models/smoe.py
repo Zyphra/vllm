@@ -48,6 +48,70 @@ from vllm.transformers_utils.configs import SMoEConfig
 import logging
 logger = logging.getLogger(__name__)
 
+
+# ----------------------------------------------------------------------------
+# TiDAR SF/TF perf-gap workaround: hide the probs+indices cat() from
+# inductor so it materializes probs once.
+#
+# v0.16's SMoE forward computes probs = softmax(logits) and uses probs in
+# two consumers in the same compile region: (a) the cat into FusedMoE's
+# packed_logits, (b) the MOD passthrough's `hidden_states * probs`.
+# Inductor sees probs flowing into both, decides recomputing softmax
+# inline for (b) is cheaper than materializing probs once, and produces
+# the monster `triton_red_fused__softmax__..._gather_..._mul_..._5`
+# kernel (66% of GPU time at b=1 SF, ~50% gap vs v0.15).
+#
+# Workaround: wrap the cat() + FusedMoE.forward call in a custom op.
+# The op's contents are opaque to inductor's fusion algorithm, so probs
+# (an op input) must be materialized at the call site. Downstream uses
+# of probs (the MOD passthrough mul) then read from the materialized
+# buffer instead of triggering an inline softmax recompute.
+#
+# Opt-in via VLLM_TIDAR_SMOE_MOE_OP=1. Default OFF until proven to help.
+# ----------------------------------------------------------------------------
+from vllm.utils.torch_utils import direct_register_custom_op as _direct_register_custom_op
+
+
+def _tidar_smoe_moe_with_probs_impl(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    indices: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    """Run the cat() and FusedMoE forward inside one opaque custom op.
+
+    Resolves the FusedMoE layer by name (same trick as the upstream
+    `moe_forward` custom op), packs (probs, indices) the way
+    `_custom_routing_fn` expects, and dispatches into `forward_impl`.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import (
+        get_layer_from_name)
+    packed = torch.cat([probs, indices.to(probs.dtype)], dim=-1)
+    moe_layer = get_layer_from_name(layer_name)
+    return moe_layer.forward_impl(hidden_states, packed)
+
+
+def _tidar_smoe_moe_with_probs_fake(
+    hidden_states: torch.Tensor,
+    probs: torch.Tensor,
+    indices: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
+_direct_register_custom_op(
+    op_name="tidar_smoe_moe_with_probs",
+    op_func=_tidar_smoe_moe_with_probs_impl,
+    mutates_args=["hidden_states"],
+    fake_impl=_tidar_smoe_moe_with_probs_fake,
+)
+
+
+_VLLM_TIDAR_SMOE_MOE_OP = (
+    os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "0").lower()
+    in ("1", "true", "yes"))
+
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
     """LM-head projection that returns fp32 logits via out_dtype."""
 
@@ -575,18 +639,33 @@ class SMoEBlock(nn.Module):
             clamped_indices = torch.clamp(indices,
                                           min=0,
                                           max=self.num_moe_experts - 1)
-            packed_logits = torch.cat([
-                probs, clamped_indices.to(probs.dtype)], dim=-1)
-            hidden_states_experts = self.experts(
-                hidden_states, packed_logits)
+            if _VLLM_TIDAR_SMOE_MOE_OP:
+                # See module-level comment: the custom op hides cat()
+                # from inductor so probs materializes once instead of
+                # being recomputed inline in the MOD-passthrough kernel.
+                hidden_states_experts = (
+                    torch.ops.vllm.tidar_smoe_moe_with_probs(
+                        hidden_states, probs, clamped_indices,
+                        self.experts.layer_name))
+            else:
+                packed_logits = torch.cat([
+                    probs, clamped_indices.to(probs.dtype)], dim=-1)
+                hidden_states_experts = self.experts(
+                    hidden_states, packed_logits)
             hidden_states_mod = hidden_states * probs
             mod_mask = (indices != self.num_moe_experts)
             hidden_states = (mod_mask * hidden_states_experts) + ((~mod_mask) * hidden_states_mod)
         else:
-            packed_logits = torch.cat([
-                probs, indices.to(probs.dtype)], dim=-1)
-            hidden_states = self.experts(
-                hidden_states, packed_logits)
+            if _VLLM_TIDAR_SMOE_MOE_OP:
+                hidden_states = (
+                    torch.ops.vllm.tidar_smoe_moe_with_probs(
+                        hidden_states, probs, indices,
+                        self.experts.layer_name))
+            else:
+                packed_logits = torch.cat([
+                    probs, indices.to(probs.dtype)], dim=-1)
+                hidden_states = self.experts(
+                    hidden_states, packed_logits)
 
         if self.tp_size > 1:
             hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(hidden_states)
