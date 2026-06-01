@@ -146,9 +146,15 @@ Same `SMoERouter` code as v0.15 (zero diff in the class). v0.15's `SMoExperts(pr
 
 ## Smaller follow-ups
 
-- `_sf_mmlu_sweep.py` crashes at FULL captured with the same illegal-memory pattern that direct invocation no longer hits. Likely the `llm.generate(["hi"], max_tokens=4)` warmup leaves the engine in a state that subsequent SF steps can't recover from. Direct invocation skipping that warmup works.
-- Eager-mode output drift after ~600 tokens (loops back to restating the problem — likely RoPE position vs CCA state mismatch slowly accumulating). Lower priority since FULL captured doesn't drift in the same window.
-- `cudaErrorCapturedEvent` from Triton autotune `Event.elapsed_time` during SF capture — workaround was `VLLM_TIDAR_SF_TRITON=0` falling through to FlexAttention (see `project_sf_captured_cudagraph_fixes`). Proper fix would be pre-capture autotune.
+- ~~`_sf_mmlu_sweep.py` crashes at FULL captured~~ — **FIXED** in `bd74b3151`: removed the `llm.generate(["hi"], max_tokens=4)` pre-timing warmup. torch.compile + cudagraph capture already happen during `LLM(...)` construction, so the warmup wasn't needed for correctness. Root cause turned out to be a more general bug (see below).
+- ~~Eager-mode output drift after ~600 tokens~~ — **VERIFIED FIXED at HEAD**: TF eager runs 700-token math reasoning coherently end-to-end; SF eager runs 900-token reasoning coherently end-to-end (both `temperature=0.0`, `seed=0`). The fix was commit `3026d9151` (force CCA vectorized path under all TiDAR, so the K+1 stash candidates exist for `commit_spec_decode_state` even outside FULL captured).
+- ~~`cudaErrorCapturedEvent` from Triton autotune~~ — **NOT REPRODUCIBLE at HEAD** with `VLLM_TIDAR_SF_TRITON=1` (the default, paged-cache Triton kernel). Capture completes cleanly because `cudagraph_num_of_warmups=1` runs the SF Triton kernel inside `graph_capture(...)` but outside the actual `torch.cuda.graph()` block — autotune events go to a non-capturing stream and the chosen config is cached for the subsequent capture. **Caveat:** the opt-out `VLLM_TIDAR_SF_TRITON=0` (multi-call FA fallback) now fails engine init at HEAD — should be removed or fixed if it's still load-bearing anywhere.
+
+### Newly discovered: multi-`llm.generate()` engine corruption
+
+While verifying the sweep-script fix I found that **two consecutive `llm.generate()` calls on the same LLM instance under SF FULL captured will crash the second call** with `cudaErrorIllegalAddress` at `_update_states_after_model_execute → .cpu()`. The first call works; the second dies. Reproduces with `max_num_seqs=16`, batch grown from 1 → 4 across calls. The previous sweep-script `["hi"] max_tokens=4` warmup hit this same bug. Single `llm.generate()` calls with multiple prompts in one batch work fine (that's how `bench_tidar.py` reports the 176/361/619 tok/s numbers).
+
+Likely candidates: block-table state from the finished request isn't fully released before the next call schedules; or some scheduler-side state (`num_computed_tokens`, `_num_computed_tokens_cache`) sticks between calls in a way the captured graph can't tolerate. Not investigated further — `bench_tidar.py` and `_sf_mmlu_sweep.py` both work around it by issuing a single batched call.
 
 ## Commit chain (this port)
 
