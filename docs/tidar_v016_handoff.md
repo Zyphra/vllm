@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ❌ | Segfault in `cudaGraphLaunch` |
-| TF FULL_DECODE_ONLY captured | ❌ | Crashes deterministically at 3rd verifier replay (cudaErrorIllegalAddress) |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **22 tok/s b=1**, coherent. Requires `VLLM_TIDAR_ROUTER_PAD=1` env var. Without it, still crashes at step 3. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -55,16 +55,34 @@ out = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=600))
 
 `cudagraph_copy_inputs=True` is auto-forced under TiDAR (don't override).
 
-### Run TF (eager only — FULL captured is broken)
+### Run TF FULL captured (opt-in via env var)
+
+```bash
+export VLLM_TIDAR_TWO_FORWARD=1
+export VLLM_TIDAR_ROUTER_PAD=1   # required for TF FULL captured
+```
+
+```python
+llm = LLM(
+    model=ckpt, ..., enforce_eager=False,
+    speculative_config={...},
+    compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+)
+```
+
+22 tok/s at b=1 on iter_0012000. The padded-router workaround is dormant
+without `VLLM_TIDAR_ROUTER_PAD=1`, so SF (which doesn't need the fix)
+stays on the baseline path by default.
+
+### Run TF eager (fallback)
 
 ```python
 import os
 os.environ["VLLM_TIDAR_TWO_FORWARD"] = "1"
 
 llm = LLM(
-    model=ckpt, ..., enforce_eager=True,   # <-- required for TF today
+    model=ckpt, ..., enforce_eager=True,
     speculative_config={...},
-    # do NOT pass compilation_config with FULL/PIECEWISE — both crash
 )
 ```
 
@@ -74,34 +92,21 @@ llm = LLM(
 
 ## What's broken
 
-### TF FULL/PIECEWISE captured — deferred
+### TF FULL captured — FIXED in `43c0fa08e` (opt-in via `VLLM_TIDAR_ROUTER_PAD=1`)
 
-Verifier graph A replays cleanly for steps 1 and 2, then crashes inside `entry.cudagraph.replay()` at step 3 with `cudaErrorIllegalAddress`. Reproduces:
-- across K=4 (shape 5) and K=16 (shape 17) — **step-count specific, not shape-specific**
-- max_tokens 1-4: OK (1-2 replays only). max_tokens ≥ 5: crash at 3rd replay.
-- with/without `cudagraph_copy_inputs`, `combo_kernels`, `enable_chunked_prefill`, `cudagraph_capture_sizes=[17]` only
-- with/without the v0.15-style `drafter.model = self.model` rebind (rebind + lazy capture *succeeds at capture* but produces all-zero spec tokens and the next verifier crashes anyway)
+**Root cause:** `SMoERouter`'s final linear projects `D=mlp_expansion -> num_experts (=17 with MOD)`. That output stride (17) is not a multiple of 8, so under captured-cudagraph replay cublas selects `cutlass_75_tensorop_s1688gemm_bf16_64x64_tn_align1` — a kernel that **writes 1+ bytes past its output allocation**. In eager mode the regular allocator's padding hides the OOB; the cudagraph memory pool's tight fit exposes it. Verified with `compute-sanitizer --tool=memcheck`: every TF FULL crash hits this exact kernel at `+0x5430`, OOB by 1 byte from a 1.18 GB-adjacent allocation.
 
-PIECEWISE TF fails earlier in `cudaGraphLaunch` with a process segfault — likely the same root cause, different surface.
+**Fix:** project against a padded `D -> E_padded` weight (E=17 → E_padded=24, the next multiple of 8). cublas picks a different (correct) sm_90 kernel for the aligned output stride. Slice back to E columns for downstream code. Padded weight buffer is filled lazily on first forward from `router_mlp[4].weight`, no checkpoint format change needed.
 
-#### Already ruled out
+**Why opt-in:** SF FULL captured doesn't hit the buggy kernel at its runtime shapes, and the padded matmul has small overhead at b=16 in noisy benchmarks. SF stays on the baseline path by default.
 
-| Hypothesis | Result |
-|---|---|
-| Dispatcher routing | Verifier always returns FULL match for `(uniform=True, drafter_pass=False)`. Confirmed via runtime print. |
-| Drafter corrupting state | Drafter is eager + `cca_drafter_pass=True` → `skip_writes=True`, doesn't touch AR slot. |
-| Recent CCA gate change (`_use_spec_vectorized = bool(_spec_stash_conv is not None)`) | Reverting to commit `a5f3dcc7a`'s FULL-only gate still crashes. Bug predates the fix. |
-| Persistent buffer pointer drift | `state_indices_tensor`, `_spec_stash_*`, `block_table_tensor`, `query_start_loc.gpu`, `seq_lens.gpu`, `slot_mapping.gpu` are all persistent slices with stable `data_ptr()`. |
-| v0.15-style drafter rebind + lazy capture | Lazy capture succeeds (with `graph_capture(device=...)` bracket to satisfy non-default-stream). Captured drafter emits all-zero tokens → next verifier crashes. Removing rebind reverts to original step-3 crash. |
-| max_num_seqs > 1, chunked_prefill off, capture_sizes=[17] only, block_size > 16 | All still crash at step 3 (block_size > 16 is rejected by FlexAttention). |
+**Validation (smoediffusion iter_0012000, b=1, max_tokens=500):**
+- `VLLM_TIDAR_TWO_FORWARD=1` `VLLM_TIDAR_ROUTER_PAD=1` `cudagraph_mode=FULL_DECODE_ONLY` → **22.4 tok/s, coherent math reasoning end-to-end**. Was 0 tok/s (engine crashed at step 3 = ~5 tokens).
+- Without `VLLM_TIDAR_ROUTER_PAD=1`, TF FULL still crashes (verified — the fix is dormant when the flag is off).
 
-#### Next things to try
+### TF PIECEWISE captured — still broken
 
-1. **`compute-sanitizer --tool memcheck`** on a TF FULL run. The OOB access is inside a captured kernel — the only practical way to localize it is device-side memory tracking. PyTorch's `TORCH_USE_CUDA_DSA=1` requires a custom build (env var alone has no effect).
-2. **v0.15 ↔ v0.16 CCA bisect**. v0.15's CCA forward worked under TF FULL. v0.16 added `cca_prefill_fused`, `cca_decode_fused`, `cca_prefill_fused_hip`, `fused_pad_gather_scatter`, `fused_qk_mean`, and the `_gw_weight_T` runtime weight view cache. Even though the new fused paths are env-gated (default off), `__init__` runs them. Diffing the active code path between v0.15 and v0.16 would narrow this down.
-3. **Drafter rebind producing zeros** is a separate bug worth investigating in its own right (would unlock a route to capturing the drafter graph, even if it doesn't fix the verifier crash).
-
-The crash being **deterministic at step 3 regardless of shape, prompt length, K, batch size, or block crossing** is a strong fingerprint but I haven't been able to attribute it to anything observable from Python.
+PIECEWISE TF fails earlier in `cudaGraphLaunch` with a process segfault. Likely the same router-output OOB triggered from a piecewise-captured subgraph; the `VLLM_TIDAR_ROUTER_PAD=1` workaround has not been tested on this path yet. The SF FULL captured path is the supported alternative.
 
 ## What's slow
 
