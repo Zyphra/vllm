@@ -14,6 +14,7 @@ VLLM_CCA_TRITON = os.getenv("VLLM_CCA_TRITON", "1") == "1"
 from typing import Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from torch import nn
+import torch.nn.functional as F
 
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.mamba.cca import CCA
@@ -368,6 +369,34 @@ class SMoERouter(nn.Module):
             self.non_linearity,
             ReplicatedLinear(D, E, bias=False, quant_config=quant_config, return_bias=False),
         )
+        # Padded copy of the final router linear's weight. The original
+        # D->E weight has unaligned output stride (E=17 with MOD), which
+        # under captured cudagraph replay routes cublas to the buggy
+        # cutlass_75 align1 GEMM kernel that writes past its output
+        # allocation. Computing the final projection against a padded
+        # (D->E_padded) weight where E_padded is a multiple of 8 dodges
+        # that kernel selection. Filled lazily on first forward (after
+        # default_weight_loader has populated router_mlp[4].weight).
+        #
+        # OPT-IN via VLLM_TIDAR_ROUTER_PAD=1 because the padded matmul
+        # regresses SF FULL captured throughput at b>=16 (large M).
+        # SF doesn't trigger the buggy kernel at runtime shapes, so it
+        # gets the baseline (faster) path by default. TF FULL captured
+        # MUST use the padded path to avoid the crash.
+        _enable_router_pad = (
+            os.environ.get("VLLM_TIDAR_ROUTER_PAD", "0").lower()
+            in ("1", "true", "yes"))
+        self._E_pad = ((E + 7) // 8) * 8
+        if _enable_router_pad and self._E_pad != E:
+            self.register_buffer(
+                "_router_last_w_padded",
+                torch.zeros(self._E_pad, D, dtype=torch.bfloat16),
+                persistent=False,
+            )
+            self._router_last_w_synced = False
+        else:
+            self._router_last_w_padded = None
+            self._router_last_w_synced = True
 
         # Balancing biases
         self.register_buffer("balancing_biases", torch.zeros(self.num_experts, dtype=torch.float32))
@@ -408,7 +437,34 @@ class SMoERouter(nn.Module):
         hs_norm = self.rmsnorm_eda(hs)
 
         # 3) Expert probability distribution
-        logits = self.router_mlp(hs_norm)
+        # WORKAROUND: the final linear of router_mlp is D -> num_experts
+        # (=17 with MOD), an unaligned-output GEMM that, under captured
+        # cudagraph replay, triggers cublas to pick the buggy
+        # cutlass_75_tensorop_s1688gemm_bf16_64x64_tn_align1 kernel — it
+        # writes 1+ bytes past its output allocation (verified with
+        # compute-sanitizer memcheck). We project against a padded
+        # (D->E_padded) weight buffer (kept in sync with the real
+        # router_mlp[4].weight via _sync_router_padded_weight()), then
+        # slice the output back to E columns. cublas picks a different
+        # (correct) kernel for the multiple-of-8 output stride.
+        if self._router_last_w_padded is not None:
+            # Lazy one-time sync of the padded weight from router_mlp[4].
+            # Cheap and idempotent: a single bool check + a torch.equal
+            # is much more expensive than just always copying; we just
+            # copy once and skip thereafter.
+            if not self._router_last_w_synced:
+                with torch.no_grad():
+                    self._router_last_w_padded[:self.num_experts].copy_(
+                        self.router_mlp[4].weight)
+                self._router_last_w_synced = True
+            inner = self.router_mlp[0](hs_norm)
+            inner = self.non_linearity(inner)
+            inner = self.router_mlp[2](inner)
+            inner = self.non_linearity(inner)
+            _logits_padded = F.linear(inner, self._router_last_w_padded)  # [M, E_pad]
+            logits = _logits_padded[..., :self.num_experts]
+        else:
+            logits = self.router_mlp(hs_norm)
         if self.router_softmax_fp32:
             expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)
         else:
