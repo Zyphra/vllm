@@ -16,7 +16,7 @@
 | SF PIECEWISE captured | ✅ | Coherent |
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
-| TF PIECEWISE captured | ❌ | Segfault in `cudaGraphLaunch` |
+| TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
 | **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **23 tok/s b=1**, coherent. Requires `VLLM_TIDAR_ROUTER_PAD=1` env var. Without it, still crashes at step 3. Note: barely faster than TF eager (~20 tok/s) — the drafter still runs eager (see "Drafter-capture limitation" below). |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
@@ -117,9 +117,17 @@ With router-pad + rebind + lazy capture, the drafter graph captures successfully
 
 To genuinely beat TF eager, the drafter graph needs to be captured AT WARMUP TIME (inside `capture_model`'s `graph_capture` context) with the drafter override metadata in scope. That requires `model_runner.capture_model` to call a TiDAR-specific `drafter.warmup_capture()` after the standard verifier capture, with the override-attribute setup that `TiDARProposer.propose` does at runtime. Bigger refactor; deferred.
 
-### TF PIECEWISE captured — still broken
+### TF PIECEWISE captured — FIXED by `VLLM_TIDAR_ROUTER_PAD=1` (same flag as TF FULL)
 
-PIECEWISE TF fails earlier in `cudaGraphLaunch` with a process segfault. Likely the same router-output OOB triggered from a piecewise-captured subgraph; the `VLLM_TIDAR_ROUTER_PAD=1` workaround has not been tested on this path yet. The SF FULL captured path is the supported alternative.
+Confirmed root cause is identical to TF FULL captured: the buggy `cutlass_75_tensorop_s1688gemm_bf16_64x64_tn_align1` kernel writes 1+ bytes past its output during cudagraph replay, on the SMoERouter's `D=2048 → E=17` final projection. Under PIECEWISE the OOB lands in a place the runtime can't recover from, so it surfaces as a process **segfault** (`cudaGraphLaunch → at::cuda::CUDAGraph::replay()`) rather than the `cudaErrorIllegalAddress` exception you get under FULL.
+
+The router-pad workaround introduced in `43c0fa08e` (project against a padded `D → E_padded=24` weight to dodge the buggy kernel) applies identically to PIECEWISE — no code change needed beyond setting the env var.
+
+**Validation (smoediffusion iter_0012000, K=16, b=1, max_tokens=200, n=3, TF mode):**
+- `VLLM_TIDAR_TWO_FORWARD=1` `VLLM_TIDAR_ROUTER_PAD=1` `cudagraph_mode=PIECEWISE` → **13.88 tok/s aggregate, all 3 prompts produce coherent math reasoning** (`finish=length`, mean acceptance length 5.08/3.77/3.51 across SpecDecoding windows).
+- Without `VLLM_TIDAR_ROUTER_PAD=1`: process segfaults at first replay of the captured subgraph (post warmup, in the first user `llm.generate()` call). C-stack: `cudaGraphLaunch → at::cuda::CUDAGraph::replay`.
+
+PIECEWISE captures 6 subgraphs (vs FULL's 6 too in this config) and reuses them across drafter + verifier passes, so the fix lands once and benefits both forwards.
 
 ## What's slow
 
