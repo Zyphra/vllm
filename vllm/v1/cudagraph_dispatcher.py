@@ -238,10 +238,15 @@ class CudagraphDispatcher:
                 # drafter metadata before calling the wrapped model.
                 speculative_config = self.vllm_config.speculative_config
                 import os as _ocg
+                # VLLM_TIDAR_TWO_FORWARD=1 selects TF mode; default is SF.
+                # Mirrors TiDARProposer.__init__'s gate (vllm/v1/spec_decode
+                # /tidar.py — single_forward_mode = not VLLM_TIDAR_TWO_FORWARD).
+                _tf_mode = _ocg.environ.get("VLLM_TIDAR_TWO_FORWARD", "0") == "1"
                 if (
                     speculative_config is not None
                     and getattr(speculative_config, "method", None)
                         == "tidar"
+                    and _tf_mode
                     and _ocg.environ.get("VLLM_TIDAR_DISABLE_DRAFTER_CAPTURE", "0") != "1"
                 ):
                     self.add_cudagraph_key(
