@@ -2395,8 +2395,39 @@ class GPUModelRunner(
         ]
         if not num_accepted_per_batch_idx:
             return
+        # Build idx_gpu / arange_gpu ONCE here (then pass to every layer).
+        # Each layer's commit_spec_decode_state would otherwise re-allocate
+        # both tensors on GPU. For ~40 CCA layers per step that's ~120
+        # tiny torch.as_tensor / torch.arange calls per spec-decode step
+        # -- the dominant verifier-side TiDAR overhead at b=1.
+        # Eligibility: idx_gpu/arange_gpu only useful when n_used > 0 and
+        # _spec_stash_conv exists on the layer; we mirror the layer's
+        # check approximately (any one layer can decide to ignore the
+        # passed tensors and fall back if needed).
+        _first_layer = next(iter(self._cca_layers_cache.values()))
+        _spec_max_P = getattr(_first_layer, "_spec_max_P", 0) or 0
+        _spec_max_S = getattr(_first_layer, "_spec_max_S", 0) or 0
+        _stash_conv = getattr(_first_layer, "_spec_stash_conv", None)
+        _idx_gpu = None
+        _arange_gpu = None
+        if _spec_max_P > 0 and _spec_max_S > 0 and _stash_conv is not None:
+            n_used = min(len(num_accepted_per_batch_idx), _spec_max_P)
+            if n_used > 0:
+                K_max = _spec_max_S - 1
+                accepted = [
+                    min(max(0, n), K_max)
+                    for n in num_accepted_per_batch_idx[:n_used]
+                ]
+                if len(accepted) < n_used:
+                    accepted.extend([0] * (n_used - len(accepted)))
+                _idx_gpu = torch.as_tensor(
+                    accepted, dtype=torch.long, device=_stash_conv.device)
+                _arange_gpu = torch.arange(n_used, device=_stash_conv.device)
         for cca_layer in self._cca_layers_cache.values():
-            cca_layer.commit_spec_decode_state(num_accepted_per_batch_idx)
+            cca_layer.commit_spec_decode_state(
+                num_accepted_per_batch_idx,
+                idx_gpu=_idx_gpu,
+                arange_gpu=_arange_gpu)
     # === end TiDAR Block 11 ===========================================
 
     def _prepare_kv_sharing_fast_prefill(
