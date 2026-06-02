@@ -130,6 +130,19 @@ Result: 0% acceptance and 1.29 tok/s b=1 dense P (vs 14.25 baseline). The captur
 
 Pointers for the next attempt: nsys diff between v0.15 drafter-capture and v0.16 attempt; or `compute-sanitizer --tool=initcheck` + memcheck on the drafter graph's first replay to find the unpinned read source.
 
+**2026-06-01 third attempt log (Approach B, also reverted):** Implemented the bigger refactor the handoff originally recommended — a `TiDARProposer.warmup_capture_drafter_graphs()` hook that builds dummy drafter metadata + inputs inside `gpu_model_runner.capture_model`'s `graph_capture(device=)` context, AFTER the standard verifier captures complete. This avoids the per-call `graph_capture(device=)` bracket in `propose()` entirely; the drafter graph is captured at warmup with the correct metadata in scope, then runtime `propose()` just dispatches and replays.
+
+Implementation:
+- `vllm/v1/spec_decode/tidar.py`: new `warmup_capture_drafter_graphs()` + `_warmup_capture_one_drafter_shape()` methods. Constructs dummy seq_lens=K+1, query_start_loc=[0,K+1,..], slot_mapping=[0..n-1], etc. — pointing at runner persistent buffers — then sets drafter overrides (`state_indices_tensor_write_override = block_table[:, 1]`, `cca_drafter_pass=True`) and calls `self.model(...)` with `BatchDescriptor(is_drafter_pass=True)`. Wrapped in `torch.inference_mode()` to match `_dummy_run`'s decorator (FlexAttention metadata builder inplace-mutates persistent inference tensors that fail outside that mode).
+- `vllm/v1/cudagraph_dispatcher.py`: register `is_drafter_pass=True` key per shape; filter from `get_capture_descs()` so the standard loop doesn't try to capture it with verifier metadata.
+- `vllm/v1/worker/gpu_model_runner.py`: runner rebind + call the new hook after the regular capture loop inside `graph_capture(device=)`.
+
+Result: drafter graph captures successfully at warmup (logs show "TiDAR Tier 3: warmup-capturing drafter graph at num_tokens=17 (batch_size=1, K+1=17)"). Generation runs at ~13 tok/s (vs 14.25 eager baseline), **still 0% acceptance**. Same garbage-token symptom as the lazy-capture attempt — confirms the bug is NOT about *when* the drafter graph gets captured.
+
+This rules out my earlier hypotheses (non-default stream, graph_capture context-manager state, late-binding warmup vs lazy). The captured drafter graph itself is structurally wrong even with all the proper metadata in scope at capture. Most likely cause: **FlexAttention bakes seq-length-dependent Python ints into the captured kernels** (e.g., `seq_lengths=(num_actual_tokens, total_cache_tokens)` on the block_mask), so the captured graph attends only over the dummy seq_lens=K+1 KV slice instead of the real runtime sequence. v0.15 used FlashAttention (FA backend) for the drafter, which doesn't have this property; v0.16's `VLLM_ATTENTION_BACKEND=FLEX_ATTENTION` is the only viable backend for SF, but FlexAttention's per-step seq-len bakeness may be incompatible with TF drafter capture.
+
+To progress further: try the warmup capture path with `VLLM_ATTENTION_BACKEND=FLASH_ATTN` (the v0.15 backend) to test the FlexAttention-bakeness hypothesis. If FA works, the right shipping path is to capture the drafter graph against the FA backend even when the verifier uses FlexAttention — or accept the eager-drafter ceiling for TF mode (SF stays the supported path).
+
 ### TF PIECEWISE captured — FIXED by `VLLM_TIDAR_ROUTER_PAD=1` (same flag as TF FULL)
 
 Confirmed root cause is identical to TF FULL captured: the buggy `cutlass_75_tensorop_s1688gemm_bf16_64x64_tn_align1` kernel writes 1+ bytes past its output during cudagraph replay, on the SMoERouter's `D=2048 → E=17` final projection. Under PIECEWISE the OOB lands in a place the runtime can't recover from, so it surfaces as a process **segfault** (`cudaGraphLaunch → at::cuda::CUDAGraph::replay()`) rather than the `cudaErrorIllegalAddress` exception you get under FULL.
