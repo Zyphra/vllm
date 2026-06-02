@@ -547,7 +547,7 @@ class TiDARProposer(EagleProposer):
         if cca_blk_tensor_full.shape[1] < 2:
             return
 
-        # FlashAttn group's block table (group 0) is what
+        # FlashAttn group's block table is what
         # CommonAttentionMetadata.block_table_tensor must point at --
         # the FA metadata builder consumes it for KV lookup. The CCA
         # builder also reads `common_attn_metadata.block_table_tensor`
@@ -555,7 +555,19 @@ class TiDARProposer(EagleProposer):
         # mamba_get_block_table_tensor), and the CCA-specific draft
         # slot is plumbed separately via
         # `state_indices_tensor_write_override`.
-        fa_blk_obj = runner.input_batch.block_table[0]
+        #
+        # CRITICAL: look up FA's group_id dynamically. Hardcoding [0]
+        # picked the CCA group (shape [N, K+1]) instead of FA (shape
+        # [N, max_blocks_per_req]), so the captured graph traced FA
+        # attention against the WRONG block table addresses and produced
+        # 0% accept at runtime. (Both groups happen to live at adjacent
+        # addresses 23407005301248 vs 23407005301760 with shape [1,17]
+        # vs [1,128], differing by 512 bytes — the captured FA ops then
+        # read garbage from the CCA-shaped buffer at replay.)
+        _, _fa_group_id = (
+            self._get_metadata_builder_and_group_id_for_layer(
+                self.attn_layer_names[0]))
+        fa_blk_obj = runner.input_batch.block_table[_fa_group_id]
         fa_blk_tensor_full = fa_blk_obj.get_device_tensor(
             runner.scheduler_config.max_num_seqs)
 
@@ -596,12 +608,12 @@ class TiDARProposer(EagleProposer):
 
                 self._warmup_capture_one_drafter_shape(
                     runner, batch_size, K_plus_1, num_input_tokens, desc,
-                    fa_blk_tensor_full, cca_blk_tensor_full)
+                    fa_blk_tensor_full, cca_blk_tensor_full, _fa_group_id)
 
     def _warmup_capture_one_drafter_shape(
         self, runner, batch_size: int, K_plus_1: int,
         num_input_tokens: int, drafter_desc,
-        fa_blk_tensor_full, cca_blk_tensor_full):
+        fa_blk_tensor_full, cca_blk_tensor_full, fa_group_id: int = 0):
         """Capture one drafter-pass FULL cudagraph at warmup."""
         from vllm.forward_context import set_forward_context
         from vllm.config import CUDAGraphMode
@@ -643,7 +655,8 @@ class TiDARProposer(EagleProposer):
 
         # FlashAttn slot_mapping: persistent buffer; fill with valid
         # slot IDs (slot 0..num_input_tokens-1 are fine for dummy).
-        fa_blk_obj = runner.input_batch.block_table[0]
+        # (Use the same dynamically-looked-up FA group id as above.)
+        fa_blk_obj = runner.input_batch.block_table[fa_group_id]
         fa_blk_obj.slot_mapping.gpu[:num_input_tokens].copy_(
             torch.arange(num_input_tokens, dtype=torch.int64,
                          device=gpu_dev))
@@ -923,7 +936,14 @@ class TiDARProposer(EagleProposer):
                                    query_len, max=self.max_model_len)
 
         # slot_mapping: write into FlashAttn group's persistent slot_mapping.
-        flash_blk_table = runner.input_batch.block_table[0]
+        # Use FA group id dynamically — hardcoded [0] picked the CCA group
+        # on this model (CCA layers happen to register first), so the
+        # captured drafter graph (which traced FA's slot_mapping at fa_group's
+        # persistent buffer) read stale data at replay.
+        _, _fa_group_id_bdi = (
+            self._get_metadata_builder_and_group_id_for_layer(
+                self.attn_layer_names[0]))
+        flash_blk_table = runner.input_batch.block_table[_fa_group_id_bdi]
         flash_blk_table.slot_mapping.gpu[:n_tokens].copy_(slot_mapping.view(-1))
         flash_blk_table.slot_mapping.gpu[n_tokens:].fill_(-1)
         slot_mapping_pinned = flash_blk_table.slot_mapping.gpu[:n_tokens]
