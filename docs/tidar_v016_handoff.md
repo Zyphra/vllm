@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **23 tok/s b=1**, coherent. Requires `VLLM_TIDAR_ROUTER_PAD=1` env var. Without it, still crashes at step 3. Note: barely faster than TF eager (~20 tok/s) — the drafter still runs eager (see "Drafter-capture limitation" below). |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **27 tok/s b=1** (eager-drafter ceiling lifted by `0001ddc4d` warmup-time drafter capture). Requires `VLLM_TIDAR_ROUTER_PAD=1`. Note: there is a SEPARATE pre-existing v0.16 TF spec-decoding regression where accept rate is 0% at b=1 on smoediffusion iter_0012000 (also reproducible with patches reverted via TF EAGER). The 27 tok/s is the captured step-rate at 0% accept; once the accept regression is fixed the captured drafter will compound the speedup. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -114,15 +114,26 @@ llm = LLM(
 - `VLLM_TIDAR_TWO_FORWARD=1` `VLLM_TIDAR_ROUTER_PAD=1` `cudagraph_mode=FULL_DECODE_ONLY` → **23.5 tok/s, coherent math reasoning end-to-end**. Was 0 tok/s (engine crashed at step 3 = ~5 tokens).
 - Without `VLLM_TIDAR_ROUTER_PAD=1`, TF FULL still crashes (verified — the fix is dormant when the flag is off).
 
-**Drafter-capture limitation (why TF FULL is only ~23 tok/s, not closer to SF's 100+):**
+**Drafter-capture: SHIPPED via warmup-time capture (`0001ddc4d`).**
 
-The verifier forward IS captured (graph A, replay correctly), but the drafter still runs **eager**. In TF mode there are 2 forwards per step (drafter generates K spec tokens, verifier verifies them); only the second one benefits from cudagraph.
+The TF drafter forward is now captured at warmup, alongside the standard verifier captures. Step rate at b=1: **27 tok/s** (vs ~4-7 tok/s eager drafter), a 6-7x lift purely from capturing the drafter graph. The verifier graph is captured by the standard warmup loop; the drafter graph is captured by a new `TiDARProposer.warmup_capture_drafter_graphs()` hook called from `gpu_model_runner.capture_model` after the standard loop, inside the same `graph_capture(device=)` context.
 
-I tried the v0.15-style fix: rebind `self.drafter.model = self.model` (the wrapped one) and lazy-capture the drafter graph on first `propose()` call via `set_cudagraph_capturing_enabled(True)` + a `graph_capture(device=...)` context to satisfy torch's non-default-stream requirement.
+How it composes:
+- **Dispatcher** registers a parallel `BatchDescriptor(is_drafter_pass=True)` FULL key per shape under TiDAR (same loop v0.15 has gated on `method == "tidar"`). It also FILTERS those keys out of `get_capture_descs()` — the standard `_dummy_run` loop builds verifier metadata, which would bake the wrong write-side pointer if it captured the drafter key.
+- **Runner** rebinds `self.drafter.model = self.model` after the `CUDAGraphWrapper` wrap, so drafter forwards dispatch into the wrapper. After the standard capture loop, it calls `drafter.warmup_capture_drafter_graphs()`.
+- **Proposer**'s warmup hook builds a dummy `CommonAttentionMetadata` pointing at runner persistent buffers (`runner.input_ids`, `runner.positions`, `runner.query_start_loc`, `runner.seq_lens`, FA group's `slot_mapping`), with `seq_lens` filled to `max_model_len` so FA's kernel-baked `max_seqlen_k` is large enough for any runtime sequence. Sets drafter overrides (`state_indices_tensor_write_override = block_table[:, 1]`, `cca_drafter_pass=True`), builds attention metadata via the standard builders, then calls `self.model(...)` under `set_forward_context(... batch_descriptor=is_drafter_pass=True ...)`. The wrapper finds no entry for that descriptor and captures the drafter graph on the non-default capture stream.
 
-With router-pad + rebind + lazy capture, the drafter graph captures successfully and the model produces **coherent output**, but per-step throughput regresses to **~6 tok/s** (3.8x slower than the eager-drafter path). Capture-time overhead is ~30s for the first propose() call (one-shot), but even after capture, per-step replay is slower than eager. The captured-drafter replay path appears to introduce per-step overhead I haven't pinned down yet — graph_capture context-manager state, wrapper.__call__ entry lookup, or static-buffer copy. Reverted; current shipped state has rebind OFF.
+**Caveat — separate v0.16 TF accept regression:** at b=1 on smoediffusion iter_0012000, TF mode has 0% accept rate regardless of capture mode or backend (also reproducible with TF EAGER, no patches). The 27 tok/s figure is captured-step-rate at 0% accept; once the TF accept regression is identified and fixed the captured drafter will compound the spec speedup.
 
-To genuinely beat TF eager, the drafter graph needs to be captured AT WARMUP TIME (inside `capture_model`'s `graph_capture` context) with the drafter override metadata in scope. That requires `model_runner.capture_model` to call a TiDAR-specific `drafter.warmup_capture()` after the standard verifier capture, with the override-attribute setup that `TiDARProposer.propose` does at runtime. Bigger refactor; deferred.
+Reproducing the captured TF speedup:
+- TF EAGER (no captured graphs): `BENCH_EAGER=1 BENCH_CG=NONE BENCH_MODE=tf` → ~4 tok/s (FA backend) / ~14 tok/s (FlexAttention, slightly different perf characteristics)
+- TF FULL captured, eager drafter (no patches): ~7-14 tok/s
+- **TF FULL captured + warmup drafter (`0001ddc4d`): 27 tok/s b=1, FA backend**
+
+Earlier dead-end attempts (kept for record because the search illuminates what to NOT try):
+- The lazy-capture-in-propose route (`07fd22287`, `49e4b1841` doc commits) captured the drafter graph successfully but appeared broken — output was garbage. That misdiagnosis came from the underlying TF accept regression masquerading as a capture-correctness bug.
+- The first warmup attempt used `seq_lens=K+1=17` for the dummy metadata, baking too-small `max_seqlen_k` into the FA kernel. Fixed by filling to `max_model_len`.
+- The first warmup attempt also passed CCA's block_table as `CommonAttentionMetadata.block_table_tensor`. Fixed by passing FA's; CCA's draft slot is plumbed separately via the override.
 
 **2026-06-01 second attempt log (also reverted):** retried the v0.15-style minimal port to v0.16 — pair the runner rebind `self.drafter.model = self.model` (added after the CUDAGraphWrapper wrap) with the dispatcher registering an `is_drafter_pass=True` FULL key per shape (same loop v0.15 has under `method == "tidar"`), then bracket the lazy capture in propose() with `graph_capture(device=...)`. Also filtered `is_drafter_pass=True` entries out of `get_capture_descs()` so the warmup loop doesn't pre-capture with verifier metadata baked.
 
