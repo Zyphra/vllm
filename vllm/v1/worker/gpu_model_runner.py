@@ -5677,6 +5677,7 @@ class GPUModelRunner(
                 hasattr(self, "drafter")
                 and getattr(self.drafter, "warmup_capture_drafter_graphs",
                             None) is not None
+                and __import__("os").environ.get("VLLM_TIDAR_DISABLE_DRAFTER_CAPTURE", "0") != "1"
             ):
                 self.drafter.warmup_capture_drafter_graphs()
 

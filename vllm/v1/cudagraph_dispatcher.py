@@ -237,10 +237,12 @@ class CudagraphDispatcher:
                 # entry. The TiDAR warmup hook sets up the correct
                 # drafter metadata before calling the wrapped model.
                 speculative_config = self.vllm_config.speculative_config
+                import os as _ocg
                 if (
                     speculative_config is not None
                     and getattr(speculative_config, "method", None)
                         == "tidar"
+                    and _ocg.environ.get("VLLM_TIDAR_DISABLE_DRAFTER_CAPTURE", "0") != "1"
                 ):
                     self.add_cudagraph_key(
                         CUDAGraphMode.FULL,
