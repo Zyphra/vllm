@@ -497,6 +497,235 @@ class TiDARProposer(EagleProposer):
             self.last_draft_probs = draft_probs.contiguous()
         return draft_token_ids.view(B, K).to(torch.int32)
 
+    def warmup_capture_drafter_graphs(self) -> None:
+        """Approach B: warmup-time drafter graph capture.
+
+        Called from runner.capture_model AFTER the standard verifier
+        captures complete, INSIDE that method's already-active
+        graph_capture(device=self.device) context. We're on a
+        non-default stream and the runner's persistent buffers were
+        primed by the just-finished _dummy_run.
+
+        For each captured FULL shape, we build the drafter-specific
+        CCA metadata (state_indices_tensor_write_override = draft slot,
+        cca_drafter_pass=True), then call self.model with the drafter
+        BatchDescriptor. The CUDAGraphWrapper sees no entry for that
+        descriptor and captures the drafter graph at that moment, with
+        the *drafter* metadata in scope — write→draft and skip_writes
+        baked in at capture time, exactly like v0.15's lazy capture
+        did. Subsequent runtime propose() calls hit a populated entry
+        and replay.
+
+        Only runs under TiDAR TF mode (single_forward_mode=False) on
+        FULL-cudagraph capture sizes whose shape is a multiple of
+        (K+1); other capture sizes don't correspond to a TiDAR drafter
+        forward.
+        """
+        if self.single_forward_mode:
+            # SF mode has no separate drafter pass.
+            return
+        if not self.cca_layer_names:
+            # No CCA in this model -> no read=AR/write=draft routing.
+            return
+        runner = self.runner
+        K_plus_1 = self.num_speculative_tokens + 1
+
+        # Lazily resolve the CCA metadata builder + kv-cache group id.
+        if self.cca_metadata_builder is None or not hasattr(
+                self, "cca_kv_cache_group_id"):
+            (self.cca_metadata_builder, self.cca_kv_cache_group_id) = \
+                self._get_metadata_builder_and_group_id_for_layer(
+                    self.cca_layer_names[0])
+        if self.attn_metadata_builder is None:
+            self.attn_metadata_builder = self._get_metadata_builder_for_layer(
+                self.attn_layer_names[0])
+
+        # CCA block table must have >=2 columns (col 0 = AR, col 1 = draft).
+        cca_blk_obj = runner.input_batch.block_table[self.cca_kv_cache_group_id]
+        cca_blk_tensor_full = cca_blk_obj.get_device_tensor(
+            runner.scheduler_config.max_num_seqs)
+        if cca_blk_tensor_full.shape[1] < 2:
+            return
+
+        # FlashAttn group's block table (group 0) is what
+        # CommonAttentionMetadata.block_table_tensor must point at --
+        # the FA metadata builder consumes it for KV lookup. The CCA
+        # builder also reads `common_attn_metadata.block_table_tensor`
+        # to derive its default state_indices_tensor (via
+        # mamba_get_block_table_tensor), and the CCA-specific draft
+        # slot is plumbed separately via
+        # `state_indices_tensor_write_override`.
+        fa_blk_obj = runner.input_batch.block_table[0]
+        fa_blk_tensor_full = fa_blk_obj.get_device_tensor(
+            runner.scheduler_config.max_num_seqs)
+
+        # Enumerate drafter-pass capture descriptors registered with
+        # the dispatcher. These have is_drafter_pass=True; the standard
+        # warmup loop skips them (see CudagraphDispatcher
+        # .get_capture_descs filtering is_drafter_pass=False).
+        from vllm.config import CUDAGraphMode
+        drafter_descs = [
+            d for d in runner.cudagraph_dispatcher.cudagraph_keys[
+                CUDAGraphMode.FULL]
+            if getattr(d, "is_drafter_pass", False)
+        ]
+        if not drafter_descs:
+            return
+
+        # Capture largest first (matches main capture loop's strategy
+        # for the FULL memory pool).
+        drafter_descs = sorted(
+            drafter_descs, key=lambda d: d.num_tokens, reverse=True)
+
+        # Builders inside _warmup_capture_one_drafter_shape inplace-
+        # mutate persistent inference tensors (e.g., FlexAttention's
+        # inverse_block_table buffer). They're safe under inference_mode
+        # which gpu_model_runner.capture_model does NOT wrap us in --
+        # the standard captures got it via the @torch.inference_mode()
+        # decorator on _dummy_run. Match that here.
+        with torch.inference_mode():
+            for desc in drafter_descs:
+                num_input_tokens = desc.num_tokens
+                if num_input_tokens % K_plus_1 != 0:
+                    continue
+                batch_size = num_input_tokens // K_plus_1
+                if batch_size < 1:
+                    continue
+                if batch_size > runner.scheduler_config.max_num_seqs:
+                    continue
+
+                self._warmup_capture_one_drafter_shape(
+                    runner, batch_size, K_plus_1, num_input_tokens, desc,
+                    fa_blk_tensor_full, cca_blk_tensor_full)
+
+    def _warmup_capture_one_drafter_shape(
+        self, runner, batch_size: int, K_plus_1: int,
+        num_input_tokens: int, drafter_desc,
+        fa_blk_tensor_full, cca_blk_tensor_full):
+        """Capture one drafter-pass FULL cudagraph at warmup."""
+        from vllm.forward_context import set_forward_context
+        from vllm.config import CUDAGraphMode
+
+        # Zero-fill input_ids / positions in the runner buffers. The
+        # captured graph reads from these buffer ADDRESSES at replay;
+        # the runtime propose() will copy real drafter inputs into the
+        # same buffers, so zero contents at capture time are fine.
+        runner.input_ids.gpu[:num_input_tokens].fill_(0)
+        runner.positions.gpu[:num_input_tokens].fill_(0)
+
+        n_plus = batch_size + 1
+        gpu_dev = runner.query_start_loc.gpu.device
+
+        # query_start_loc: [0, K+1, 2*(K+1), ..., batch*(K+1)].
+        cu_gpu = torch.arange(
+            0, n_plus * K_plus_1, K_plus_1, dtype=torch.int32,
+            device=gpu_dev)
+        runner.query_start_loc.gpu[:n_plus].copy_(cu_gpu)
+        runner.query_start_loc.gpu[n_plus:].fill_(num_input_tokens)
+        query_start_loc = runner.query_start_loc.gpu[:n_plus]
+        query_start_loc_cpu = torch.arange(
+            0, n_plus * K_plus_1, K_plus_1, dtype=torch.int32)
+
+        # seq_lens: fill with `max_model_len` so the captured FA
+        # kernel's `max_seqlen_k` (which is a Python int read from
+        # attn_metadata.max_seq_len at capture time, NOT a tensor read
+        # live at replay) is large enough to cover any runtime seq
+        # length. The CONTENT of the seq_lens.gpu buffer is read live
+        # from the pinned address each step, so runtime propose() can
+        # overwrite with the actual per-step values; only the int
+        # baked into the kernel call is locked at capture.
+        max_seq_int = self.max_model_len
+        runner.seq_lens.gpu[:batch_size].fill_(max_seq_int)
+        runner.seq_lens.gpu[batch_size:].fill_(0)
+        seq_lens = runner.seq_lens.gpu[:batch_size]
+        seq_lens_cpu = torch.full(
+            (batch_size,), max_seq_int, dtype=torch.int32)
+
+        # FlashAttn slot_mapping: persistent buffer; fill with valid
+        # slot IDs (slot 0..num_input_tokens-1 are fine for dummy).
+        fa_blk_obj = runner.input_batch.block_table[0]
+        fa_blk_obj.slot_mapping.gpu[:num_input_tokens].copy_(
+            torch.arange(num_input_tokens, dtype=torch.int64,
+                         device=gpu_dev))
+        fa_blk_obj.slot_mapping.gpu[num_input_tokens:].fill_(-1)
+        slot_mapping_pinned = fa_blk_obj.slot_mapping.gpu[:num_input_tokens]
+
+        # Build the drafter CommonAttentionMetadata pointing at the
+        # pinned buffers above. block_table_tensor is the FA group's
+        # block table (what attn_metadata_builder.build_for_drafting
+        # and FA kernel consume); CCA's draft slot is plumbed
+        # separately via the override below.
+        fa_block_table_tensor = fa_blk_tensor_full[:batch_size]
+        draft_common_attn_metadata = CommonAttentionMetadata(
+            query_start_loc=query_start_loc,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens=seq_lens,
+            _seq_lens_cpu=seq_lens_cpu,
+            _num_computed_tokens_cpu=seq_lens_cpu,
+            num_reqs=batch_size,
+            num_actual_tokens=num_input_tokens,
+            max_query_len=K_plus_1,
+            max_seq_len=max_seq_int,
+            block_table_tensor=fa_block_table_tensor,
+            slot_mapping=slot_mapping_pinned,
+            causal=False,
+        )
+
+        # CCA-side drafter overrides: read=AR (col 0 of CCA's block
+        # table), write=draft (col 1), cca_drafter_pass=True for the
+        # skip_writes path.
+        cca_block_table_tensor = cca_blk_tensor_full[:batch_size]
+        ar_slots = cca_block_table_tensor[:, 0]
+        draft_slots = cca_block_table_tensor[:, 1]
+        setattr(draft_common_attn_metadata,
+                "state_indices_tensor_override", ar_slots)
+        setattr(draft_common_attn_metadata,
+                "state_indices_tensor_write_override", draft_slots)
+        setattr(draft_common_attn_metadata, "cca_drafter_pass", True)
+
+        # Build per-layer attention metadata: FA layers via the
+        # standard build_for_drafting, CCA layers via the CCA builder
+        # (which honors the drafter overrides). (We're called from
+        # gpu_model_runner.capture_model which wraps us in
+        # inference_mode at the top.)
+        attn_metadata = self.attn_metadata_builder.build_for_drafting(
+            common_attn_metadata=draft_common_attn_metadata,
+            draft_index=0,
+        )
+        per_layer_attn_metadata = {
+            layer_name: attn_metadata
+            for layer_name in self.attn_layer_names
+        }
+        cca_attn_metadata = self.cca_metadata_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=draft_common_attn_metadata,
+            fast_build=True,
+        )
+        for layer_name in self.cca_layer_names:
+            per_layer_attn_metadata[layer_name] = cca_attn_metadata
+
+        # Capture: call the wrapped model under the drafter
+        # BatchDescriptor's forward context. The wrapper finds no
+        # entry for this descriptor and captures on the current
+        # (non-default) stream — we're inside capture_model's
+        # graph_capture(device=) context, which already set the stream.
+        logger.info(
+            "TiDAR Tier 3: warmup-capturing drafter graph at num_tokens=%d "
+            "(batch_size=%d, K+1=%d)",
+            num_input_tokens, batch_size, K_plus_1)
+        with set_forward_context(
+                per_layer_attn_metadata,
+                self.vllm_config,
+                num_tokens=num_input_tokens,
+                cudagraph_runtime_mode=CUDAGraphMode.FULL,
+                batch_descriptor=drafter_desc):
+            _ = self.model(
+                input_ids=runner.input_ids.gpu[:num_input_tokens],
+                positions=runner.positions.gpu[:num_input_tokens],
+                inputs_embeds=None,
+            )
+        self._drafter_captured_sizes.add(num_input_tokens)
+
     def _resolve_mask_token_id(self) -> Optional[int]:
         hf_config = self.vllm_config.model_config.hf_config
         candidate_attrs = (

@@ -4697,6 +4697,21 @@ class GPUModelRunner(
             self.model = CUDAGraphWrapper(
                 self.model, self.vllm_config, runtime_mode=CUDAGraphMode.FULL
             )
+            # TiDAR Tier 3: rebind drafter.model to the FULL-wrapped
+            # model so drafter forwards go through the wrapper and
+            # dispatch into the is_drafter_pass=True CUDAGraphEntry.
+            # The drafter graph itself is captured at warmup by
+            # `drafter.warmup_capture_drafter_graphs` (called from
+            # capture_model after the standard captures, inside the
+            # graph_capture(device=) context). Without the rebind,
+            # drafter.model stays as the unwrapped target_model and
+            # drafter runs eager (the TF FULL perf ceiling).
+            if (
+                hasattr(self, "drafter")
+                and getattr(self, "drafter", None) is not None
+                and hasattr(self.drafter, "model")
+            ):
+                self.drafter.model = self.model
         elif self.parallel_config.use_ubatching:
             if cudagraph_mode.has_full_cudagraphs():
                 self.model = UBatchWrapper(
@@ -5643,6 +5658,27 @@ class GPUModelRunner(
                     batch_descriptors=batch_descs,
                     cudagraph_runtime_mode=runtime_mode,
                 )
+
+            # TiDAR Tier 3: after the standard captures finish, run the
+            # drafter-graph warmup. The proposer constructs drafter
+            # metadata in scope (state_indices_tensor_write_override =
+            # draft slot, cca_drafter_pass=True) and calls the wrapped
+            # model with a BatchDescriptor(is_drafter_pass=True). The
+            # CUDAGraphWrapper finds no entry for that descriptor and
+            # captures the drafter graph here -- inside the
+            # graph_capture(device=) context so the non-default-stream
+            # requirement from torch 2.9's torch.cuda.graph() is met
+            # without needing a separate per-call bracket later. The
+            # dispatcher's get_capture_descs intentionally filters
+            # is_drafter_pass=True out of the standard loop because
+            # _dummy_run feeds VERIFIER metadata, which would bake the
+            # wrong write-side pointer into the drafter entry.
+            if (
+                hasattr(self, "drafter")
+                and getattr(self.drafter, "warmup_capture_drafter_graphs",
+                            None) is not None
+            ):
+                self.drafter.warmup_capture_drafter_graphs()
 
             torch.cuda.synchronize()
             end_free_gpu_memory = torch.cuda.mem_get_info()[0]

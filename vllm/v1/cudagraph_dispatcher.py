@@ -217,23 +217,41 @@ class CudagraphDispatcher:
                         bs, True, num_active_loras > 0, num_active_loras
                     ),
                 )
-                # TiDAR TF: register a separate FULL key per shape with
-                # is_drafter_pass=True. The drafter forward (path 2:
-                # read=AR, write=draft scratch) needs its own captured
-                # graph because the captured CCA gather/scatter operand
-                # pointers are baked at warmup. Sharing the verifier
-                # graph (write=AR) would corrupt the post-acceptance
-                # state. The drafter graph is captured lazily on first
-                # propose() call -- see TiDARProposer.propose's Tier 3
-                # logic in vllm/v1/spec_decode/tidar.py.
-                # NOTE: v0.16 does NOT rebind drafter.model to the
-                # CUDAGraphWrapper-wrapped model (v0.15 did:
-                # `self.drafter.model = self.model` after wrapping).
-                # In v0.16 `drafter.model = target_model` (unwrapped) in
-                # TiDARProposer.load_model, so drafter.forward bypasses
-                # the wrapper entirely and runs eager. There is no
-                # captured "drafter graph" to dispatch to, so we do NOT
-                # register an is_drafter_pass=True key here.
+                # TiDAR TF Tier 3: register a parallel FULL key per
+                # shape with is_drafter_pass=True. The drafter forward
+                # (path 2: read=AR slot, write=draft scratch slot)
+                # needs its OWN captured graph because the captured
+                # kernels bake CCA gather/scatter operand pointers at
+                # warmup -- the verifier graph baked write=AR, and
+                # sharing it would have the drafter write to AR and
+                # corrupt the post-acceptance state.
+                # Capture is performed AT WARMUP by
+                # `TiDARProposer.warmup_capture_drafter_graphs` (called
+                # from runner.capture_model after the standard captures
+                # complete, inside the same graph_capture(device=)
+                # context). The dispatcher's `get_capture_descs` filters
+                # is_drafter_pass=True out of the standard capture loop
+                # because that loop's _dummy_run feeds VERIFIER metadata
+                # (no override / cca_drafter_pass=False), which would
+                # bake the wrong write-side pointer into the drafter
+                # entry. The TiDAR warmup hook sets up the correct
+                # drafter metadata before calling the wrapped model.
+                speculative_config = self.vllm_config.speculative_config
+                if (
+                    speculative_config is not None
+                    and getattr(speculative_config, "method", None)
+                        == "tidar"
+                ):
+                    self.add_cudagraph_key(
+                        CUDAGraphMode.FULL,
+                        self._create_padded_batch_descriptor(
+                            bs,
+                            True,
+                            num_active_loras > 0,
+                            num_active_loras,
+                            is_drafter_pass=True,
+                        ),
+                    )
 
         self.keys_initialized = True
 
@@ -331,6 +349,16 @@ class CudagraphDispatcher:
         # Return in order: PIECEWISE first, then FULL
         for mode in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]:
             descs = list(self.cudagraph_keys[mode])
+            # TiDAR Tier 3: exclude is_drafter_pass=True keys from the
+            # standard warmup loop. They need DRAFTER-specific CCA
+            # metadata (state_indices_tensor_write_override = draft
+            # slots, cca_drafter_pass=True) in scope at capture time,
+            # which only `TiDARProposer.warmup_capture_drafter_graphs`
+            # sets up. capture_model() calls that hook after the
+            # standard loop, still inside the graph_capture(device=)
+            # context.
+            descs = [d for d in descs
+                     if not getattr(d, "is_drafter_pass", False)]
             if descs:
                 # Sort by num_tokens descending (largest first)
                 descs.sort(key=lambda d: d.num_tokens, reverse=True)
