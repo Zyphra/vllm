@@ -825,7 +825,24 @@ class FlexAttentionMetadata:
         self.mask_mod = self.get_mask_mod()
         self.transformed_score_mod = self.get_transformed_score_mod()
 
-        if self.direct_build and self.causal:
+        # Route the non-causal TF drafter through the direct path
+        # under FULL cudagraph so kv_indices / kv_num_blocks come from
+        # the builder's PERSISTENT buffers (stable data_ptr across
+        # build() calls). The create_block_mask_compiled path
+        # (build_block_mask) allocates fresh tensors per call, so the
+        # captured graph baked the warmup-time addresses and at replay
+        # reads from freed memory -> degenerate drafts (0% accept).
+        # The direct path's over-estimation is fine here: mask_mod
+        # handles per-position validity.
+        # Exclude SF (structured mask_mod) and ENCODER_ONLY (inline
+        # K/V) -- both need the create_block_mask path; SF's also hits
+        # a default-stream crash if forced through direct under capture.
+        _route_direct_non_causal = (
+            self.use_full_cuda_graph
+            and self.total_cache_tokens > 0  # paged decoder
+            and self.tidar_single_forward_proposal_acc_levels is None
+        )
+        if self.direct_build and (self.causal or _route_direct_non_causal):
             self.block_mask = self._build_block_mask_direct()
         else:
             self.block_mask = self.build_block_mask()
