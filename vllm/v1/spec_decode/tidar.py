@@ -726,12 +726,20 @@ class TiDARProposer(EagleProposer):
             "TiDAR Tier 3: warmup-capturing drafter graph at num_tokens=%d "
             "(batch_size=%d, K+1=%d)",
             num_input_tokens, batch_size, K_plus_1)
+        # See propose() comment: pass slot_mapping dict so that
+        # FA's unified_kv_cache_update writes drafter K/V to scratch
+        # slots during warmup capture.
+        _drafter_slot_map_w = {
+            _ln: slot_mapping_pinned
+            for _ln in self.attn_layer_names
+        }
         with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=CUDAGraphMode.FULL,
-                batch_descriptor=drafter_desc):
+                batch_descriptor=drafter_desc,
+                slot_mapping=_drafter_slot_map_w):
             _ = self.model(
                 input_ids=runner.input_ids.gpu[:num_input_tokens],
                 positions=runner.positions.gpu[:num_input_tokens],
@@ -1132,12 +1140,28 @@ class TiDARProposer(EagleProposer):
                           not in self._drafter_captured_sizes)
         if _needs_capture:
             set_cudagraph_capturing_enabled(True)
+        # v0.16 split unified_kv_cache_update off from FA's forward
+        # (FlashAttentionBackend.forward_includes_kv_cache_update=False).
+        # That op reads slot_mapping from forward_context.slot_mapping
+        # (a {layer_name: tensor} dict). Without this dict the op
+        # silently no-ops, the drafter's K/V never lands in the cache,
+        # and FA reads stale slots -> 0% accept. FLEX backend has
+        # forward_includes_kv_cache_update=True (default) so it
+        # ignores this dict -- safe to populate unconditionally.
+        # CCA layers don't go through unified_kv_cache_update (CCA
+        # manages its own conv_states/prev_hs writes inside its
+        # forward), so we only need entries for the FA attn layers.
+        _drafter_slot_map = {
+            _ln: draft_common_attn_metadata.slot_mapping
+            for _ln in self.attn_layer_names
+        }
         try:
             with set_forward_context(per_layer_attn_metadata,
                                      self.vllm_config,
                                      num_tokens=num_input_tokens,
                                      cudagraph_runtime_mode=_cg_mode,
-                                     batch_descriptor=_draft_desc):
+                                     batch_descriptor=_draft_desc,
+                                     slot_mapping=_drafter_slot_map):
                 model_output = self.model(
                     input_ids=runner.input_ids.gpu[:num_input_tokens],
                     positions=runner.positions.gpu[:num_input_tokens],
