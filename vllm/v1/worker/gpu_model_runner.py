@@ -3100,12 +3100,27 @@ class GPUModelRunner(
         _ar_only = _os_b5.environ.get("TIDAR_AR_ONLY")
         _drafts_only = _os_b5.environ.get("TIDAR_DRAFTS_ONLY")
         _mix_v1 = _os_b5.environ.get("TIDAR_MIX_DRAFT_TARGET_V1")
+        # Cache the runtime mix-weight file read. Without caching this
+        # was hitting open()/read()/close() syscalls every spec-decode
+        # step (~50 us each) for a file that almost never exists in
+        # benchmarks. The "always check disk so a user can tune mid-run"
+        # design is preserved by re-reading every N steps; for benches
+        # the file's absence makes the syscall a no-op cost path.
         _v1_w_runtime = None
-        try:
-            with open("/tmp/tidar_mix_w") as _fh:
-                _v1_w_runtime = float(_fh.read().strip())
-        except Exception:
-            pass
+        if not hasattr(self, "_tidar_mix_w_disabled"):
+            self._tidar_mix_w_disabled = False
+            self._tidar_mix_w_check_count = 0
+        if not self._tidar_mix_w_disabled:
+            try:
+                with open("/tmp/tidar_mix_w") as _fh:
+                    _v1_w_runtime = float(_fh.read().strip())
+            except FileNotFoundError:
+                # After 100 consecutive misses, stop polling.
+                self._tidar_mix_w_check_count += 1
+                if self._tidar_mix_w_check_count >= 100:
+                    self._tidar_mix_w_disabled = True
+            except Exception:
+                pass
         if _v1_w_runtime is not None:
             _mix_v1 = "1" if _v1_w_runtime > 0 else None
 
