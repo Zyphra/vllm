@@ -122,6 +122,26 @@ class TiDARProposer(EagleProposer):
         _tf_explicit = os.environ.get(
             "VLLM_TIDAR_TWO_FORWARD", "0") == "1"
         self.single_forward_mode: bool = not _tf_explicit
+
+        # SF mode requires the SF Triton kernel which lives in
+        # flex_attention.py. With FA backend, the SF path falls through
+        # to standard FA forward (no structured mask), collapsing
+        # mean accept to ~1.05 (drafts unanimously rejected). Warn
+        # loudly at init so users don't silently see broken SF perf.
+        # TF mode is unaffected (FA is the recommended TF backend).
+        if self.single_forward_mode:
+            _attn_backend = os.environ.get(
+                "VLLM_ATTENTION_BACKEND", "").upper()
+            if _attn_backend == "FLASH_ATTN":
+                logger.warning(
+                    "TiDAR SF mode is running with FLASH_ATTN backend. "
+                    "The SF kernel (verify-causal + proposals-bidirectional "
+                    "structured mask) lives in flex_attention.py only; "
+                    "FA backend falls through to standard FA forward and "
+                    "produces broken drafts (mean accept ~1.05). "
+                    "Set VLLM_ATTENTION_BACKEND=FLEX_ATTENTION for SF, "
+                    "or VLLM_TIDAR_TWO_FORWARD=1 for TF mode (which is "
+                    "FA-recommended).")
         sf_levels_env = os.environ.get("VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
         if sf_levels_env:
             self.proposal_acc_levels: tuple[int, ...] = (
