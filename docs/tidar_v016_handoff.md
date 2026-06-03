@@ -1,10 +1,10 @@
 # TiDAR vLLM v0.16 Port — Handoff
 
-**Branch:** `jinzhao/tidar_v016` @ `55e08f7cb`
+**Branch:** `jinzhao/tidar_v016` @ `771a701d6`
 **Repo:** `git@github.com:Zyphra/Zvllm.git`
 **Node tested:** vp-dgx-2 (147.68.0.2)
 **Env:** `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
-**Date:** 2026-06-02
+**Date:** 2026-06-03
 
 ## What works
 
@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **158 tok/s b=1, accept 5.71** on smoediffusion iter_0012000, AIME, K=16 (FA backend). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. The earlier 0% accept regression was a SF+FA backend mismatch (FA being used for SF which needs FLEX) — the captured TF FA path itself works. Captured accept is on par with (actually slightly above) fresh n=3 EAGER (5.14); the 7.29 figure cited in earlier docs was a single outlier window from an n=1 bench. See "TF captured drafter accept: no real drift" below. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **~170-190 tok/s b=1, accept ~5.7** on smoediffusion iter_0012000, AIME, K=16 (FA backend) after 5e4b95df0 (lm_head SM90 fix) + 771a701d6 (MOE_OP default-on). Run-to-run variance is ~15% (158-190 across single runs). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. v0.15 reference for the same bench config is ~266 tok/s (consistent across runs, ±4% variance) — v0.16 currently at ~64% of v0.15. See "v0.16 vs v0.15 perf gap" below. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -223,6 +223,75 @@ Set `kernel_config={"enable_flashinfer_autotune": False}` in the LLM config to r
 the 8%. No accept change, just kernel selection at small M. Could be wired as a default
 for TiDAR mode in a follow-up; for now it's a one-line knob in the user config.
 
+## v0.16 vs v0.15 perf gap (TF FA b=1, K=16)
+
+Apples-to-apples bench (n=3 AIME prompts, max_tokens=1500, AIME25 thinking-off,
+T_AR=0):
+
+| version | mean tok/s | range | notes |
+|---|---:|---|---|
+| v0.15 `jinzhao/tidar` | 266 | 261-272 | Reference, low variance |
+| v0.16 `jinzhao/tidar_v016` (this branch, head) | ~170-190 | 158-190 | ~64% of v0.15 |
+| v0.16 pre-perf-hunt baseline | 158 | ±5% | before 5e4b95df0 |
+
+### Shipped wins (this hunt)
+
+| commit | win | gain |
+|---|---|---:|
+| `5e4b95df0` | lm_head: bf16xbf16->fp32 via `out_dtype` (SM90 Tensor Cores) instead of fp32xfp32 (SM80 GEMM) | +9-15% |
+| `771a701d6` | `VLLM_TIDAR_SMOE_MOE_OP=1` default-on (opaque MoE custom op hides cat() from inductor) | +5-10% |
+
+### Methodology + caveats
+
+- Per-step phase timing (instrumented via a `_TidarTime` ContextManager added to
+  `gpu_model_runner.py`) showed `bookkeep` phase = ~14ms/step (76% of step time)
+  on TF FA b=1 captured. Inside `bookkeep`, `RejectionSampler.parse_output` does
+  a `.cpu().numpy()` sync that waits ~12-14ms for queued GPU work (verify forward
+  + sample). Similar 14ms wait inside `_update_states_after_model_execute` which
+  fires just before bookkeep.
+- nsys identified the two top GPU kernels pre-fix as `sm80_xmma_gemm_f32f32_f32f32_f32`
+  (fp32xfp32 matmul) eating ~65% of total GPU kernel time on TF FA b=1 — the fp32
+  lm_head path. After 5e4b95df0, the same logical workload runs as `nvjet_tss_512x16_64x3`
+  / `_512x24_64x3` (Hopper cublasLt SM90 kernels), 3.2x faster on this workload.
+- Run-to-run variance is ~15%, so any sub-10% perf change can't be confirmed in a single
+  run; need 3-5 run averaging or longer benches.
+
+### Ruled out (each tried, no real gain)
+
+- `VLLM_TIDAR_NO_COPY_INPUTS=1` (skipping the per-step cudagraph input copy):
+  no improvement, and unsafe historically (TF crash without it).
+- Async pinned non-blocking copy in `_update_states_after_model_execute`: 156-185
+  tok/s range; mean equal to baseline. The next-step reader needs sync, so
+  going async without a CUDA event makes the next read stale and the model
+  generates different outputs (sometimes longer, sometimes shorter).
+- Skipping `_update_states_after_model_execute` entirely when no GDN attention
+  backend / mamba-align: mean = baseline mean (168.7 vs 168.7 over 3 runs each).
+  The .cpu() sync was "absorbed" into the next .cpu() (parse_output) since GPU
+  work has to drain somewhere.
+- `VLLM_TIDAR_SMOE_MOE_OP=1` (pre-lm_head-fix): -5% regression at b=1 — the
+  cat() avoidance was negated by larger custom-op block overhead while the fp32
+  lm_head was the hot path. After lm_head SM90 fix, the moe_op now stacks
+  cleanly.
+
+### Where the remaining 36% gap likely sits
+
+Sum of small structural differences vs v0.15:
+1. `unified_kv_cache_update` is a separate splitting_op kernel call in v0.16 (40
+   layers × 2 forwards × read+write index kernels = ~160 per step). v0.15 had
+   this inline in FA's forward. nsys shows 26ms/200 tokens on these.
+2. v0.16's `RejectionSampler.parse_output` + `_update_states_after_model_execute`
+   both do `.cpu().numpy()` syncs on `sampled_token_ids`. v0.15 has only the
+   parse_output one (no equivalent of `_update_states_after_model_execute`'s
+   pre-bookkeep sync). Per-step impact unclear given the variance.
+3. v0.16 captures 6 cudagraph sizes [1,2,4,8,17,306] vs v0.15's [17]. Dispatcher
+   lookup per step is larger.
+4. `cudagraph_copy_inputs=True` is forced for TiDAR (v0.15 had False). Per-step
+   memcpy of inputs into captured buffers.
+
+Closing the rest would require structural changes — enabling async scheduling
+for TiDAR, re-fusing kv_cache_update into FA, or backporting v0.15's tighter
+per-step path. None are session-scoped.
+
 ## What's slow
 
 SF FULL captured at b=1/8/16:
@@ -336,6 +405,11 @@ Likely candidates: block-table state from the finished request isn't fully relea
 | `96cc939c7` | perf+accept: `VLLM_TIDAR_FA_NO_SPLITS=1` forces FA `num_splits=1` (recovers +10% accept on TF captured) |
 | `5a51e6ea4` | fix: gate `VLLM_TIDAR_FA_NO_SPLITS` on TF mode only (SF combo was broken) |
 | `55e08f7cb` | warn: log warning when SF mode runs with FA backend (FA + SF is broken; force FLEX) |
+| `4414adfd8` | chore: commit bench_tidar.py + profile_sf.py |
+| `eb694969c` | docs: handoff update with v0.15 baseline + drafter-drift correction |
+| `f87075885` | docs: correct phantom 22% drafter drift (was n=1 outlier window) |
+| `5e4b95df0` | perf: lm_head SM90 Tensor Cores via out_dtype (3.2x lm_head GEMMs, +9-15% TF FA b=1) |
+| `771a701d6` | perf: default `VLLM_TIDAR_SMOE_MOE_OP=1` (stacks with lm_head SM90 for +5-10% more) |
 
 ## v0.15 vs v0.16 — things to know if you keep working on this
 
