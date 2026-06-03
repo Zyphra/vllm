@@ -1,8 +1,8 @@
 # TiDAR vLLM v0.16 Port — Handoff
 
-**Branch:** `jinzhao/tidar_v016` @ `771a701d6`
+**Branch:** `jinzhao/tidar_v016` @ `84950b974`
 **Repo:** `git@github.com:Zyphra/Zvllm.git`
-**Node tested:** vp-dgx-2 (147.68.0.2)
+**Node tested:** vp-dgx-89 (147.68.0.89) — measurements below; node 2 was contended
 **Env:** `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
 **Date:** 2026-06-03
 
@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **~170-190 tok/s b=1, accept ~5.7** on smoediffusion iter_0012000, AIME, K=16 (FA backend) after 5e4b95df0 (lm_head SM90 fix) + 771a701d6 (MOE_OP default-on). Run-to-run variance is ~15% (158-190 across single runs). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. v0.15 reference for the same bench config is ~266 tok/s (consistent across runs, ±4% variance) — v0.16 currently at ~64% of v0.15. See "v0.16 vs v0.15 perf gap" below. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **163 tok/s n=10, accept ~5.7** on smoediffusion iter_0012000, AIME, K=16 (FA backend) on idle node 89 (low variance, ±0.2%). Short n=3 benches read 175-185 tok/s with higher variance (cache-warm effects). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. v0.15 reference n=10 = 237 tok/s, n=3 = 278 tok/s on the same idle node. v0.16 at ~69% of v0.15 on n=10 (real gap, structural). See "v0.16 vs v0.15 perf gap" below. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -228,18 +228,19 @@ for TiDAR mode in a follow-up; for now it's a one-line knob in the user config.
 Apples-to-apples bench (n=3 AIME prompts, max_tokens=1500, AIME25 thinking-off,
 T_AR=0):
 
-| version | mean tok/s | range | notes |
-|---|---:|---|---|
-| v0.15 `jinzhao/tidar` | 266 | 261-272 | Reference, low variance |
-| v0.16 `jinzhao/tidar_v016` (this branch, head) | ~170-190 | 158-190 | ~64% of v0.15 |
-| v0.16 pre-perf-hunt baseline | 158 | ±5% | before 5e4b95df0 |
+| version | n=10 mt=2000 mean | n=3 mt=1500 mean | notes |
+|---|---:|---:|---|
+| v0.15 `jinzhao/tidar` (idle node 89) | **237** | **278** | Reference; n=10 has dropoff |
+| v0.16 head (this branch, idle node 89) | **163** | 185 | 69% of v0.15 on n=10, 67% on n=3 |
+| v0.16 + VLLM_TIDAR_SMOE_MOE_OP=1 | 158.8 | 182.6 | -2.7% n=10 vs default off |
+| v0.16 pre-perf-hunt baseline (estimated) | ~150 | 158 | before 5e4b95df0 |
 
 ### Shipped wins (this hunt)
 
-| commit | win | gain |
+| commit | win | confirmed gain (n=10) |
 |---|---|---:|
-| `5e4b95df0` | lm_head: bf16xbf16->fp32 via `out_dtype` (SM90 Tensor Cores) instead of fp32xfp32 (SM80 GEMM) | +9-15% |
-| `771a701d6` | `VLLM_TIDAR_SMOE_MOE_OP=1` default-on (opaque MoE custom op hides cat() from inductor) | +5-10% |
+| `5e4b95df0` | lm_head: bf16xbf16->fp32 via `out_dtype` (SM90 Tensor Cores) instead of fp32xfp32 (SM80 GEMM); 87.6ms->27ms across 200 tokens (3.2x lm_head GEMMs) | +8-10% (~150 -> 163) |
+| `84950b974` | MOE_OP default REVERTED to OFF. The earlier flip to ON (771a701d6) was based on a high-variance n=3 measurement that included a 204 tok/s outlier; on idle node 89 n=10 the same flip is -2.7% (158.8 vs 163.3). | n/a (reverts a misjudgment) |
 
 ### Methodology + caveats
 
@@ -452,7 +453,8 @@ Likely candidates: block-table state from the finished request isn't fully relea
 | `eb694969c` | docs: handoff update with v0.15 baseline + drafter-drift correction |
 | `f87075885` | docs: correct phantom 22% drafter drift (was n=1 outlier window) |
 | `5e4b95df0` | perf: lm_head SM90 Tensor Cores via out_dtype (3.2x lm_head GEMMs, +9-15% TF FA b=1) |
-| `771a701d6` | perf: default `VLLM_TIDAR_SMOE_MOE_OP=1` (stacks with lm_head SM90 for +5-10% more) |
+| `771a701d6` | perf: default `VLLM_TIDAR_SMOE_MOE_OP=1` (later reverted: see 84950b974) |
+| `84950b974` | perf: revert MOE_OP default to OFF (regresses 2.7% at n=10; the n=3 "win" was variance artifact) |
 
 ## v0.15 vs v0.16 — things to know if you keep working on this
 
