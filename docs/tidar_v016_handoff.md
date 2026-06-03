@@ -1,10 +1,10 @@
 # TiDAR vLLM v0.16 Port — Handoff
 
-**Branch:** `jinzhao/tidar_v016` @ `9da7f7d07`
+**Branch:** `jinzhao/tidar_v016` @ `55e08f7cb`
 **Repo:** `git@github.com:Zyphra/Zvllm.git`
-**Node tested:** vp-dgx-51 (147.68.0.51)
+**Node tested:** vp-dgx-2 (147.68.0.2)
 **Env:** `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
-**Date:** 2026-05-31
+**Date:** 2026-06-02
 
 ## What works
 
@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **27 tok/s b=1** (eager-drafter ceiling lifted by `0001ddc4d` warmup-time drafter capture). Requires `VLLM_TIDAR_ROUTER_PAD=1`. Note: there is a SEPARATE pre-existing v0.16 TF spec-decoding regression where accept rate is 0% at b=1 on smoediffusion iter_0012000 (also reproducible with patches reverted via TF EAGER). The 27 tok/s is the captured step-rate at 0% accept; once the accept regression is fixed the captured drafter will compound the speedup. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **158 tok/s b=1, accept 5.71** on smoediffusion iter_0012000, AIME, K=16 (FA backend). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. The earlier 0% accept regression was a SF+FA backend mismatch (FA being used for SF which needs FLEX) — the captured TF FA path itself works. Residual ~22% accept gap vs TF EAGER (7.29) is intrinsic to the captured drafter's cuBLAS-dispatch context; see "TF captured drafter accept drift" below. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -66,7 +66,9 @@ out = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=600))
 
 ```bash
 export VLLM_TIDAR_TWO_FORWARD=1
-export VLLM_TIDAR_ROUTER_PAD=1   # required for TF FULL captured
+export VLLM_TIDAR_ROUTER_PAD=1   # required (router padding to dodge buggy cutlass align1 kernel)
+export VLLM_TIDAR_FA_NO_SPLITS=1 # required for max accept (forces FA num_splits=1)
+export VLLM_ATTENTION_BACKEND=FLASH_ATTN   # FA, not FLEX — FLEX is intrinsically bad for TF
 ```
 
 ```python
@@ -74,15 +76,14 @@ llm = LLM(
     model=ckpt, ..., enforce_eager=False,
     speculative_config={...},
     compilation_config={"cudagraph_mode": "FULL_DECODE_ONLY"},
+    kernel_config={"enable_flashinfer_autotune": False},   # +8% tok/s (146 -> 158); see "FlashInfer autotune" below
 )
 ```
 
-23.5 tok/s at b=1 on iter_0012000 (steady state, after a warmup call).
-Barely faster than TF eager — drafter still runs eager; see "Drafter-
-capture limitation" below for what's needed to make TF FULL genuinely
-fast. The padded-router workaround is dormant without
-`VLLM_TIDAR_ROUTER_PAD=1`, so SF (which doesn't need the fix) stays on
-the baseline path by default.
+**158 tok/s @ accept 5.71 at b=1** on iter_0012000 (n=3, AIME). 4.4x over v0.16 FLEX baseline (~36 tok/s).
+The padded-router workaround is dormant without `VLLM_TIDAR_ROUTER_PAD=1`, so SF
+(which doesn't need the fix) stays on the baseline path by default. `NO_SPLITS=1` is
+TF-only — gated on `VLLM_TIDAR_TWO_FORWARD=1`, doesn't affect SF.
 
 ### Run TF eager (fallback)
 
@@ -98,7 +99,17 @@ llm = LLM(
 
 ### Benchmark + profile
 
-`scripts/bench_tidar.py` and `scripts/profile_sf.py` (uncommitted, in tree) drive the SF perf numbers above and the nsys profile that pinpoints the SMoERouter hotspot.
+`scripts/bench_tidar.py` (committed) drives all SF/TF accept + perf numbers in this doc. Env knobs:
+- `BENCH_K/B/N/MT` — speculative K, batch, num prompts, max output tokens
+- `BENCH_MODE` — `ar` / `tf` / `sf`
+- `BENCH_EAGER` — 1 to disable compile + cudagraph
+- `BENCH_CG` — `NONE` / `PIECEWISE` / `FULL_DECODE_ONLY`
+- `BENCH_GPU_MEM`, `BENCH_MML`, `BENCH_MNBT` — memory util, max_model_len, max_num_batched_tokens
+- `BENCH_FI_AUTOTUNE_OFF=1` — disable FlashInfer autotune (+8% tok/s for TF, no accept change)
+- `BENCH_O=0` — force optimization_level=O0 (diagnostic)
+- `BENCH_COMPILE_MODE`, `BENCH_COMBO_OFF` — compile-mode diagnostic knobs
+
+`scripts/profile_sf.py` (committed) — one-prompt torch.profiler capture of SF FULL captured for per-component breakdown.
 
 ## What's broken
 
@@ -165,6 +176,65 @@ The router-pad workaround introduced in `43c0fa08e` (project against a padded `D
 - Without `VLLM_TIDAR_ROUTER_PAD=1`: process segfaults at first replay of the captured subgraph (post warmup, in the first user `llm.generate()` call). C-stack: `cudaGraphLaunch → at::cuda::CUDAGraph::replay`.
 
 PIECEWISE captures 6 subgraphs (vs FULL's 6 too in this config) and reuses them across drafter + verifier passes, so the fix lands once and benefits both forwards.
+
+### TF captured drafter accept drift (~22% gap vs TF EAGER) — characterized, not fixed
+
+**Symptom.** On smoediffusion iter_0012000, AIME, K=16, b=1, n=3:
+
+| backend | mode | accept | tok/s |
+|---|---|---:|---:|
+| TF FA | EAGER | **7.29** | 31.6 |
+| TF FA | PIECEWISE | 5.33 | 38.2 |
+| TF FA | COMPILE-only (cg=NONE) | 5.49 | 25.8 |
+| TF FA | FULL+NO_SPLITS=1 | **5.71** | 146.5 |
+| TF FA | FULL+NO_SPLITS=1 +FI_autotune=off | 5.69 | 158.0 |
+| TF FA | FULL default (splits=32) | 5.10 | 158.6 |
+| SF FLEX | EAGER | 7.01 | 41.4 |
+| SF FLEX | FULL_DECODE_ONLY | 7.56 | 168.2 |
+
+TF FA captured loses ~22% mean accept length vs TF FA EAGER. SF FLEX captured is healthy
+(within noise of its eager). TF FLEX is intrinsically bad (5.30 eager) — use FA for TF, FLEX for SF.
+
+**Diagnosis.** The captured verify-forward output matches eager exactly (same `n_out` per prompt:
+605/957/650 across both). The drift is **drafter-side only** — captured drafter argmax flips on
+borderline tokens, lowering accept rate but the verify pass still picks the right tokens.
+
+Ruled out as drift sources (each tested A/B at n=3):
+- inductor codegen (mode=NONE shows same drift)
+- dynamo tracing (DYNAMO_TRACE_ONCE shows same)
+- `combo_kernels=True` inductor fusion
+- `flashinfer_autotune` (no accept impact, but +8% tok/s when disabled — see below)
+- DeepGEMM JIT warmup (`VLLM_USE_DEEP_GEMM=0`)
+- optimization_level pass_config (O0's all-False fuses)
+- FA `max_num_splits=32` (NO_SPLITS=1 partially fixes: 5.10 -> 5.71, +12%)
+
+Likely root cause: cuBLAS algorithm selection inside the cudagraph mempool's
+captured kernel context differs from the eager-context selection, even with all
+other knobs matched. This shifts bf16 numerics at borderline tokens and flips
+drafter argmax. The same mechanism doesn't trigger in SF because SF has no
+separate drafter forward; verify and "drafter" are the same single pass.
+
+**Practical fix paths (neither shipped):**
+- **(A) Force drafter eager, keep verify captured** — recovers accept but drafter at K+1=17
+  tokens eager is ~5x slower; net tok/s loss outweighs the ~28% accept gain. Not worth it.
+- **(B) Custom drafter kernel that bypasses cudagraph mempool's cuBLAS dispatch** —
+  major engineering, would also need to land in upstream vLLM. Not pursued.
+
+**Current ceiling: 5.71 accept @ 158 tok/s with `VLLM_TIDAR_FA_NO_SPLITS=1`** is the
+practical operating point for TF FA captured. Document as v0.16-specific intrinsic
+gap; revisit if upstream vLLM changes cudagraph cuBLAS dispatch.
+
+### FlashInfer autotune perf gotcha (TF, +8% tok/s when disabled)
+
+`kernel_config.enable_flashinfer_autotune=True` is the default for `optimization_level >= O1`
+(i.e., any non-`enforce_eager` run). It runs `_dummy_run(max_num_batched_tokens, is_profile=True)`
+to benchmark FlashInfer op implementations and cache the best per-shape. The
+autotune is at MNBT=2048-4096; the runtime drafter+verify forwards are 17-34 tokens.
+The selected ops are mis-sized — no accept impact, but ~8% throughput on the table.
+
+Set `kernel_config={"enable_flashinfer_autotune": False}` in the LLM config to recover
+the 8%. No accept change, just kernel selection at small M. Could be wired as a default
+for TiDAR mode in a follow-up; for now it's a one-line knob in the user config.
 
 ## What's slow
 
@@ -266,6 +336,19 @@ Likely candidates: block-table state from the finished request isn't fully relea
 | `3026d9151` | force CCA vectorized path under ALL TiDAR (not just FULL) — fixes TF eager drift |
 | `878231bc8` | port Block 5 mix-logit / drafts-only / ar-only to v0.16 |
 | `9da7f7d07` | `is_drafter_pass` scaffolding + force `cudagraph_copy_inputs=True` |
+| `43c0fa08e` | TF FULL/PIECEWISE captured FIX: router-pad workaround (`VLLM_TIDAR_ROUTER_PAD=1`) dodges buggy cutlass align1 OOB |
+| `b03144b13` | perf: `VLLM_TIDAR_SMOE_MOE_OP=1` opaque MoE custom op (+45% TF dense, +54% SF sparse P) |
+| `0001ddc4d` | TF drafter warmup capture (eager-drafter ceiling 7-14 tok/s -> 27 tok/s captured) |
+| `35a01a325` | FA backend 0% accept fix (slot_mapping dict missing in `set_forward_context`) |
+| `a658cb610` | perf: cache fp32 lm_head weight transpose (2GB/step recompute removed) |
+| `1d23c6385` | perf: hoist `_commit_tidar_cca_state` (idx_gpu/arange_gpu) |
+| `9945e9e5b` | perf: cache `_get_cca_block_slots` result |
+| `80ab16112` | perf: cache FA group id lookup in `_build_draft_inputs` |
+| `284091c04` | perf: cache `/tmp/tidar_mix_w` file-read |
+| `955cc6361` | perf: skip per-step `state_indices_tensor.tolist()` sync |
+| `96cc939c7` | perf+accept: `VLLM_TIDAR_FA_NO_SPLITS=1` forces FA `num_splits=1` (recovers +10% accept on TF captured) |
+| `5a51e6ea4` | fix: gate `VLLM_TIDAR_FA_NO_SPLITS` on TF mode only (SF combo was broken) |
+| `55e08f7cb` | warn: log warning when SF mode runs with FA backend (FA + SF is broken; force FLEX) |
 
 ## v0.15 vs v0.16 — things to know if you keep working on this
 
