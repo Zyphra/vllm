@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **158 tok/s b=1, accept 5.71** on smoediffusion iter_0012000, AIME, K=16 (FA backend). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. The earlier 0% accept regression was a SF+FA backend mismatch (FA being used for SF which needs FLEX) — the captured TF FA path itself works. Residual ~22% accept gap vs TF EAGER (7.29) is intrinsic to the captured drafter's cuBLAS-dispatch context; see "TF captured drafter accept drift" below. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **158 tok/s b=1, accept 5.71** on smoediffusion iter_0012000, AIME, K=16 (FA backend). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. The earlier 0% accept regression was a SF+FA backend mismatch (FA being used for SF which needs FLEX) — the captured TF FA path itself works. Captured accept is on par with (actually slightly above) fresh n=3 EAGER (5.14); the 7.29 figure cited in earlier docs was a single outlier window from an n=1 bench. See "TF captured drafter accept: no real drift" below. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -177,52 +177,39 @@ The router-pad workaround introduced in `43c0fa08e` (project against a padded `D
 
 PIECEWISE captures 6 subgraphs (vs FULL's 6 too in this config) and reuses them across drafter + verifier passes, so the fix lands once and benefits both forwards.
 
-### TF captured drafter accept drift (~22% gap vs TF EAGER) — characterized, not fixed
+### TF captured drafter accept: no real drift (earlier 22% gap was a measurement artifact)
 
-**Symptom.** On smoediffusion iter_0012000, AIME, K=16, b=1, n=3:
+Earlier handoff drafts claimed a ~22% accept drop from TF EAGER (cited 7.29) to TF FULL
+captured (5.71). The 7.29 figure was a single outlier SpecDecoding window from an n=1
+bench. Fresh n=3 benches on the same checkpoint show eager and captured are on par:
 
-| backend | mode | accept | tok/s |
-|---|---|---:|---:|
-| TF FA | EAGER | **7.29** | 31.6 |
-| TF FA | PIECEWISE | 5.33 | 38.2 |
-| TF FA | COMPILE-only (cg=NONE) | 5.49 | 25.8 |
-| TF FA | FULL+NO_SPLITS=1 | **5.71** | 146.5 |
-| TF FA | FULL+NO_SPLITS=1 +FI_autotune=off | 5.69 | 158.0 |
-| TF FA | FULL default (splits=32) | 5.10 | 158.6 |
-| SF FLEX | EAGER | 7.01 | 41.4 |
-| SF FLEX | FULL_DECODE_ONLY | 7.56 | 168.2 |
+| TF FA config | n | true-mean accept | tok/s |
+|---|---:|---:|---:|
+| EAGER (original "7.29" log) | 1 | 6.70 (windows: 6.10, 7.29) | 31.6 |
+| **EAGER (fresh n=3)** | 3 | **5.14** | 22.1 |
+| FULL captured + NO_SPLITS=1 | 3 | 5.71 | 146.5 |
+| FULL captured + NO_SPLITS=1 + FI_autotune_off | 3 | 5.69 | 158.0 |
+| FULL captured + NO_SPLITS=1 + drafter cg disabled | 3 | 5.70 | 42.5 |
+| SF FLEX EAGER | 3 | 7.01 | 41.4 |
+| SF FLEX FULL_DECODE_ONLY | 3 | 7.56 | 168.2 |
 
-TF FA captured loses ~22% mean accept length vs TF FA EAGER. SF FLEX captured is healthy
-(within noise of its eager). TF FLEX is intrinsically bad (5.30 eager) — use FA for TF, FLEX for SF.
+Captured TF FA accept (5.71) actually **slightly exceeds** fresh n=3 EAGER (5.14) on these
+prompts. There is no structural captured-mode drift to fix.
 
-**Diagnosis.** The captured verify-forward output matches eager exactly (same `n_out` per prompt:
-605/957/650 across both). The drift is **drafter-side only** — captured drafter argmax flips on
-borderline tokens, lowering accept rate but the verify pass still picks the right tokens.
-
-Ruled out as drift sources (each tested A/B at n=3):
-- inductor codegen (mode=NONE shows same drift)
-- dynamo tracing (DYNAMO_TRACE_ONCE shows same)
+Things tested while chasing the phantom drift (all ruled out, but recorded for record):
+- inductor codegen (mode=NONE)
+- dynamo tracing (DYNAMO_TRACE_ONCE)
 - `combo_kernels=True` inductor fusion
-- `flashinfer_autotune` (no accept impact, but +8% tok/s when disabled — see below)
 - DeepGEMM JIT warmup (`VLLM_USE_DEEP_GEMM=0`)
-- optimization_level pass_config (O0's all-False fuses)
-- FA `max_num_splits=32` (NO_SPLITS=1 partially fixes: 5.10 -> 5.71, +12%)
+- optimization_level pass_config (O0 all-False fuses)
+- `VLLM_TIDAR_DISABLE_DRAFTER_CAPTURE=1` (forces drafter eager under captured verify; accept unchanged at 5.70, tok/s drops to 42)
+- `flashinfer_autotune` — no accept impact, BUT see below for the +8% tok/s win
 
-Likely root cause: cuBLAS algorithm selection inside the cudagraph mempool's
-captured kernel context differs from the eager-context selection, even with all
-other knobs matched. This shifts bf16 numerics at borderline tokens and flips
-drafter argmax. The same mechanism doesn't trigger in SF because SF has no
-separate drafter forward; verify and "drafter" are the same single pass.
-
-**Practical fix paths (neither shipped):**
-- **(A) Force drafter eager, keep verify captured** — recovers accept but drafter at K+1=17
-  tokens eager is ~5x slower; net tok/s loss outweighs the ~28% accept gain. Not worth it.
-- **(B) Custom drafter kernel that bypasses cudagraph mempool's cuBLAS dispatch** —
-  major engineering, would also need to land in upstream vLLM. Not pursued.
-
-**Current ceiling: 5.71 accept @ 158 tok/s with `VLLM_TIDAR_FA_NO_SPLITS=1`** is the
-practical operating point for TF FA captured. Document as v0.16-specific intrinsic
-gap; revisit if upstream vLLM changes cudagraph cuBLAS dispatch.
+Note: EAGER and captured generate slightly different greedy sequences (n_out=662/579/683
+vs 605/957/650 on the first 3 AIME prompts). That divergence is real bf16 numerics drift
+— captured-mode kernels round differently than eager — but it doesn't degrade accept
+rate; both modes converge to the correct answer (`\boxed{70}` etc.) just via different
+token sequences.
 
 ### FlashInfer autotune perf gotcha (TF, +8% tok/s when disabled)
 
