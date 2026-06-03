@@ -288,9 +288,52 @@ Sum of small structural differences vs v0.15:
 4. `cudagraph_copy_inputs=True` is forced for TiDAR (v0.15 had False). Per-step
    memcpy of inputs into captured buffers.
 
-Closing the rest would require structural changes — enabling async scheduling
-for TiDAR, re-fusing kv_cache_update into FA, or backporting v0.15's tighter
-per-step path. None are session-scoped.
+### Structural attempts (this hunt, none shipped)
+
+Tried but didn't pan out within session scope:
+
+1. **Re-fuse `unified_kv_cache_update` into FA's forward** (inline `reshape_and_cache_flash`
+   inside `FlashAttentionImpl.forward`, set `forward_includes_kv_cache_update=True`).
+   Result: FA's main `_vllm_fa3_C.fwd` kernel raises `out must have shape (total_q,
+   num_heads, head_size_v)` during warmup. The flag flip changes a code path in
+   `attention.py` (the no-output-tensor branch becomes legal) which in turn affects
+   how the output shape is set up. Needs deeper investigation of the attention.py
+   dispatch + output-tensor allocation interactions.
+
+2. **Async scheduling for TiDAR** (add `tidar` to the eligible methods in
+   `vllm/config/vllm.py:651`). Structural blockers in the existing async path:
+   - `_bookkeeping_sync` async branch (line 3295) asserts
+     `sampled_token_ids.shape[-1] == 1`; for TF spec-decode this is K+1=17. Need
+     to either widen the assertion or add a TiDAR-specific async path that handles
+     `[batch, K+1]` shapes.
+   - `_commit_tidar_cca_state` currently requires `valid_sampled_token_ids` on CPU
+     to compute per-request `num_accepted`. Either compute on GPU directly (replace
+     `len(num_accepted_per_batch_idx)` with `idx_gpu.shape[0]`) or sync per-step
+     (defeats the async benefit).
+   - Consumer of `prev_sampled_token_ids` in `_update_states` assumes shape
+     `[num_reqs, 1]` for the bonus column (line 1415: `prev_sampled_token_ids[:n, 0]`).
+     For TF spec-decode shape `[num_reqs, K+1]`, the bonus is at column 0 which
+     happens to work, but the consumer's downstream draft-token scatter (line
+     1431) assumes a separate `_draft_token_ids` tensor — not how TiDAR represents
+     state.
+
+3. **Minimal `cudagraph_capture_sizes` for TF b=1** (drop `small_grid [1,2,4,8]`
+   and `sf_sizes [306]`, keep only `spec_sizes [17]`). Result: mean across 3 runs
+   was 171.7 vs baseline 168.7 — within noise. Dispatcher lookup overhead at 6
+   sizes vs 1 is apparently small per step (microseconds, not milliseconds).
+
+### What would actually close the gap
+
+These need engineering work beyond this session:
+- **Re-fuse kv_cache_update into FA forward** — requires understanding the
+  attention.py output-tensor allocation contract when `forward_includes_kv_cache_update`
+  flips. ~26ms/200 tokens of GPU kernel time recoverable.
+- **Full async scheduling for TiDAR** — requires (a) widening async path assertions
+  to allow spec-decode shapes, (b) GPU-only `_commit_tidar_cca_state`, (c) reworking
+  `prev_sampled_token_ids` consumption for TF mode. ~25-28ms/step potentially
+  recoverable.
+- **Re-investigate the 1.29 GB of D2D memcpy** nsys shows (760 calls/200 tokens).
+  Not clear what's being copied or where; needs targeted profiling.
 
 ## What's slow
 
