@@ -112,7 +112,7 @@ _direct_register_custom_op(
 
 
 _VLLM_TIDAR_SMOE_MOE_OP = (
-    os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "1").lower()
+    os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "0").lower()
     in ("1", "true", "yes"))
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
