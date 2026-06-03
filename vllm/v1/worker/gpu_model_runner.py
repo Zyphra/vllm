@@ -1172,13 +1172,40 @@ class GPUModelRunner(
     ) -> None:
         """Update the cached states after model execution.
 
-        This is used for MTP/EAGLE for hybrid models, as in linear attention,
-        only the last token's state is kept. In MTP/EAGLE, for draft tokens
-        the state are kept util we decide how many tokens are accepted for
-        each sequence, and a shifting is done during the next iteration
-        based on the number of accepted tokens.
+        PERF (TiDAR): the original v0.16 path does a .cpu().numpy() sync here
+        on output_token_ids — ~13.7ms/step on TF FA b=1 captured. The result
+        flows ONLY to GDNAttentionMetadataBuilder (linear-attention spec
+        metadata) and mamba_utils.postprocess_mamba (mamba_cache_mode=align).
+        For TiDAR + CCA (no GDN, mamba_cache_mode=none), the entire result
+        is unused — pure overhead. Skip the GPU compute + sync entirely.
+
+        The bookkeep path will still .cpu() the same sampled_token_ids for
+        parse_output, but at that point the surrounding logic uses the CPU
+        result locally without writing back into input_batch.num_accepted_tokens_cpu,
+        which is dead state for non-GDN models.
         """
         if not self.speculative_config or not self.model_config.is_hybrid:
+            return
+
+        # Skip entirely if no GDN backend AND mamba_cache_mode != "align".
+        # The .cpu().numpy() sync below is ~13.7ms/step and feeds only those
+        # two paths; without them the work is dead.
+        if not hasattr(self, "_uam_skip_cached"):
+            from vllm.v1.attention.backends.gdn_attn import (
+                GDNAttentionMetadataBuilder)
+            has_gdn = False
+            for groups in (self.attn_groups or []):
+                for g in groups:
+                    builder = getattr(g, "metadata_builder", None)
+                    if isinstance(builder, GDNAttentionMetadataBuilder):
+                        has_gdn = True
+                        break
+                if has_gdn:
+                    break
+            self._uam_skip_cached = (
+                not has_gdn
+                and self.cache_config.mamba_cache_mode != "align")
+        if self._uam_skip_cached:
             return
 
         # Find the number of accepted tokens for each sequence.
