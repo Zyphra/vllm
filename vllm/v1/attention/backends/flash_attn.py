@@ -377,6 +377,17 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # we only set num_splits when using cuda graphs.
             max_num_splits = self.max_num_splits
 
+            # TiDAR drafter perf knob: split-KV (num_splits > 1) under
+            # captured cudagraph introduces reduction-order non-determinism
+            # that shifts drafter argmax at borderline tokens, dropping
+            # mean accept rate ~25% vs eager FA on TF spec-decode. Set
+            # VLLM_TIDAR_FA_NO_SPLITS=1 to force max_num_splits=1, matching
+            # eager FA numerics in exchange for less parallelism across
+            # the KV dim (cheap at short seq_lens common in TiDAR).
+            import os as _os_ns
+            if _os_ns.environ.get("VLLM_TIDAR_FA_NO_SPLITS", "0") == "1":
+                max_num_splits = 1
+
         if vllm_is_batch_invariant():
             max_num_splits = 1
 
