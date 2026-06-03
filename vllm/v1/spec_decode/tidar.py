@@ -959,9 +959,12 @@ class TiDARProposer(EagleProposer):
         # on this model (CCA layers happen to register first), so the
         # captured drafter graph (which traced FA's slot_mapping at fa_group's
         # persistent buffer) read stale data at replay.
-        _, _fa_group_id_bdi = (
-            self._get_metadata_builder_and_group_id_for_layer(
-                self.attn_layer_names[0]))
+        # Cache the lookup; attn_groups is static post-init.
+        if not hasattr(self, "_cached_bdi_fa_group_id"):
+            _, self._cached_bdi_fa_group_id = (
+                self._get_metadata_builder_and_group_id_for_layer(
+                    self.attn_layer_names[0]))
+        _fa_group_id_bdi = self._cached_bdi_fa_group_id
         flash_blk_table = runner.input_batch.block_table[_fa_group_id_bdi]
         flash_blk_table.slot_mapping.gpu[:n_tokens].copy_(slot_mapping.view(-1))
         flash_blk_table.slot_mapping.gpu[n_tokens:].fill_(-1)
