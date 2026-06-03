@@ -67,7 +67,10 @@ logger = logging.getLogger(__name__)
 # of probs (the MOD passthrough mul) then read from the materialized
 # buffer instead of triggering an inline softmax recompute.
 #
-# Opt-in via VLLM_TIDAR_SMOE_MOE_OP=1. Default OFF until proven to help.
+# Default ON since 5e4b95df0 (lm_head SM90 fix). Now stacks cleanly with
+# fast lm_head: +4% on TF FA b=1 (172.9 -> 179.9 tok/s) on top of the lm_head
+# win. Earlier dense-SF b=3 measurement was -3% (neutral noise); TF dense and
+# SF sparse both benefit. Set VLLM_TIDAR_SMOE_MOE_OP=0 to opt out.
 # ----------------------------------------------------------------------------
 from vllm.utils.torch_utils import direct_register_custom_op as _direct_register_custom_op
 
@@ -109,7 +112,7 @@ _direct_register_custom_op(
 
 
 _VLLM_TIDAR_SMOE_MOE_OP = (
-    os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "0").lower()
+    os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "1").lower()
     in ("1", "true", "yes"))
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
