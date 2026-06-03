@@ -113,15 +113,32 @@ _VLLM_TIDAR_SMOE_MOE_OP = (
     in ("1", "true", "yes"))
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
-    """LM-head projection that returns fp32 logits via out_dtype."""
+    """LM-head projection that returns fp32 logits via out_dtype.
+
+    PERF: cache the fp32-upcasted weight transpose. Without caching this
+    method allocates + copies the full (vocab, hidden) weight to fp32
+    on every forward (vocab=262272, hidden=2048 -> 2.15GB bf16->fp32
+    conversion per call). Two calls per spec-decode step (verifier +
+    drafter compute_logits) = ~4ms wasted per step. The weight is
+    immutable post-load so a single cached fp32 copy is safe.
+    The cache lives as an attribute on the layer; if weights are
+    ever reloaded the layer should clear ``_fp32_weight_t_cache``.
+    """
 
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
         # ROCm does not support bf16->fp32 torch.mm via out_dtype, so upcast
         # operands explicitly and keep the logits accumulation in fp32.
-        out = torch.mm(x.to(torch.float32),
-                       layer.weight.t().to(torch.float32))
+        # Cache the fp32 weight transpose; the lm_head weight is immutable
+        # after load. Saves ~1-2 ms per call (weight is hundreds of MB).
+        _cached = getattr(layer, "_fp32_weight_t_cache", None)
+        if (_cached is None
+                or _cached.data_ptr() == 0
+                or _cached.dtype != torch.float32):
+            _cached = layer.weight.t().to(torch.float32).contiguous()
+            layer._fp32_weight_t_cache = _cached
+        out = torch.mm(x.to(torch.float32), _cached)
         if bias is not None:
             out = out + bias.to(torch.float32)
         return out
