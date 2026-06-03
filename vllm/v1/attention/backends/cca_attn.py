@@ -180,11 +180,18 @@ class CCAAttentionMetadataBuilder(
             meta.query_start_loc_p = (
                 self._query_start_loc_p_buf[:num_prefills + 1])
 
-        # Materialize per-req slot indices as a Python list once. Used by
-        # CCA's prefill loop and commit_spec_decode_state to index
-        # conv_states / prev_hs with Python ints. Skip on pure-decode
-        # batches (no prefill loop runs).
-        if num_prefills > 0 and meta.state_indices_tensor is not None:
+        # Materialize per-req slot indices as a Python list. Originally
+        # consumed by the legacy eager Python-loop prefill in cca.py;
+        # the vectorized prefill path (which is the only path used under
+        # TF mode at runtime) reads state_indices_tensor directly on GPU
+        # and never touches state_indices_list. The .tolist() call here
+        # forced a GPU->CPU sync every propose step for unused data;
+        # gate on env to preserve compatibility for any legacy callers.
+        import os as _osc
+        if (num_prefills > 0
+                and meta.state_indices_tensor is not None
+                and _osc.environ.get(
+                    "VLLM_TIDAR_CCA_STATE_INDICES_LIST", "0") == "1"):
             meta.state_indices_list = meta.state_indices_tensor.tolist()
 
         return meta
