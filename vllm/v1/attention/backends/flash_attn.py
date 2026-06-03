@@ -384,8 +384,15 @@ class FlashAttentionMetadataBuilder(AttentionMetadataBuilder[FlashAttentionMetad
             # VLLM_TIDAR_FA_NO_SPLITS=1 to force max_num_splits=1, matching
             # eager FA numerics in exchange for less parallelism across
             # the KV dim (cheap at short seq_lens common in TiDAR).
+            # Gated on TF mode (VLLM_TIDAR_TWO_FORWARD=1): SF mode's FA
+            # path doesn't go through the SF Triton kernel (that lives
+            # in flex_attention.py) and forcing num_splits=1 there
+            # collapses accept to ~1 (broken kernel selection for SF's
+            # mask layout). FA + SF combo is not recommended anyway --
+            # use FLEX backend for SF.
             import os as _os_ns
-            if _os_ns.environ.get("VLLM_TIDAR_FA_NO_SPLITS", "0") == "1":
+            if (_os_ns.environ.get("VLLM_TIDAR_FA_NO_SPLITS", "0") == "1"
+                    and _os_ns.environ.get("VLLM_TIDAR_TWO_FORWARD", "0") == "1"):
                 max_num_splits = 1
 
         if vllm_is_batch_invariant():
