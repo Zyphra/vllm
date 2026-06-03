@@ -832,6 +832,11 @@ class TiDARProposer(EagleProposer):
         did that copy across all CCA layers per step (~5-10ms wasted) and
         was rendered unnecessary once the captured CCA forward learned to
         scatter into a separate write slot.
+
+        PERF: ar_slots/draft_slots are slices of the persistent CCA block
+        table -- their data_ptr is stable per (num_reqs, group_id). Cache
+        the slice views to skip the per-step Python iteration through
+        attn_groups + validation cost (~25us saved per propose).
         """
         if self.cca_metadata_builder is None or \
                 not hasattr(self, "cca_kv_cache_group_id"):
@@ -840,10 +845,14 @@ class TiDARProposer(EagleProposer):
                 self._get_metadata_builder_and_group_id_for_layer(
                     self.cca_layer_names[0])
 
+        _num_reqs = common_attn_metadata.num_reqs
+        _cache_key = (_num_reqs, self.cca_kv_cache_group_id)
+        _cached = getattr(self, "_cached_cca_slots_key", None)
+        if _cached == _cache_key:
+            return self._cached_cca_ar_slots, self._cached_cca_draft_slots
         block_table_obj = self.runner.input_batch.block_table[
             self.cca_kv_cache_group_id]
-        block_table = block_table_obj.get_device_tensor(
-            common_attn_metadata.num_reqs)
+        block_table = block_table_obj.get_device_tensor(_num_reqs)
         if block_table.shape[1] < 2:
             raise ValueError(
                 "TiDAR with CCA requires a dedicated draft state block, but "
@@ -853,14 +862,16 @@ class TiDARProposer(EagleProposer):
         draft_state_indices = block_table[:, 1]
         # Validate against the CPU mirror so we don't pay a sync just to read
         # back a single bool (`torch.any` on a GPU tensor would force one).
-        block_table_cpu = block_table_obj.get_cpu_tensor()[
-            :common_attn_metadata.num_reqs]
+        block_table_cpu = block_table_obj.get_cpu_tensor()[:_num_reqs]
         if (block_table_cpu[:, 0] <= 0).any().item() or \
                 (block_table_cpu[:, 1] <= 0).any().item():
             raise ValueError(
                 "TiDAR found invalid CCA state indices while preparing the "
                 "draft cache.")
 
+        self._cached_cca_slots_key = _cache_key
+        self._cached_cca_ar_slots = ar_state_indices
+        self._cached_cca_draft_slots = draft_state_indices
         return ar_state_indices, draft_state_indices
 
     def _build_draft_inputs(
