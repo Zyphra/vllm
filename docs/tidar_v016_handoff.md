@@ -228,12 +228,14 @@ for TiDAR mode in a follow-up; for now it's a one-line knob in the user config.
 Apples-to-apples bench (n=3 AIME prompts, max_tokens=1500, AIME25 thinking-off,
 T_AR=0):
 
-| version | n=10 mt=2000 mean | n=3 mt=1500 mean | notes |
-|---|---:|---:|---|
-| v0.15 `jinzhao/tidar` (idle node 89) | **240** | **278** | Reference |
-| **v0.16 head** (5 commits this session including c1e8c9f9c) | **228** | **264** | **94.8% of v0.15** |
-| v0.16 head minus c1e8c9f9c (use_gpu_toks=True for TiDAR) | 168 | 184 | -35% vs head |
-| v0.16 pre-perf-hunt baseline | ~150 | 158 | before 5e4b95df0 |
+| config | v0.15 | v0.16 head | ratio |
+|---|---:|---:|---:|
+| n=10 mt=2000 b=1 (idle node 89) | **240** | **228** | 95% |
+| n=3 mt=1500 b=1 | **278** | **264** | 95% |
+| **n=10 mt=2000 b=4** | **566** | **608** | **107% (v0.16 FASTER)** |
+| AR mode (no spec decode), n=10 b=1 | 64.8 | 101 | **156% (v0.16 FASTER)** |
+| v0.16 head minus c1e8c9f9c (use_gpu_toks=True) | n/a | 168 | -35% vs head |
+| v0.16 pre-perf-hunt baseline | n/a | ~150 | before 5e4b95df0 |
 
 ### Shipped wins (this hunt)
 
