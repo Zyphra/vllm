@@ -326,6 +326,18 @@ class SpeculativeConfig:
                 self.model = self.target_model_config.model
                 if not self.quantization:
                     self.quantization = self.target_model_config.quantization
+                # Force disable_padded_drafter_batch=True to match v0.15's
+                # _use_padded_drafter_batch() returning False for TiDAR.
+                # Effect: use_gpu_toks=False → propose_drafts_after_bookkeeping=True.
+                # Draft fires AFTER bookkeep, so bookkeep's .cpu() only waits for
+                # verify+sample (not drafter). Drafter runs in parallel with
+                # next step's preprocess+forward, saving ~5-10ms/step.
+                # Opt-out: set disable_padded_drafter_batch=False explicitly.
+                import os as _os_dpdb
+                if (not self.disable_padded_drafter_batch
+                        and _os_dpdb.environ.get(
+                            "VLLM_TIDAR_KEEP_PADDED_DRAFTER", "0") != "1"):
+                    self.disable_padded_drafter_batch = True
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "suffix":
