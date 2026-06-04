@@ -34,19 +34,21 @@ Idle vp-dgx-89, smoediffusion `iter_0012000` checkpoint:
 | TF FA        | 16 | **1621** | 1537 | **105%** | 7.25 | 6.77 |
 | SF FLEX      |  1 | **223** | ~75 | **297%** (v0.15 unstable here) | 6.79 | 6.10 |
 | SF FLEX      |  8 | **634** |  319 | **199%** | 6.98 | 6.16 |
-| SF FLEX      | 16 | **862** (var 801-921) | (degen) | n/a    | 6.29 | (degen) |
+| SF FLEX      | 16 | **862** (var 801-921) | (not measured†) | n/a | 6.29 | (n/a) |
 
 Accept = `Mean acceptance length` averaged across all SpecDecoding metric
 windows in the run (each window ~10s of generation). v0.15 vs v0.16 accept
-is within ~5% across configs (excluding the SF b=16 v0.15 degenerate run) — the perf differences in the table are
+is within ~5% across configs (excluding the unfair SF b=16 v0.15 entry — see †) — the perf differences in the table are
 throughput differences, not accept-quality differences.
 
-**SF b=16 v0.15 degenerate output**: both v0.15 runs at b=16 collapsed —
-per-position acceptance rates were uniformly 0.94+ across all 15 spec
-positions and mean accept hit 15+ (≈K+1=17), versus v0.16's healthy
-0.71→0.10 decay. The 1030 tok/s v0.15 first-run figure is throughput on
-degenerate output, not real generation. v0.16 SF b=16 generates normally
-at 862 tok/s with accept 6.29.
+† **SF b=16 v0.15 entry is not measured fairly.** Initial bench used v0.15's
+default `VLLM_TIDAR_PROPOSAL_ACC_LEVELS=(4,7,10)`, which is documented as
+cascade-degenerate on smoediffusion (acc collapses to ≈1.0; per-position
+uniformly 0.94+). v0.16 SF b=16 ran with explicit
+`VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,...,16` (full K+1 dense), avoiding the
+broken default. Apples-to-apples would require running v0.15 with the same
+override; not done here. v0.16 SF b=16 itself is real: 862 tok/s with
+healthy 0.71→0.10 per-position decay.
 
 Run-to-run sigma on TF b=1 is ~0.5% on idle node. The b=8 dip is high
 variance (v0.16 std-dev ~100); v0.15 is stable. The cudagraph dispatcher
