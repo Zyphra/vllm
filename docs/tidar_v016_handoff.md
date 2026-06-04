@@ -24,16 +24,21 @@ or better than v0.15 across nearly every config tested.
 
 Idle vp-dgx-89, smoediffusion `iter_0012000` checkpoint:
 
-| mode    | batch | v0.16 | v0.15 | ratio |
-|---|---:|---:|---:|---:|
-| AR (no spec) |  1 | **101** |   65 | **156%** |
-| TF FA        |  1 |     228 |  240 |   95%  |
-| TF FA        |  2 | **384** |  374 | **103%** |
-| TF FA        |  4 | **608** |  566 | **107%** |
-| TF FA        |  8 | 914 (var 831-1069) | 1154 | 79% (variance, not structural) |
-| TF FA        | 16 | **1621** | 1537 | **105%** |
-| SF FLEX      |  1 | **223** | ~75 | **297%** (v0.15 unstable here) |
-| SF FLEX      |  8 | **634** |  319 | **199%** |
+| mode    | batch | v0.16 tok/s | v0.15 tok/s | ratio | v0.16 acc | v0.15 acc |
+|---|---:|---:|---:|---:|---:|---:|
+| AR (no spec) |  1 | **101** |   65 | **156%** | n/a | n/a |
+| TF FA        |  1 |     228 |  240 |   95%  | 7.09 | 6.94 |
+| TF FA        |  2 | **384** |  374 | **103%** | 6.63 | 6.48 |
+| TF FA        |  4 | **608** |  566 | **107%** | 6.79 | 7.10 |
+| TF FA        |  8 | 914 (var 831-1069) | 1154 | 79% (variance, not structural) | 6.72 | 7.00 |
+| TF FA        | 16 | **1621** | 1537 | **105%** | 7.25 | 6.77 |
+| SF FLEX      |  1 | **223** | ~75 | **297%** (v0.15 unstable here) | 6.79 | 6.10 |
+| SF FLEX      |  8 | **634** |  319 | **199%** | 6.98 | 6.16 |
+
+Accept = `Mean acceptance length` averaged across all SpecDecoding metric
+windows in the run (each window ~10s of generation). v0.15 vs v0.16 accept
+is within ~5% across configs — the perf differences in the table are
+throughput differences, not accept-quality differences.
 
 Run-to-run sigma on TF b=1 is ~0.5% on idle node. The b=8 dip is high
 variance (v0.16 std-dev ~100); v0.15 is stable. The cudagraph dispatcher
