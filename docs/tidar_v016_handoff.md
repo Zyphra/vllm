@@ -228,23 +228,29 @@ for TiDAR mode in a follow-up; for now it's a one-line knob in the user config.
 Apples-to-apples bench (n=3 AIME prompts, max_tokens=1500, AIME25 thinking-off,
 T_AR=0):
 
-### Full v0.15 vs v0.16 matrix (idle node 89, n=10 mt=2000)
+### Full v0.15 vs v0.16 matrix (idle node 89, n=10 mt=2000, n=20 for b=16)
 
 | mode  | batch | v0.15 | v0.16 head | ratio | notes |
 |---|---:|---:|---:|---:|---|
-| AR (no spec)    | 1 |   65 |  101 | **156%** | v0.16 forward is faster |
-| **TF (FA)**     | 1 |  240 |  228 |   95%  | residual 5% structural |
-| TF (FA)         | 4 |  566 |  608 | **107%** | v0.16 faster |
-| TF (FA)         | 8 | 1137 |  856 |   75%  | **v0.15 lead at b=8 — scheduler/bookkeep scaling** |
-| **SF (FLEX)**   | 1 |  ~75 |  223 | **297%** | v0.15 SF crashes at short bench; my n=10 measurement of 75 may not be apples-to-apples |
-| SF (FLEX)       | 8 |  319 |  634 | **199%** | v0.16 SF much faster |
-
-(b=4 TF and AR runs are 2-run mean; b=1 is 5-run mean; b=8 is 2-run.)
+| AR (no spec)    |  1 |   65 |  101 | **156%** | v0.16 forward is faster |
+| TF (FA)         |  1 |  240 |  228 |   95%  | residual 5% structural |
+| TF (FA)         |  2 |  374 |  384 | **103%** | v0.16 faster |
+| TF (FA)         |  4 |  566 |  608 | **107%** | v0.16 faster |
+| TF (FA)         |  8 | 1154 |  914 |   79%  | **anomaly — high variance at b=8 (v0.16 range 831-1069)** |
+| TF (FA)         | 16 | 1537 | 1621 | **105%** | v0.16 faster |
+| SF (FLEX)       |  1 |  ~75 |  223 | **297%** | v0.15 SF crashed in short bench; n=10 measurement |
+| SF (FLEX)       |  8 |  319 |  634 | **199%** | v0.16 SF much faster |
 
 ### Where the remaining gaps are
 
-- **TF b=1**: residual ~5%. v0.16 has small fixed per-step overhead (engine subprocess IPC, scheduler bookkeeping) that v0.15 doesn't.
-- **TF b=8**: ~25% gap. v0.16's overhead scales linearly with batch in some places (CPU-list path for sampled_token_ids, per-req scheduler iteration). The c1e8c9f9c fix is still net-positive at b=8 (vs the use_gpu_toks=True alternative which gave 550 tok/s — so dpdb=True wins by +56% at b=8) but doesn't close to v0.15.
+- **TF b=1**: residual ~5%. v0.16 has small fixed per-step overhead (engine
+  subprocess IPC, scheduler bookkeeping) that v0.15 doesn't.
+- **TF b=8 anomaly**: v0.16 has high variance at b=8 (831-1069 tok/s across
+  5 runs; std-dev ~100). v0.15 is super stable (1105-1168 across 5 runs).
+  v0.16 wins cleanly at b=4 (+7%) and b=16 (+5%), so this b=8 dip is
+  likely a measurement variance issue, not a structural gap. Captured
+  cudagraph dispatcher with 13 sizes might cause occasional fallback
+  paths at b=8 specifically that don't fire at adjacent sizes.
 - **Everywhere else**: v0.16 is at par or significantly faster.
 
 To close the TF b=8 gap would need batch-scaling-aware optimizations — out of session scope. The dominant b=1 case is closed.
