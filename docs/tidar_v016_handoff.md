@@ -1,6 +1,6 @@
 # TiDAR vLLM v0.16 Port — Handoff
 
-**Branch:** `jinzhao/tidar_v016` @ `8e79bdc39`
+**Branch:** `jinzhao/tidar_v016` @ `c1e8c9f9c`
 **Repo:** `git@github.com:Zyphra/Zvllm.git`
 **Node tested:** vp-dgx-89 (147.68.0.89) — node 2 was contended, all post-2026-06-03 measurements use idle node 89
 **Env:** `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
@@ -17,7 +17,7 @@
 | **SF FULL_DECODE_ONLY captured** | ✅ | **Primary path** — 176/361/619 tok/s b=1/8/16 |
 | TF eager | ✅ | ~20 tok/s, coherent |
 | TF PIECEWISE captured | ✅ (opt-in) | **13.9 tok/s b=1, n=3, max_tokens=200**, coherent math reasoning end-to-end. Requires `VLLM_TIDAR_ROUTER_PAD=1` — same env var that fixed TF FULL captured. Without it, process segfaults in `cudaGraphLaunch → CUDAGraph::replay()`. Same root cause as TF FULL (buggy CUTLASS align1 kernel from the unaligned router output stride). |
-| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **168 tok/s n=10, accept ~5.7** on smoediffusion iter_0012000, AIME, K=16 (FA backend) on idle node 89 after lm_head SM90 + MOE_OP off + skip_uam + skip_conv1d_meta. Short n=3 = 184 tok/s. Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. v0.15 reference n=10 = 240 tok/s, n=3 = 278 tok/s. v0.16 at ~70% of v0.15 on n=10. See "v0.16 vs v0.15 perf gap" below. |
+| **TF FULL_DECODE_ONLY captured** | ✅ (opt-in) | **228 tok/s n=10, 264 tok/s n=3** on smoediffusion iter_0012000, AIME, K=16, idle vp-dgx-89 (3-run sigma~0.5%). v0.16 now at 94.8% of v0.15 (was 70% before c1e8c9f9c's disable_padded_drafter_batch fix). Requires `VLLM_TIDAR_ROUTER_PAD=1` + `VLLM_TIDAR_FA_NO_SPLITS=1` + `VLLM_ATTENTION_BACKEND=FLASH_ATTN`. v0.15 reference n=10 = 240, n=3 = 278. See "v0.16 vs v0.15 perf gap" below for the recovery story. |
 | `vllm serve` DP=8 | Not retested | v0.15 handoff has working command; should port over once TF captured is fixed (or stay SF-only) |
 
 ## Quickstart
@@ -230,9 +230,9 @@ T_AR=0):
 
 | version | n=10 mt=2000 mean | n=3 mt=1500 mean | notes |
 |---|---:|---:|---|
-| v0.15 `jinzhao/tidar` (idle node 89) | **237** | **278** | Reference; n=10 has dropoff |
-| **v0.16 head** (5e4b95df0 + 84950b974 + 528f2b851 + 8e79bdc39) | **168** | **184** | 70% of v0.15 on n=10 |
-| v0.16 with VLLM_TIDAR_SMOE_MOE_OP=1 | 158.8 | 182.6 | -2.7% n=10 vs default off |
+| v0.15 `jinzhao/tidar` (idle node 89) | **240** | **278** | Reference |
+| **v0.16 head** (5 commits this session including c1e8c9f9c) | **228** | **264** | **94.8% of v0.15** |
+| v0.16 head minus c1e8c9f9c (use_gpu_toks=True for TiDAR) | 168 | 184 | -35% vs head |
 | v0.16 pre-perf-hunt baseline | ~150 | 158 | before 5e4b95df0 |
 
 ### Shipped wins (this hunt)
@@ -243,6 +243,7 @@ T_AR=0):
 | `84950b974` | MOE_OP default REVERTED to OFF. The earlier flip to ON (771a701d6) was based on a high-variance n=3 measurement that included a 204 tok/s outlier; on idle node 89 n=10 the same flip is -2.7% (158.8 vs 163.3). | n/a (reverts a misjudgment) |
 | `528f2b851` | Skip `_update_states_after_model_execute` for TiDAR (no GDN backend, no mamba_cache_mode=align consumer). Eliminates a dead-code .cpu().numpy() sync + cat/argmax/loop. The sync gets absorbed into the later `parse_output` sync (same total wait for GPU), so the win is the eliminated GPU compute + Python work, not the sync itself. | +1.9% (163 -> 165) |
 | `8e79bdc39` | Skip `compute_causal_conv1d_metadata` when the metadata builder is CCAAttentionMetadataBuilder. The function builds Mamba1 causal_conv1d kernel metadata that CCA never reads (CCA has its own conv path). Was 6.7ms per call × 2 calls/step = ~13.5ms wall time, mostly overlapping with surrounding GPU work — net on-critical-path saving is ~0.3ms. | +1.0% (165 -> 168) |
+| `c1e8c9f9c` | **THE BIG ONE.** Force `disable_padded_drafter_batch=True` for TiDAR in SpeculativeConfig validation. Restores v0.15's `_use_padded_drafter_batch()=False` behavior, which v0.16 dropped when refactoring the gate to a pure config field. Effect: TiDAR's draft fires AFTER bookkeep (CPU-list path), so bookkeep's `.cpu()` sync waits only for verify+sample (not drafter). Drafter then runs in parallel with the next step's preprocess+forward, saving ~5-10ms/step. | **+35.7%** (168 -> 228) |
 
 ### Methodology + caveats
 
@@ -461,6 +462,8 @@ Likely candidates: block-table state from the finished request isn't fully relea
 | `528f2b851` | perf: skip _update_states_after_model_execute for TiDAR (no GDN/mamba-align consumer) +1.9% n=10 |
 | `f4f94cb9d` | docs: handoff update for skip_uam |
 | `8e79bdc39` | perf: skip compute_causal_conv1d_metadata for CCA (dead-code Mamba1 conv kernel metadata) +1.0% n=10 |
+| `caef41083` | docs: handoff update for skip_conv1d_metadata |
+| `c1e8c9f9c` | perf: **force disable_padded_drafter_batch=True for TiDAR** — restores v0.15 fast path. +35.7% n=10. THE BIG ONE. |
 
 ## v0.15 vs v0.16 — things to know if you keep working on this
 
