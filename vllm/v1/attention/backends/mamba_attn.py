@@ -242,12 +242,27 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 num_computed_tokens[num_reqs - num_prefills : num_reqs] > 0
             )
 
-            nums_dict, batch_ptr, token_chunk_offset_ptr = (
-                compute_causal_conv1d_metadata(
-                    query_start_loc_p_cpu,
-                    device=common_attn_metadata.query_start_loc.device,
+            # TiDAR/CCA never reads nums_dict/batch_ptr/token_chunk_offset_ptr
+            # (those are Mamba1 causal_conv1d kernel metadata, CCA has its own
+            # conv path in cca.py). Skip the ~6.7ms/call function. The
+            # downstream meta still gets None values, which is safe.
+            # Opt-out: VLLM_TIDAR_NO_CONV1D_META_SKIP=1 to restore the call.
+            import os as _os_conv1d
+            if (_os_conv1d.environ.get(
+                    "VLLM_TIDAR_NO_CONV1D_META_SKIP", "0") == "1"
+                or not isinstance(
+                    self,
+                    __import__("vllm.v1.attention.backends.cca_attn",
+                               fromlist=["CCAAttentionMetadataBuilder"]
+                               ).CCAAttentionMetadataBuilder)):
+                nums_dict, batch_ptr, token_chunk_offset_ptr = (
+                    compute_causal_conv1d_metadata(
+                        query_start_loc_p_cpu,
+                        device=common_attn_metadata.query_start_loc.device,
+                    )
                 )
-            )
+            # else: nums_dict/batch_ptr/token_chunk_offset_ptr stay None (already
+            # initialized above) — CCA's metadata doesn't use them anyway.
 
             if self.vllm_config.cache_config.mamba_cache_mode == "all":
                 assert num_computed_tokens is not None
