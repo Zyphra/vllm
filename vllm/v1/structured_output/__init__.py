@@ -46,8 +46,7 @@ class StructuredOutputManager:
         # happen at different times on different TP ranks,
         # breaking the determinism assumption that external_launcher relies on.
         self._use_async_grammar_compilation = (
-            vllm_config.parallel_config.distributed_executor_backend
-            != "external_launcher"
+            not vllm_config.parallel_config.is_external_executor
         )
 
         self._grammar_bitmask: torch.Tensor | None = None

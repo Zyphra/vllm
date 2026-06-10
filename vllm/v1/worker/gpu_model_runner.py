@@ -383,7 +383,7 @@ class GPUModelRunner(
         # TODO: Support overlapping mirco-batches
         # https://github.com/vllm-project/vllm/issues/18019
         self.broadcast_pp_output = (
-            self.parallel_config.distributed_executor_backend == "external_launcher"
+            self.parallel_config.is_external_executor
             and len(get_pp_group().ranks) > 1
         )
 
@@ -3721,8 +3721,7 @@ class GPUModelRunner(
 
             if not num_scheduled_tokens:
                 if (
-                    self.parallel_config.distributed_executor_backend
-                    == "external_launcher"
+                    self.parallel_config.is_external_executor
                     and self.parallel_config.data_parallel_size > 1
                 ):
                     # this is a corner case when both external launcher

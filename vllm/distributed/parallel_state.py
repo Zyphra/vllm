@@ -1202,7 +1202,7 @@ def init_distributed_environment(
     config = get_current_vllm_config_or_none()
     if (
         config is not None
-        and config.parallel_config.distributed_executor_backend != "external_launcher"
+        and not config.parallel_config.is_external_executor
         and (
             config.parallel_config.nnodes > 1
             or config.parallel_config.data_parallel_size > 1

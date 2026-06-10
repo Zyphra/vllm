@@ -117,6 +117,14 @@ class ToolParser:
         raise NotImplementedError(
             "AbstractToolParser.extract_tool_calls_streaming has not been implemented!"
         )
+    
+    @staticmethod
+    def parser_should_check_for_unstreamed_tool_arg_tokens() -> bool:
+        """
+        Whether serving should run its generic final-chunk recovery for argument
+        text that may have been parsed but not streamed yet.
+        """
+        return True
 
 
 class ToolParserManager:
