@@ -10,8 +10,9 @@ ROCm 7.2, torch 2.10. Docker image `jinzhao/vllm-tidar-amd:latest`
 
 - **TiDAR works on AMD and is fast.** Our single-forward (SF) path with the
   paged Triton kernel hits **803 tok/s** doing real spec decode (accept 5.6)
-  — faster than a colleague's AITER-FA-paged AR (~600) and TF (~380) on the
-  same workload.
+  — faster than the colleague's `ROCM_AITER_FA` AR (590, stock kernel) and
+  TF (376, his paged K+1 kernel), both measured single-GPU on the same
+  workload.
 - **The SF kernel is already at its AMD ceiling.** MI300X autotune tuning
   (2026-06-11) gave no win: occupancy knobs (`waves_per_eu`, `num_stages`)
   are parity; MFMA-math knobs (`matrix_instr_nonkdim`, `kpack`) regress
@@ -51,8 +52,8 @@ compare directly):
 | TF | Flex | 263 | 7.17 | |
 | AR (no spec) | Flex | 28.5 | – | 23× slower than AITER-FA — Flex pathological for AR at b=16 |
 | TF | AITER-FA | 71 | **1.25** | **broken** — K+1 mask, pos1+→0 |
-| *colleague AR* (ref) | AITER-FA paged | *~600* | – | his vllm-diffusion-dev fork |
-| *colleague TF* (ref) | AITER-FA paged | *~380* | – | his fork |
+| *colleague AR* | ROCM_AITER_FA (stock) | 590 | – | captured; measured single-GPU on his fork |
+| *colleague TF* | ROCM_AITER_FA + his paged K+1 kernel | 376 | 6.97 | eager; the paged kernel fixes K+1 accept |
 
 ### Reading
 
@@ -65,9 +66,12 @@ compare directly):
   (544) is for max accept only.
 - **Our SF beats the colleague's TF and AR** at his own config, on a slower
   attention backend — the SF paged Triton kernel is the AMD win.
-- **TF trails** (263 vs his 380): we're on FlexAttention; he wrote a
-  custom AITER-FA paged kernel (see below). The gap is the attention
-  backend, not TiDAR.
+- **TF trails** — our 263 (FLEX_ATTENTION, captured) vs his 376
+  (ROCM_AITER_FA + his custom `tidar_paged_multi_token_attention`
+  kernel, eager). The gap is the attention backend, not TiDAR. **AR**
+  has no K+1 layout, so both trees run it on stock ROCM_AITER_FA: ours
+  658, his 590 (both single-GPU). Both his numbers are per-GPU, not
+  DP=8 aggregate. See below.
 
 ## Verified against the aiter-pa-tidar-fix backend
 
@@ -76,24 +80,30 @@ adds a hand-written `tidar_paged_multi_token_attention` Triton kernel on the
 AITER-FA backend (see below). Ran its AR + TF at the same single-GPU config
 (ckpt iter_0012600, AIME25 30 prompts, n=4, T=0.5, mt=8192, b=16):
 
-| Config | backend | tok/s | accept | notes |
-|---|---|---:|---:|---|
-| **our SF `[0,4,7,11]`** | Flex + SF Triton paged, captured | **803** | 5.63 | throughput winner |
-| our AR | AITER-FA, captured | 658 | – | |
-| aiter-pa-tidar-fix AR | AITER-FA, captured | 590 | – | matches their ~600 |
-| **aiter-pa-tidar-fix TF** | AITER-FA paged, eager | 376 | **6.97** | their paged kernel **fixes K+1 accept** |
-| our TF | Flex, captured | 263 | 7.17 | |
-| our TF | stock AITER-FA | 71 | **1.25** | **broken** (no paged kernel) |
+| Config | vLLM attn backend | in-kernel path | mode | tok/s | accept |
+|---|---|---|---|---:|---:|
+| **our SF `[0,4,7,11]`** | FLEX_ATTENTION | our SF paged Triton kernel | captured | **803** | 5.63 |
+| our AR | ROCM_AITER_FA | stock paged decode | captured | 658 | – |
+| **aiter-pa-tidar-fix AR** | ROCM_AITER_FA | stock paged decode | captured | **590** | – |
+| **aiter-pa-tidar-fix TF** | ROCM_AITER_FA | his `tidar_paged_multi_token_attention` (K+1) | eager | **376** | **6.97** |
+| our TF | FLEX_ATTENTION | Flex K+1 mask | captured | 263 | 7.17 |
+| our TF | ROCM_AITER_FA | stock (no paged multi-token) | captured | 71 | **1.25** |
 
-Decisive point: the aiter-pa-tidar-fix paged kernel keeps TF acceptance
-healthy on AITER-FA (6.97, per-pos 0.50->0.43->0.38->0.37 decay) exactly
-where our tree's *stock* AITER-FA collapses (1.25). It also confirms their
-quoted ~600 AR / ~380 TF are **per-GPU** (we reproduced 590 AR single-GPU),
-not DP=8 aggregate. Our SF still wins on raw throughput; their kernel wins
-on a *correct fast TF*. Their TF was eager here — a torch-2.10
-"cudagraphs must be captured on a non-default stream" error blocks the
-captured path under our direct-LLM harness (their server harness avoids it);
-captured would push TF higher still.
+Both colleague rows use the **same `ROCM_AITER_FA` vLLM backend**; the
+only difference is the in-kernel path. AR has no K+1 spec layout, so it
+rides the stock paged-decode kernel (590 tok/s, captured). TF routes
+through his hand-written `tidar_paged_multi_token_attention` kernel
+(376 tok/s, eager, accept 6.97) — which is what keeps K+1 acceptance
+healthy where the *stock* ROCM_AITER_FA TF collapses to 1.25.
+
+His TF accept decays gently across positions (6.97 mean; per-pos
+0.50->0.43->0.38->0.37) — real multi-token acceptance, not a
+pos-0-only artifact. His quoted ~600 AR / ~380 TF are **per-GPU** (we
+reproduced 590 AR single-GPU), not DP=8 aggregate. Our SF still wins on
+raw throughput; his kernel wins on a *correct fast TF*. His TF ran eager
+here — a torch-2.10 "cudagraphs must be captured on a non-default
+stream" error blocks the captured path under our direct-LLM harness (his
+server harness avoids it); captured would push TF above 376.
 
 This is the concrete payoff of open-work item below: grafting their
 `tidar_paged_multi_token_attention` into our Flex TF path would give us a
