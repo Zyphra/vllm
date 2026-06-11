@@ -64,6 +64,36 @@ compare directly):
   custom AITER-FA paged kernel (see below). The gap is the attention
   backend, not TiDAR.
 
+## Verified against the aiter-pa-tidar-fix backend
+
+The `vllm-diffusion-dev` branch (image `zyphra/rocm-primus:aiter-pa-tidar-fix`)
+adds a hand-written `tidar_paged_multi_token_attention` Triton kernel on the
+AITER-FA backend (see below). Ran its AR + TF at the same single-GPU config
+(ckpt iter_0012600, AIME25 30 prompts, n=4, T=0.5, mt=8192, b=16):
+
+| Config | backend | tok/s | accept | notes |
+|---|---|---:|---:|---|
+| **our SF `[0,4,7,11]`** | Flex + SF Triton paged, captured | **803** | 5.63 | throughput winner |
+| our AR | AITER-FA, captured | 658 | – | |
+| aiter-pa-tidar-fix AR | AITER-FA, captured | 590 | – | matches their ~600 |
+| **aiter-pa-tidar-fix TF** | AITER-FA paged, eager | 376 | **6.97** | their paged kernel **fixes K+1 accept** |
+| our TF | Flex, captured | 263 | 7.17 | |
+| our TF | stock AITER-FA | 71 | **1.25** | **broken** (no paged kernel) |
+
+Decisive point: the aiter-pa-tidar-fix paged kernel keeps TF acceptance
+healthy on AITER-FA (6.97, per-pos 0.50->0.43->0.38->0.37 decay) exactly
+where our tree's *stock* AITER-FA collapses (1.25). It also confirms their
+quoted ~600 AR / ~380 TF are **per-GPU** (we reproduced 590 AR single-GPU),
+not DP=8 aggregate. Our SF still wins on raw throughput; their kernel wins
+on a *correct fast TF*. Their TF was eager here — a torch-2.10
+"cudagraphs must be captured on a non-default stream" error blocks the
+captured path under our direct-LLM harness (their server harness avoids it);
+captured would push TF higher still.
+
+This is the concrete payoff of open-work item below: grafting their
+`tidar_paged_multi_token_attention` into our Flex TF path would give us a
+fast *and correct* TF without adopting their whole branch.
+
 ## Cross-platform: same config on NVIDIA H100 (vp-dgx-2)
 
 Identical config (iter_0012600, AIME25 30 prompts chat-template, n=4,
