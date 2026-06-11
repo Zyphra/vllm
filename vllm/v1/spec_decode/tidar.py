@@ -1070,12 +1070,26 @@ class TiDARProposer(EagleProposer):
         # is configured. Allow FlexAttentionMetadata to flow through.
         from vllm.v1.attention.backends.flex_attention import (
             FlexAttentionMetadata)
-        if not isinstance(
-                attn_metadata, (FlashAttentionMetadata,
-                                FlexAttentionMetadata)):
+        _allowed = [FlashAttentionMetadata, FlexAttentionMetadata]
+        try:
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+            _allowed.append(TritonAttentionMetadata)
+        except ImportError:
+            pass
+        try:
+            from vllm.v1.attention.backends.rocm_aiter_fa import AiterFlashAttentionMetadata
+            _allowed.append(AiterFlashAttentionMetadata)
+        except ImportError:
+            pass
+        try:
+            from vllm.v1.attention.backends.rocm_attn import RocmAttentionMetadata
+            _allowed.append(RocmAttentionMetadata)
+        except ImportError:
+            pass
+        if not isinstance(attn_metadata, tuple(_allowed)):
             raise ValueError(
-                "TiDAR drafter requires flash_attn or FlexAttention "
-                f"backend; got {type(attn_metadata).__name__}.")
+                "TiDAR drafter: unsupported attention metadata "
+                f"{type(attn_metadata).__name__}.")
 
         per_layer_attn_metadata = {
             layer_name: attn_metadata

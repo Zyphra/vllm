@@ -432,13 +432,16 @@ torch._inductor.config.joint_graph_constant_folding = False
 # Pre-initialize SDPA pattern matcher at import time. Otherwise it
 # lazy-inits on first inductor compile, which can fire inside an active
 # cudagraph capture stream.
-try:
-    from torch._inductor.fx_passes.fuse_attention import _sfdp_init
-    _sfdp_init()
-    logger.info("env_override: SDPA pattern matcher pre-initialized "
-                "(no-op if already)")
-except Exception as _e:
-    logger.warning("env_override: _sfdp_init failed: %s", _e)
+if os.environ.get("VLLM_SKIP_SDPA_PREINIT", "0") != "1":
+    try:
+        from torch._inductor.fx_passes.fuse_attention import _sfdp_init
+        _sfdp_init()
+        logger.info("env_override: SDPA pattern matcher pre-initialized "
+                    "(no-op if already)")
+    except Exception as _e:
+        logger.warning("env_override: _sfdp_init failed: %s", _e)
+else:
+    logger.info("env_override: SDPA pre-init SKIPPED via VLLM_SKIP_SDPA_PREINIT=1")
 
 # Workaround for dynamo's RNG-state read during cudagraph capture.
 # torch._dynamo.convert_frame._fn calls torch.cuda.get_rng_state() to
