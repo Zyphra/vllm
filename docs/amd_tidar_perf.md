@@ -111,6 +111,8 @@ fast *and correct* TF without adopting their whole branch.
 
 ## Cross-platform: same config on NVIDIA H100 (vp-dgx-2)
 
+> Step-by-step repro for the TF+FA run below: [reproduce_nv_tf_fa.md](reproduce_nv_tf_fa.md).
+
 Identical config (iter_0012600, AIME25 30 prompts chat-template, n=4,
 T=0.5, mt=8192, b=16, captured). NVIDIA can run FLASH_ATTN; AMD cannot.
 
