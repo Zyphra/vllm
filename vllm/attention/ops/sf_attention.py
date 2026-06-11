@@ -609,6 +609,26 @@ def _sf_attention_fwd_kernel_compact(
 #   Phase 1 — prefix [0, prefix_lens[r]): read paged via block_table[r].
 #   Phase 2 — verify + props [0, total_per_req_q): read inline_kv.
 # -----------------------------------------------------------------------
+#
+# MI300X autotune note (measured 2026-06-11, smoediffusion iter_0012600,
+# SF[0,4,7,11] K+1, AIME25 30xn4 T=0.5 b=16 captured):
+#   * This CUDA-shaped list is ALSO the right list for AMD. On ROCm,
+#     Triton's backend picks sane defaults for the AMD-only knobs, and
+#     end-to-end SF throughput is NOT bound by this kernel (cudagraph
+#     capture already removes launch overhead: eager 497 -> captured
+#     ~750-800 tok/s; the residual is the MoE forward + spec-decode
+#     verify). So config tuning here is marginal by construction.
+#   * Adding waves_per_eu / num_stages=1 occupancy variants: PARITY
+#     (778 vs 744 tok/s, inside the ~5-8% run-to-run band; accept
+#     5.27 vs 5.06). No reliable win -> not worth the extra warmup.
+#   * DO NOT add matrix_instr_nonkdim or kpack here. They change the
+#     MFMA instruction + accumulation order, which perturbs the
+#     attention output. Because this output feeds the spec-decode
+#     VERIFIER, that shifts which drafts are accepted: measured
+#     accept 5.06 -> 4.68 and throughput 744 -> 693 (the tput loss
+#     tracked the accept loss 1:1 -- compute wasn't slower, drafts got
+#     worse). Verifier-feeding kernels must keep numerics fixed.
+# -----------------------------------------------------------------------
 
 @triton.autotune(
     configs=[

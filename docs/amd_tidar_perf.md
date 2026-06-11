@@ -12,6 +12,11 @@ ROCm 7.2, torch 2.10. Docker image `jinzhao/vllm-tidar-amd:latest`
   paged Triton kernel hits **803 tok/s** doing real spec decode (accept 5.6)
   — faster than a colleague's AITER-FA-paged AR (~600) and TF (~380) on the
   same workload.
+- **The SF kernel is already at its AMD ceiling.** MI300X autotune tuning
+  (2026-06-11) gave no win: occupancy knobs (`waves_per_eu`, `num_stages`)
+  are parity; MFMA-math knobs (`matrix_instr_nonkdim`, `kpack`) regress
+  acceptance (5.06→4.68) because they perturb the verifier-fed output.
+  Throughput is bound by the MoE + spec-decode-verify path, not this kernel.
 - **Only FlexAttention runs TiDAR correctly on our tree.** Every other AMD
   backend (AITER-FA, Triton, AITER-Unified) breaks TiDAR's K+1 spec layout
   — accept collapses to ~1.2 (pos-0 partially survives, pos-1+ → 0).
@@ -174,19 +179,39 @@ path — but wired into AITER-FA (TF layout) instead of Flex (SF layout).
 
 ## Is our SF Triton kernel optimized for AMD?
 
-No — it runs correctly and auto-adapts, but the tuning space is
-NVIDIA-shaped. `_sf_attention_fwd_kernel_paged` uses `@triton.autotune`
-over 10 configs keyed on `(verify_len, Kp1, P_props, num_heads, head_dim,
-block_size)`. Issues on MI300X:
-- `num_stages=2/3` is a CUDA software-pipelining concept; largely inert on
-  CDNA, so 3 of the 10 configs are effective duplicates.
-- `num_warps`/`BLOCK_Q`/`BLOCK_KV` were picked for H100 occupancy, not
-  MI300X (304 CUs, 64-lane wavefronts, different LDS/regfile). No AMD knobs
-  (`waves_per_eu`, `matrix_instr_nonkdim`).
+**Yes, effectively** — measured 2026-06-11. The CUDA-shaped autotune list
+is already the right list for MI300X, and AMD-specific knob tuning gives no
+reliable win because end-to-end SF throughput is not bound by this kernel.
 
-Autotune still picks the best available config, so the 803 tok/s is with
-this CUDA-shaped space — an MI300X-specific config list is **unexplored
-headroom** and a cheap, self-contained edit (just the `configs=[...]` list).
+Same-session A/B (smoediffusion iter_0012600, SF `[0,4,7,11]` K+1, AIME25
+30×n4 T=0.5 b=16, captured, single MI300X):
+
+| `_sf_attention_fwd_kernel_paged` autotune list | TOTAL tok/s | accept (true-mean) |
+|---|---:|---:|
+| original 10 CUDA-shaped configs | 744 | 5.06 |
+| + `waves_per_eu` / `num_stages=1` occupancy variants | 778 | 5.27 |
+| + `matrix_instr_nonkdim=16` + `kpack=2` (MFMA-math knobs) | **693** | **4.68** |
+
+- **Occupancy tuning is parity.** `waves_per_eu` + `num_stages=1` variants
+  land at 778 vs 744 — inside the ~5-8% run-to-run band (the *same
+  unchanged* kernel measured 744 this session and 803 in a prior one;
+  generation isn't bit-deterministic at T=0.5, token totals swing
+  320k–383k). No reliable gain, so the list is kept unchanged (avoids the
+  extra autotune warmup of a bigger config list for nothing).
+- **MFMA-math knobs actively hurt.** `matrix_instr_nonkdim` / `kpack`
+  change the MFMA instruction + accumulation order, perturbing the
+  attention output. Because that output feeds the spec-decode **verifier**,
+  the perturbation shifts which drafts are accepted: accept 5.06 → 4.68,
+  throughput 744 → 693. The throughput loss tracked the accept loss 1:1 —
+  the compute wasn't slower, the *drafts got worse*. These knobs are now
+  documented as forbidden in a guardrail comment above the autotune block.
+  General rule: verifier-feeding kernels must keep numerics fixed.
+- **Why it's marginal:** cudagraph capture already removes launch overhead
+  (eager 497 → captured ~750–800). The residual is dominated by the MoE
+  forward + spec-decode verify machinery, not the SF attention kernel, so
+  tuning this one kernel's autotune was always going to be in the noise.
+  Real SF headroom (if any) is algorithmic (the 2-phase paged loop) or in
+  the MoE path — not in these knobs.
 
 ## Runbook
 
@@ -231,8 +256,10 @@ Gotchas (each cost real debugging time):
 
 1. **Full SF proposal-level sweep** — P=4 `[0,4,7,11]` (803) beat both
    denser and sparser; map the optimum properly.
-2. **MI300X-tune the SF Triton kernel autotune configs** — cheap edit,
-   unexplored headroom.
+2. ~~MI300X-tune the SF Triton kernel autotune configs~~ — **DONE
+   (2026-06-11), no win.** Occupancy knobs are parity; MFMA-math knobs
+   regress acceptance. See "Is our SF Triton kernel optimized for AMD?"
+   above. Throughput isn't bound by this kernel.
 3. **Port the colleague's `tidar_paged_multi_token_attention` kernel** into
    our Flex TF path (self-contained ~150-line graft) to fix TF, OR adopt
    his AITER-FA branch and graft our SF kernel onto it.
