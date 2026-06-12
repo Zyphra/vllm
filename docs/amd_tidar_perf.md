@@ -266,6 +266,8 @@ Gotchas (each cost real debugging time):
 
 ## Open work (throughput)
 
+> Multi-GPU (DP / EP / TP+EP) status for SF is written up separately: [amd_multigpu_dp_ep.md](amd_multigpu_dp_ep.md) — all in-engine multi-GPU modes are currently blocked (captured-collective watchdog bug); use independent single-GPU replicas.
+
 1. **Full SF proposal-level sweep** — P=4 `[0,4,7,11]` (803) beat both
    denser and sparser; map the optimum properly.
 2. ~~MI300X-tune the SF Triton kernel autotune configs~~ — **DONE
