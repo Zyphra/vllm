@@ -1,4 +1,4 @@
-# Reproduce: TiDAR TF + FlashAttention on NVIDIA H100 (≈1827 tok/s)
+# Reproduce: TiDAR TF + FlashAttention on NVIDIA H100 (≈1.8–1.9k tok/s)
 
 Step-by-step to reproduce the headline **two-forward (TF) TiDAR on the
 `FLASH_ATTN` backend** number on a single NVIDIA H100. This is the fast
@@ -6,15 +6,24 @@ NVIDIA path that AMD/ROCm cannot run today (see [the perf
 report](amd_tidar_perf.md) — ROCm's `flash_attn` is the FA2 API; vLLM's
 backend needs the FA3-fork `vllm_flash_attn`).
 
-Verified on `dgxh100-002` (vp-dgx-2), run on 2026-06-11.
+Verified on `dgxh100-002` (vp-dgx-2) on 2026-06-11 with **two repos that
+share the same TiDAR code**, so either reproduces:
+
+- **Zyphra/vllm-smoe-amd** `jinzhao/tidar_v016` — **1906 tok/s**, built from
+  source on the H100. This is the **single source of truth** (same repo used
+  for AMD), verified to build + run TF+FA on CUDA. **Recommended.**
+- **Zyphra/Zvllm** `jinzhao/tidar` — **1827 tok/s** (the original run,
+  `v0.16.1.dev37+gb106800a0`).
 
 ## Result you should get
 
 ```
-TOTAL: 386915 tokens / 211.82s = 1826.6 tok/s across 120 seqs
+TOTAL: 357605 tokens / 187.60s = 1906.2 tok/s across 120 seqs   # vllm-smoe-amd tidar_v016
+TOTAL: 386915 tokens / 211.82s = 1826.6 tok/s across 120 seqs   # Zvllm jinzhao/tidar
 ```
 
-- **≈1827 tok/s**, spec-decode **mean acceptance ≈ 6.99**.
+- **≈1.8–1.9k tok/s** (the two builds differ only by run-to-run variance),
+  spec-decode **mean acceptance ≈ 6.7–7.0**.
 - AR baseline on the same box/bench (set `MODE=ar`): **≈1011 tok/s** — TF
   beats AR ~1.8× because FlashAttention makes the 2-forward verify cheap
   while acceptance stays ~7.
@@ -30,32 +39,37 @@ Initialized TiDAR self-speculation with a two-forward FlashAttention draft pass.
 
 - **1× H100 80GB**, single GPU — `tensor_parallel_size=1,
   data_parallel_size=1`.
-- vLLM: **Zyphra/Zvllm**, branch **`jinzhao/tidar`** (TiDAR
-  self-speculation), built **with `vllm_flash_attn`** (the FA3 fork — this
-  is what provides the `FLASH_ATTN` backend). Logged run was vLLM
-  `v0.16.1.dev37+gb106800a0`.
 - ckpt: `/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012600`
   (HF-converted smoediffusion 128k / 64-node, iter 12600).
 - prompts: `aime25_zpo_texts.json` — a JSON list of 30 AIME25 questions,
   **chat-templated** (already wrapped in the model's chat template).
 
-### On vp-dgx-2 the env is already built
-
-```
-/data/home/jinzhao/workspace/tidar/.venv          # venv (python3.10)
-/data/home/jinzhao/workspace/tidar/Zvllm-sf-fixed  # vLLM editable source
-/data/home/jinzhao/workspace/tidar/bench_match_sy.py
-/data/home/jinzhao/workspace/tidar/aime25_zpo_texts.json
-```
-
-### From scratch on a fresh H100 box
+### Build the single repo (vllm-smoe-amd) on CUDA — verified
 
 ```bash
-git clone git@github.com:Zyphra/Zvllm.git && cd Zvllm
-git checkout jinzhao/tidar
-uv venv --python 3.10 && source .venv/bin/activate
-uv pip install -e .            # builds vllm_flash_attn (FA3 fork) for the FLASH_ATTN backend
+git clone --branch jinzhao/tidar_v016 git@github.com:Zyphra/vllm-smoe-amd.git
+cd vllm-smoe-amd
+python3.10 -m venv .venv && source .venv/bin/activate
+pip install -U pip "setuptools>=77,<81" setuptools-scm wheel ninja cmake packaging jinja2 grpcio-tools==1.78.0
+pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128   # fork build-system pins torch 2.9.1
+# from-source build (~30-40 min, sm_90). VLLM_USE_PRECOMPILED=0 is REQUIRED:
+# the fork's custom SMoE CUDA kernels are not in any upstream precompiled wheel.
+CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST="9.0" VLLM_USE_PRECOMPILED=0 MAX_JOBS=64 \
+  pip install --no-build-isolation -e .
 # place bench_match_sy.py + aime25_zpo_texts.json + the ckpt, then launch (below)
+```
+
+`setup.py` auto-detects CUDA (`torch.version.cuda`), so the same fork that
+targets MI300X builds CUDA kernels + `vllm_flash_attn` on an H100. No
+ROCm-only ops block the SMoE model on CUDA.
+
+### Already-built Zvllm env on vp-dgx-2 (the original 1827 run)
+
+```
+/data/home/jinzhao/workspace/tidar/.venv           # venv (python3.10)
+/data/home/jinzhao/workspace/tidar/Zvllm-sf-fixed   # Zvllm editable source (jinzhao/tidar lineage)
+/data/home/jinzhao/workspace/tidar/bench_match_sy.py
+/data/home/jinzhao/workspace/tidar/aime25_zpo_texts.json
 ```
 
 ## Bench harness — `bench_match_sy.py`
@@ -106,29 +120,25 @@ The bench hardcodes the measured config: `n=4`, `temperature=0.5`,
 ## Launch (the TF + FA combination)
 
 ```bash
-cd /data/home/jinzhao/workspace/tidar
 VLLM_TIDAR_TWO_FORWARD=1 \      # TF mode  (unset / 0 = single-forward)
 ATTN_BACKEND=FLASH_ATTN \      # the NVIDIA-only fast backend
 MODE=tidar \
 CKPT=/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012600 \
-TEXTS=/data/home/jinzhao/workspace/tidar/aime25_zpo_texts.json \
+TEXTS=/path/to/aime25_zpo_texts.json \
 NPROMPTS=30 CUDA_VISIBLE_DEVICES=0 \
-.venv/bin/python -u bench_match_sy.py 2>&1 | tee nv_tf_fa.log
+python -u bench_match_sy.py 2>&1 | tee nv_tf_fa.log
 ```
 
 The two switches that define this run:
 
 | env | value | meaning |
 |---|---|---|
-| `VLLM_TIDAR_TWO_FORWARD` | `1` | two-forward TiDAR (the 1827 path). Omit/0 → single-forward. |
+| `VLLM_TIDAR_TWO_FORWARD` | `1` | two-forward TiDAR (the 1827/1906 path). Omit/0 → single-forward. |
 | `ATTN_BACKEND` | `FLASH_ATTN` | FA3-fork backend. `FLEX_ATTENTION` on the same box is far slower. |
 
 ## Caveats
 
-- The vp-dgx-2 `Zvllm-sf-fixed` checkout is currently on branch
-  `jinzhao/tidar_sf_tfna0`, not the `jinzhao/tidar` @ `gb106800a0` that
-  produced the logged 1827. TF+FA is stable across these TiDAR branches,
-  but for a bit-exact match `git -C Zvllm-sf-fixed checkout jinzhao/tidar`
-  first (re-run `uv pip install -e .` if the build complains).
-- This is single-GPU. The colleague's quoted NVIDIA throughput is per-GPU,
-  not a DP=8 aggregate.
+- The vllm-smoe-amd CUDA build is **from source** (~30-40 min on an H100,
+  needs `nvcc`); `VLLM_USE_PRECOMPILED=0` is mandatory because the fork's
+  custom SMoE CUDA kernels aren't in any upstream precompiled wheel.
+- Single-GPU number. Per-GPU, not a DP=8 aggregate.
