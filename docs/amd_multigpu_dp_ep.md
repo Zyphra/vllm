@@ -17,7 +17,8 @@ replicas** behind a load balancer.
 |---|---|
 | **Single GPU** (DP=1), captured | ✅ **Works** — 803 tok/s b=16 (148 b=1), accept ~5.6 |
 | `--data-parallel-size 8` (with **or without** `--enable-expert-parallel`), captured | ❌ Crash at cudagraph capture — RCCL watchdog on the captured MoE all-to-all |
-| `--data-parallel-size 8 --enable-expert-parallel`, eager | ❌ Inits + serves a single request, then deadlocks under concurrent load |
+| `--data-parallel-size 8` (no EP), **eager** | ✅ **Works under load** — no deadlock; ~1187 tok/s aggregate (eager, thin batch). Integrated endpoint. |
+| `--data-parallel-size 8 --enable-expert-parallel`, eager | ❌ Serves a single request, deadlocks under load (EP all-to-all desync — EP-specific) |
 | `--tensor-parallel-size 8 --enable-expert-parallel` ("EP-alone"), captured | ❌ Crash even earlier — TiDAR scratch-block init-ordering bug under the TP executor; watchdog bug behind it; CCA doesn't split under TP anyway |
 
 The shared, deep blocker is a **torch-ROCm `ProcessGroupNCCL` bug**: it
