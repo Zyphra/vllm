@@ -420,7 +420,14 @@ def build_single_forward_inputs(
     slot_mapping = torch.cat([verify_slot, prop_slot], dim=1)  # [B, total]
 
     # Flatten to 1-D as vLLM's runner expects.
-    return (input_ids.view(-1), positions.view(-1).to(pos_dtype),
+    # Return CLAMPED positions: tokens whose RoPE position would land
+    # past max_model_len (max_position_embeddings) are PAD-masked in
+    # slot_mapping above, but their position value must also be clamped
+    # or the rotary embedding indexes its position buffer out of bounds
+    # ("index out of bound < max_position_embeddings") near the context
+    # limit. Overflow tokens are PAD-masked, so clamping their position
+    # to 0 is harmless.
+    return (input_ids.view(-1), clamped_pos.view(-1).to(pos_dtype),
             slot_mapping.view(-1))
 
 
