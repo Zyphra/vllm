@@ -9,10 +9,29 @@ from dataclasses import dataclass
 import httpx
 import openai
 
-from rsa import extract, prompts
+from rsa import extract, prompts, verify
 from rsa.config import RSAParams
 
 logger = logging.getLogger("rsa")
+
+
+def advance_to_boundary(tail: str, max_skip_fraction: float = 0.1) -> str:
+    """Advance a sliced tail's start to the next semantic boundary.
+
+    A fixed token cut can land mid-sentence or mid-derivation, handing the
+    next round a severed thought it wastes tokens repairing. Look for a
+    paragraph break (then a line break) within the leading fraction of the
+    tail and start there instead; give up and keep the raw cut if none is
+    close enough.
+    """
+    window = max(int(len(tail) * max_skip_fraction), 1)
+    cut = tail.find("\n\n", 0, window)
+    if cut != -1:
+        return tail[cut + 2 :].lstrip("\n")
+    cut = tail.find("\n", 0, window)
+    if cut != -1:
+        return tail[cut + 1 :]
+    return tail
 
 
 class RSAError(Exception):
@@ -62,6 +81,7 @@ class BackendClient:
         base_url: str,
         api_key: str = "EMPTY",
         timeout: float = 1800.0,
+        tokenizer: str | None = None,
     ):
         self.base_url = base_url
         root = base_url.rstrip("/").removesuffix("/v1")
@@ -70,6 +90,9 @@ class BackendClient:
         )
         self.http = httpx.AsyncClient(base_url=root, timeout=60.0)
         self._tokenize_broken = False
+        self._tokenizer_name = tokenizer
+        self._tokenizer = None  # None = not tried, False = unavailable
+        self._tokenizer_lock = asyncio.Lock()
 
     async def close(self) -> None:
         await self.openai.close()
@@ -140,20 +163,70 @@ class BackendClient:
                 logger.error("rollout failed with status %s: %s", e.status_code, e)
                 return None
 
-    async def tail(self, text: str, tail_tokens: int, model: str) -> str:
-        """Truncate *text* to its final *tail_tokens* tokens (token-exact).
+    async def _get_tokenizer(self, model: str):
+        """Lazily load a local HF tokenizer; False when unavailable."""
+        if self._tokenizer is not None:
+            return self._tokenizer
+        async with self._tokenizer_lock:
+            if self._tokenizer is not None:
+                return self._tokenizer
+            name = self._tokenizer_name
+            try:
+                if name is None:
+                    # vLLM reports the underlying HF repo in the model
+                    # card's "root" field (the id may be an alias like
+                    # "model" when --served-model-name is used).
+                    r = await self.http.get("/v1/models")
+                    r.raise_for_status()
+                    entry = r.json()["data"][0]
+                    name = entry.get("root") or entry["id"]
 
-        Uses the backend's /tokenize and /detokenize endpoints; falls back
-        to a character approximation if they are unavailable.
+                def load():
+                    from transformers import AutoTokenizer
+
+                    return AutoTokenizer.from_pretrained(name)
+
+                self._tokenizer = await asyncio.to_thread(load)
+                logger.info("loaded local tokenizer %r", name)
+            except Exception as e:
+                self._tokenizer = False
+                logger.warning(
+                    "local tokenizer unavailable (%s); "
+                    "tails will use the backend /tokenize endpoint",
+                    e,
+                )
+        return self._tokenizer
+
+    async def tail(self, text: str, tail_tokens: int, model: str) -> str:
+        """Truncate *text* to its final *tail_tokens* tokens.
+
+        Token-exact via a local HF tokenizer when available, else the
+        backend's /tokenize + /detokenize endpoints, else a character
+        approximation. All paths advance the cut to a semantic boundary
+        (paragraph/line break) so aggregation prompts never start
+        mid-thought.
         """
         if tail_tokens <= 0:
             return text
-        # A tail of N tokens can't be shorter than N characters... but it
-        # can't be LONGER than ~N*"max chars per token". Conservatively, any
-        # text under tail_tokens characters cannot exceed tail_tokens tokens.
+        # Any text of <= tail_tokens characters cannot exceed
+        # tail_tokens tokens; skip tokenization entirely.
         if len(text) <= tail_tokens:
             return text
-        if not self._tokenize_broken:
+
+        cut = None
+        tokenizer = await self._get_tokenizer(model)
+        if tokenizer:
+
+            def token_slice():
+                ids = tokenizer.encode(text, add_special_tokens=False)
+                if len(ids) <= tail_tokens:
+                    return None
+                return tokenizer.decode(ids[-tail_tokens:], skip_special_tokens=False)
+
+            cut = await asyncio.to_thread(token_slice)
+            if cut is None:
+                return text
+        elif not self._tokenize_broken:
             try:
                 r = await self.http.post(
                     "/tokenize",
@@ -172,7 +245,7 @@ class BackendClient:
                     json={"model": model, "tokens": ids[-tail_tokens:]},
                 )
                 r.raise_for_status()
-                return prompts.TRUNCATION_MARKER + r.json()["prompt"]
+                cut = r.json()["prompt"]
             except (httpx.HTTPError, KeyError) as e:
                 self._tokenize_broken = True
                 logger.warning(
@@ -180,15 +253,13 @@ class BackendClient:
                     "falling back to char-approximate tails",
                     e,
                 )
-        # Char fallback: ~4 chars/token, cut at next newline for cleanliness.
-        approx = tail_tokens * 4
-        if len(text) <= approx:
-            return text
-        cut = text[-approx:]
-        nl = cut.find("\n")
-        if 0 <= nl < len(cut) // 4:
-            cut = cut[nl + 1 :]
-        return prompts.TRUNCATION_MARKER + cut
+        if cut is None:
+            # Char fallback: ~4 chars/token.
+            approx = tail_tokens * 4
+            if len(text) <= approx:
+                return text
+            cut = text[-approx:]
+        return prompts.TRUNCATION_MARKER + advance_to_boundary(cut)
 
 
 async def _run_round(
@@ -243,6 +314,32 @@ async def _tails_for(
     return {id(c): t for c, t in zip(population, tails)}
 
 
+async def _verified_pool(
+    population: list[Candidate], params: RSAParams
+) -> list[Candidate]:
+    """The aggregation sampling pool, minus verifiably broken candidates.
+
+    Verdicts run concurrently in threads (code verification shells out and
+    can block for seconds per candidate).
+    """
+    if params.verifier == "off":
+        return population
+    verdicts = await asyncio.gather(
+        *(
+            asyncio.to_thread(verify.verdict, c.text, c.content, params.verifier)
+            for c in population
+        )
+    )
+    pool = verify.filter_pool(population, list(verdicts), params.k)
+    if len(pool) < len(population):
+        logger.info(
+            "verifier excluded %d/%d candidates from sampling",
+            len(population) - len(pool),
+            len(population),
+        )
+    return pool
+
+
 async def run_rsa(
     client: BackendClient,
     params: RSAParams,
@@ -274,10 +371,11 @@ async def run_rsa(
     rounds = [population]
 
     for t in range(1, params.t):
-        tails = await _tails_for(client, population, params, model)
+        pool = await _verified_pool(population, params)
+        tails = await _tails_for(client, pool, params, model)
         message_sets = []
         for _ in range(params.n):
-            chosen = rng.sample(population, k=min(params.k, len(population)))
+            chosen = rng.sample(pool, k=min(params.k, len(pool)))
             message_sets.append(
                 prompts.build_aggregation_messages(
                     query, [tails[id(c)] for c in chosen], request_system
@@ -294,8 +392,9 @@ async def run_rsa(
         )
         rounds.append(population)
 
+    final_pool = await _verified_pool(population, params)
     final_text, method, vote_detail = await _select(
-        client, params, population, query, request_system, model, rng, usage
+        client, params, final_pool, query, request_system, model, rng, usage
     )
     logger.info(
         "selection=%s, total: %d requests, %d prompt + %d completion tokens",

@@ -23,12 +23,17 @@ async def main() -> None:
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("-q", "--question", required=True)
     parser.add_argument("--system", default=None, help="optional system prompt")
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help="HF tokenizer name/path for local tails (default: auto-resolve)",
+    )
     add_rsa_args(parser)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
     params = params_from_args(args)
-    client = BackendClient(args.backend, api_key=args.api_key)
+    client = BackendClient(args.backend, api_key=args.api_key, tokenizer=args.tokenizer)
     try:
         model = args.model or await client.default_model()
         messages = []

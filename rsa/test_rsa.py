@@ -11,9 +11,9 @@ import random
 import httpx
 from fastapi.testclient import TestClient
 
-from rsa import extract, prompts
+from rsa import extract, prompts, verify
 from rsa.config import RSAParams, ServerConfig, merge_params
-from rsa.core import Candidate, run_rsa
+from rsa.core import BackendClient, Candidate, advance_to_boundary, run_rsa
 from rsa.server import create_app
 
 # ---------------------------------------------------------------- extract
@@ -222,6 +222,96 @@ def test_system_message_survives_aggregation():
     agg_system = fake.calls[-1][0]
     assert agg_system["role"] == "system"
     assert agg_system["content"].startswith("Answer in French.")
+
+
+# ------------------------------------------------------- tail boundaries
+
+
+def test_advance_to_boundary_paragraph():
+    tail = "broken half-thought\nstill broken\n\nA clean paragraph." + "x" * 500
+    assert advance_to_boundary(tail).startswith("A clean paragraph.")
+
+
+def test_advance_to_boundary_line_fallback():
+    tail = "broken half-thought\nA clean line. " + "x" * 500
+    assert advance_to_boundary(tail).startswith("A clean line.")
+
+
+def test_advance_to_boundary_no_boundary_keeps_cut():
+    tail = "y" * 1000
+    assert advance_to_boundary(tail) == tail
+
+
+def test_advance_to_boundary_ignores_distant_breaks():
+    # The only break is far past the look-back window; keep the raw cut.
+    tail = "x" * 900 + "\n\n" + "y" * 100
+    assert advance_to_boundary(tail) == tail
+
+
+def test_local_tokenizer_tail_slices_and_cuts_at_boundary():
+    class StubTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            return list(range(len(text)))  # 1 token per char
+
+        def decode(self, ids, skip_special_tokens=False):
+            return "junk\n\n" + "z" * (len(ids) - 6)
+
+    client = BackendClient("http://localhost:9/v1")  # never contacted
+    client._tokenizer = StubTokenizer()
+    long_text = "a" * 1000
+
+    tail = asyncio.run(client.tail(long_text, 100, "model"))
+
+    assert tail.startswith(prompts.TRUNCATION_MARKER)
+    # Boundary cut dropped the leading "junk\n\n".
+    assert tail.removeprefix(prompts.TRUNCATION_MARKER).startswith("z")
+    short = asyncio.run(client.tail("b" * 50, 100, "model"))
+    assert short == "b" * 50
+    asyncio.run(client.close())
+
+
+# ------------------------------------------------------------- verifier
+
+
+def test_verifier_math_verdicts():
+    assert verify.verdict("", r"answer \boxed{42}", "math") == "pass"
+    assert verify.verdict("", r"answer \boxed{\frac{1}{2}}", "math") == "pass"
+    assert verify.verdict("", r"answer \boxed{((1 +* 2}", "math") == "fail"
+    assert verify.verdict("", "no boxed answer", "math") == "unknown"
+    assert verify.verdict("", r"\boxed{42}", "off") == "unknown"
+
+
+def test_verifier_code_verdicts():
+    good = "```python\nprint(17 * 23)\n```\nthen \\boxed{391}"
+    bad = "```python\nraise ValueError('broken')\n```"
+    assert verify.verdict("", good, "code") == "pass"
+    assert verify.verdict("", bad, "code") == "fail"
+    assert verify.verdict("", "prose only", "code") == "unknown"
+
+
+def test_verifier_pool_filter_and_fallback():
+    cands = ["a", "b", "c", "d"]
+    pool = verify.filter_pool(cands, ["pass", "fail", "unknown", "pass"], k=2)
+    assert pool == ["a", "c", "d"]
+    # Filtering below k falls back to the full population.
+    pool = verify.filter_pool(cands, ["fail", "fail", "fail", "pass"], k=2)
+    assert pool == cands
+
+
+def test_verifier_excludes_broken_candidates_from_aggregation():
+    # 3 candidates; one has an unparseable boxed answer. With the math
+    # verifier on, aggregation sets must never include the broken one.
+    n, k, t = 3, 2, 2
+    round0 = [r"good \boxed{7}", r"broken \boxed{((1 +* 2}", r"good \boxed{7}"]
+    round1 = [rf"agg {i} \boxed{{7}}" for i in range(n)]
+    fake = FakeBackend(round0 + round1)
+    params = RSAParams(n=n, k=k, t=t, tail_tokens=0, max_tokens=100, verifier="math")
+    messages = [{"role": "user", "content": "q? \\boxed{}"}]
+
+    asyncio.run(run_rsa(fake, params, messages, "model", rng=random.Random(0)))
+
+    for call in fake.calls[n : n * 2]:
+        assert "broken" not in call[-1]["content"]
 
 
 # ---------------------------------------------------------------- server

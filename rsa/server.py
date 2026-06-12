@@ -38,6 +38,7 @@ def create_app(config: ServerConfig) -> FastAPI:
             config.backend_base_url,
             api_key=config.api_key,
             timeout=config.defaults.request_timeout,
+            tokenizer=config.tokenizer,
         )
         app.state.passthrough = httpx.AsyncClient(
             base_url=config.backend_root, timeout=config.defaults.request_timeout
@@ -255,6 +256,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8100)
     parser.add_argument("--api-key", default="EMPTY")
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--tokenizer",
+        default=None,
+        help=(
+            "HF tokenizer name/path for local token-exact tails "
+            "(default: resolve the backend model's HF repo automatically)"
+        ),
+    )
     add_rsa_args(parser)
     args = parser.parse_args()
 
@@ -267,6 +276,7 @@ def main() -> None:
         port=args.port,
         api_key=args.api_key,
         log_level=args.log_level,
+        tokenizer=args.tokenizer,
         defaults=params_from_args(args),
     )
     app = create_app(config)

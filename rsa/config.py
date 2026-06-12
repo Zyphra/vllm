@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 Selection = Literal["auto", "majority", "final_agg", "sample"]
+Verifier = Literal["off", "math", "code", "auto"]
 
 
 class RSAParams(BaseModel):
@@ -29,6 +30,14 @@ class RSAParams(BaseModel):
     )
     temperature: float = Field(default=0.8, ge=0.0)
     selection: Selection = "auto"
+    verifier: Verifier = Field(
+        default="off",
+        description=(
+            "filter provably-broken candidates from aggregation sampling: "
+            "'math' checks boxed answers parse, 'code' executes python "
+            "blocks (runs model code on the host!), 'auto' does both"
+        ),
+    )
     max_concurrency: int = Field(default=16, ge=1)
     request_timeout: float = Field(default=1800.0, gt=0)
     max_retries: int = Field(default=1, ge=0)
@@ -60,6 +69,7 @@ class ServerConfig:
     port: int = 8100
     api_key: str = "EMPTY"
     log_level: str = "info"
+    tokenizer: str | None = None  # HF name/path; None = resolve from backend
     defaults: RSAParams = field(default_factory=RSAParams)
 
     @property
@@ -92,6 +102,15 @@ def add_rsa_args(parser: argparse.ArgumentParser) -> None:
         choices=["auto", "majority", "final_agg", "sample"],
         default=d.selection,
     )
+    g.add_argument(
+        "--rsa-verifier",
+        choices=["off", "math", "code", "auto"],
+        default=d.verifier,
+        help=(
+            "filter provably-broken candidates from aggregation sampling; "
+            "'code'/'auto' execute model-generated python on this host"
+        ),
+    )
     g.add_argument("--rsa-max-concurrency", type=int, default=d.max_concurrency)
     g.add_argument("--rsa-request-timeout", type=float, default=d.request_timeout)
     g.add_argument("--rsa-max-retries", type=int, default=d.max_retries)
@@ -106,6 +125,7 @@ def params_from_args(args: argparse.Namespace) -> RSAParams:
         max_tokens=args.rsa_max_tokens,
         temperature=args.rsa_temperature,
         selection=args.rsa_selection,
+        verifier=args.rsa_verifier,
         max_concurrency=args.rsa_max_concurrency,
         request_timeout=args.rsa_request_timeout,
         max_retries=args.rsa_max_retries,

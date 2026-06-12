@@ -41,6 +41,8 @@ From the repo root (the proxy needs only `openai`, `fastapi`, `uvicorn`,
 ```bash
 uv venv --python 3.12
 uv pip install -p .venv/bin/python openai fastapi uvicorn httpx pydantic pytest
+# Optional but recommended: local token-exact tails + math verifier
+uv pip install -p .venv/bin/python transformers sympy
 ```
 
 ## Running
@@ -106,7 +108,42 @@ Request-level `temperature` and `max_tokens` override the rollout defaults.
 | `--rsa-max-tokens` | 40000 | β — per-rollout completion budget |
 | `--rsa-temperature` | 0.8 | rollout sampling temperature |
 | `--rsa-selection` | auto | `auto` / `majority` / `final_agg` / `sample` |
+| `--rsa-verifier` | off | `off` / `math` / `code` / `auto` — see below |
 | `--rsa-max-concurrency` | 16 | concurrent backend requests |
+| `--tokenizer` | auto | HF tokenizer name/path for local tails (resolved from the backend's model `root` by default) |
+
+### Tail truncation
+
+Tails are token-exact and never start mid-thought:
+
+1. **Local HF tokenizer** (preferred): loaded lazily via `AutoTokenizer`,
+   auto-resolved from the backend's reported HF repo (ZAYA1 ships a standard
+   `GemmaTokenizerFast`, no remote code). Slicing happens in-process.
+2. **Backend `/tokenize` + `/detokenize`** if `transformers` isn't installed.
+3. **Character approximation** (~4 chars/token) as a last resort.
+
+After slicing, the cut is advanced to the next paragraph (or line) boundary
+within the leading 10% of the tail — a "look-back cut" — so each aggregation
+prompt receives a complete, coherent block of reasoning instead of a severed
+sentence. Texts already shorter than τ characters skip tokenization entirely.
+
+### Verifier filter
+
+`--rsa-verifier` (or per-request `"rsa": {"verifier": "math"}`) filters
+**provably broken** candidates out of the aggregation sampling pool and the
+final vote. It never picks winners — RSA depends on population diversity
+(N ≫ K), so verification only excludes, and falls back to the full
+population whenever filtering would leave fewer than K candidates.
+
+- `math`: the candidate's `\boxed{}` answer must parse as a numeric/symbolic
+  expression (LaTeX `\frac`/`\sqrt` de-sugared, then SymPy). Heuristic —
+  exotic-but-valid notation can fail, hence the pool fallback.
+- `code`: the candidate's last ```` ```python ```` block must run cleanly in
+  a subprocess (isolated interpreter, CPU/memory/process rlimits, 5 s
+  timeout). **This executes model-generated code on the proxy host** — the
+  sandbox is best-effort, not a security boundary. Only enable it where
+  that's acceptable.
+- `auto`: both checks; a candidate fails if either applicable check fails.
 
 ### Context-length sizing
 
@@ -146,4 +183,7 @@ predicts aggregability, per the RSA paper).
 - RSA over tool-calling requests (passed through instead)
 - True token-by-token streaming (`stream: true` returns the final answer
   pseudo-streamed after aggregation, with SSE keep-alives during the wait)
-- Automated benchmark harness; sympy-grade answer equivalence
+- Automated benchmark harness
+- Verifying answer *correctness* (the verifier checks well-formedness and
+  executability, not ground truth); round-level trace ranking is omitted by
+  design — see "Verifier filter"
