@@ -170,6 +170,38 @@ Bypasses the proxy and prints per-round stats, the vote tally, and usage:
 .venv/bin/python -m pytest rsa/test_rsa.py -q   # mocked backend, no GPU
 ```
 
+## Comparison harness and results
+
+`rsa/compare.py` benchmarks RSA against two baselines from the *same* GPU
+time: the round-0 population is N independent samples (single-sample pass@1
+and self-consistency/majority-vote baselines), and the aggregated answer is
+RSA.
+
+```bash
+.venv/bin/python -m rsa.compare rsa/aime_mini.json \
+  --rsa-n 8 --rsa-k 3 --rsa-t 2 --rsa-tail-tokens 1536 \
+  --rsa-max-tokens 5000 --rsa-verifier math
+```
+
+Results on 5 AIME problems (ZAYA1-8B bf16, single RX 7900, dedicated;
+~165 tok/s aggregate at batch 8; full data in `results/`):
+
+| method | result |
+|---|---|
+| single sample (pass@1) | 27/40 (67.5%) |
+| self-consistency (vote over 8) | 5/5 |
+| RSA (N=8, K=3, T=2, τ=1536, β=5000) | 5/5 |
+| per-trace accuracy after one aggregation round | 33/40 (82.5%) |
+
+Takeaways: RSA never returned a wrong answer and the aggregation mechanism
+visibly works — on the hardest problem only 1/8 round-0 traces produced an
+answer, yet 6/8 post-aggregation traces converged on the correct one from a
+single good 1,536-token tail. On this difficulty band, however,
+self-consistency (`"rsa": {"t": 1}`) matched RSA's final answers at half
+the token cost; the aggregation round earns its budget on problems where
+round 0 yields zero (or majority-wrong) extractable answers. Cost per
+problem at these settings: ~75K completion tokens, ~9 minutes.
+
 ## AIME-style sanity check (manual)
 
 Run a handful of known-answer problems through the CLI and compare boxed
