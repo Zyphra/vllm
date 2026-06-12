@@ -116,9 +116,13 @@ proven 803-tok/s SF path) behind a round-robin load balancer →
    issued during HIP graph capture (detect HIP capture status). C++ change,
    needs a torch rebuild. Fixes the captured-collective crash for DP, EP,
    and TP. *This is the dominant blocker.*
-   - Alternative: PIECEWISE cudagraph with the all-to-all added to
-     `splitting_ops` so the collective runs outside captured regions
-     (vLLM-level; untested for SF).
+   - Alternative: PIECEWISE cudagraph **with the collective added to
+     `splitting_ops`** so it runs eager between captured pieces. NOTE:
+     PIECEWISE *alone* was tested and does NOT help — the all-to-all is not
+     a split boundary, so it still lands inside a captured piece and crashes
+     identically (`hipErrorCapturedEvent`). It only helps if the collective
+     op is registered as a splitting op (vLLM-level work; uncertain whether
+     the all-to-all is a splittable registered op; untested for SF).
 2. **TiDAR scratch-block ordering** under the multiproc executor (our repo):
    defer `_ensure_scratch_blocks` until after cache init. Needed for the TP
    path (only gets it past init; #1 still required for capture).
