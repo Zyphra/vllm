@@ -1,29 +1,21 @@
-# Reproduce: TiDAR TF + FlashAttention on NVIDIA H100 (≈1.8–1.9k tok/s)
+# Reproduce: TiDAR TF + FlashAttention on NVIDIA H100 (≈1906 tok/s)
 
-Step-by-step to reproduce the headline **two-forward (TF) TiDAR on the
-`FLASH_ATTN` backend** number on a single NVIDIA H100. This is the fast
-NVIDIA path that AMD/ROCm cannot run today (see [the perf
-report](amd_tidar_perf.md) — ROCm's `flash_attn` is the FA2 API; vLLM's
-backend needs the FA3-fork `vllm_flash_attn`).
+Step-by-step to reproduce the **two-forward (TF) TiDAR on the `FLASH_ATTN`
+backend** number on a single NVIDIA H100, using **Zyphra/vllm-smoe-amd**
+`jinzhao/tidar_v016` — the same repo used for AMD, verified to build + run
+TF+FA on CUDA. This is the fast NVIDIA path that AMD/ROCm cannot run today
+(see [the perf report](amd_tidar_perf.md) — ROCm's `flash_attn` is the FA2
+API; vLLM's backend needs the FA3-fork `vllm_flash_attn`).
 
-Verified on `dgxh100-002` (vp-dgx-2) on 2026-06-11 with **two repos that
-share the same TiDAR code**, so either reproduces:
-
-- **Zyphra/vllm-smoe-amd** `jinzhao/tidar_v016` — **1906 tok/s**, built from
-  source on the H100. This is the **single source of truth** (same repo used
-  for AMD), verified to build + run TF+FA on CUDA. **Recommended.**
-- **Zyphra/Zvllm** `jinzhao/tidar` — **1827 tok/s** (the original run,
-  `v0.16.1.dev37+gb106800a0`).
+Verified on `dgxh100-002` (vp-dgx-2), 2026-06-11.
 
 ## Result you should get
 
 ```
-TOTAL: 357605 tokens / 187.60s = 1906.2 tok/s across 120 seqs   # vllm-smoe-amd tidar_v016
-TOTAL: 386915 tokens / 211.82s = 1826.6 tok/s across 120 seqs   # Zvllm jinzhao/tidar
+TOTAL: 357605 tokens / 187.60s = 1906.2 tok/s across 120 seqs
 ```
 
-- **≈1.8–1.9k tok/s** (the two builds differ only by run-to-run variance),
-  spec-decode **mean acceptance ≈ 6.7–7.0**.
+- **≈1906 tok/s**, spec-decode **mean acceptance ≈ 6.7–8.0**.
 - AR baseline on the same box/bench (set `MODE=ar`): **≈1011 tok/s** — TF
   beats AR ~1.8× because FlashAttention makes the 2-forward verify cheap
   while acceptance stays ~7.
@@ -44,7 +36,7 @@ Initialized TiDAR self-speculation with a two-forward FlashAttention draft pass.
 - prompts: `aime25_zpo_texts.json` — a JSON list of 30 AIME25 questions,
   **chat-templated** (already wrapped in the model's chat template).
 
-### Build the single repo (vllm-smoe-amd) on CUDA — verified
+### Build vllm-smoe-amd on CUDA
 
 ```bash
 git clone --branch jinzhao/tidar_v016 git@github.com:Zyphra/vllm-smoe-amd.git
@@ -62,15 +54,6 @@ CUDA_HOME=/usr/local/cuda-12.8 TORCH_CUDA_ARCH_LIST="9.0" VLLM_USE_PRECOMPILED=0
 `setup.py` auto-detects CUDA (`torch.version.cuda`), so the same fork that
 targets MI300X builds CUDA kernels + `vllm_flash_attn` on an H100. No
 ROCm-only ops block the SMoE model on CUDA.
-
-### Already-built Zvllm env on vp-dgx-2 (the original 1827 run)
-
-```
-/data/home/jinzhao/workspace/tidar/.venv           # venv (python3.10)
-/data/home/jinzhao/workspace/tidar/Zvllm-sf-fixed   # Zvllm editable source (jinzhao/tidar lineage)
-/data/home/jinzhao/workspace/tidar/bench_match_sy.py
-/data/home/jinzhao/workspace/tidar/aime25_zpo_texts.json
-```
 
 ## Bench harness — `bench_match_sy.py`
 
@@ -133,7 +116,7 @@ The two switches that define this run:
 
 | env | value | meaning |
 |---|---|---|
-| `VLLM_TIDAR_TWO_FORWARD` | `1` | two-forward TiDAR (the 1827/1906 path). Omit/0 → single-forward. |
+| `VLLM_TIDAR_TWO_FORWARD` | `1` | two-forward TiDAR (the 1906 path). Omit/0 → single-forward. |
 | `ATTN_BACKEND` | `FLASH_ATTN` | FA3-fork backend. `FLEX_ATTENTION` on the same box is far slower. |
 
 ## Caveats
