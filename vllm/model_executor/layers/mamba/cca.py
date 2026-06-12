@@ -380,51 +380,75 @@ class CCA(MambaBase, CustomOp):
             assert state_indices_tensor_p is not None
             assert has_initial_states_p is not None
             assert query_start_loc_p is not None
-            # Prefill
+            # Prefill: run the causal conv over all requests in one batched
+            # call instead of a per-request Python loop (which also forced a
+            # GPU->CPU sync per request via the query_start_loc_p slicing).
+            # Each request occupies a contiguous segment
+            # [cached state (total_padding cols) | its tokens] in a flat conv
+            # input, so every valid output window stays inside its own segment
+            # and requests cannot contaminate each other.
             prefill_slice = slice(num_decodes, num_decodes + num_prefill_tokens)
+            tp_pad = self.total_padding
+            device = hs.device
+
+            req_idx = torch.arange(num_prefills, device=device)
+            seq_lens_p = query_start_loc_p[1:] - query_start_loc_p[:-1]
+            token_req = torch.repeat_interleave(
+                req_idx, seq_lens_p, output_size=num_prefill_tokens
+            )
+            token_flat = torch.arange(num_prefill_tokens, device=device)
+            # Token t of request i sits at qsl[i] + t + (i + 1) * tp_pad; its
+            # conv output window starts tp_pad columns earlier.
+            token_pos = token_flat + (token_req + 1) * tp_pad
+            out_pos = token_flat + token_req * tp_pad
+            seg_starts = query_start_loc_p[:-1] + req_idx * tp_pad
+            pad_offsets = torch.arange(tp_pad, device=device)
+
+            flat_len = num_prefill_tokens + num_prefills * tp_pad
+            flat_in = qk_packed0_p.new_empty((self.in_out_ch, flat_len))
+            flat_in[:, token_pos] = qk_packed0_p[:, 0, :].t()
+
+            init_states = conv_states[state_indices_tensor_p].to(flat_in.dtype)
+            init_states = torch.where(
+                has_initial_states_p.view(-1, 1, 1),
+                init_states,
+                init_states.new_zeros(()),
+            )
+            state_pos = (seg_starts.unsqueeze(1) + pad_offsets).reshape(-1)
+            flat_in[:, state_pos] = init_states.permute(1, 0, 2).reshape(
+                self.in_out_ch, -1
+            )
+
+            flat_out = self.conv_qk(flat_in.unsqueeze(0))[0]
+            qk_packed3[prefill_slice] = flat_out[:, out_pos].t().unsqueeze(1)
+
+            # New conv state: the last total_padding input columns of each
+            # segment (naturally falls back onto the old state when a chunk
+            # is shorter than the conv window).
+            new_state_pos = (
+                (query_start_loc_p[1:] + req_idx * tp_pad).unsqueeze(1) + pad_offsets
+            ).reshape(-1)
+            new_states = (
+                flat_in[:, new_state_pos]
+                .reshape(self.in_out_ch, num_prefills, tp_pad)
+                .permute(1, 0, 2)
+            )
+            conv_states[state_indices_tensor_p] = new_states.to(
+                device=conv_states.device, dtype=conv_states.dtype
+            )
+
+            # hs2 = previous-token hidden states: shift by one within each
+            # request; the first token takes the cached last hidden state of
+            # the previous chunk (or zero for a fresh request).
             hs2_prefill = hs2[prefill_slice]
-            qk_packed3_prefill = qk_packed3[prefill_slice]
-            for i in range(len(query_start_loc_p) - 1):
-                start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
-                hs2_cur = hs_p[start_i:end_i, :, :]  # [S_cur, B, H]
-                qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]  # [S_cur, B, H]
-                qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)  # [1, H, S_cur]
-
-                if has_initial_states_p[i]:
-                    hs2_cached = (
-                        prev_hs[state_indices_tensor_p[i]].unsqueeze(0).unsqueeze(0)
-                    )  # [1, 1, H]
-                    if hs2_cached.dtype != hs2_cur.dtype:
-                        hs2_cached = hs2_cached.to(hs2_cur.dtype)
-                    hs2_cur = torch.cat(
-                        [hs2_cached, hs2_cur[:-1]], dim=0
-                    )  # [S_cur, 1, H]
-                    qk_packed0_cached = conv_states[
-                        state_indices_tensor_p[i]
-                    ].unsqueeze(0)  # [1, H, total_padding]
-                    if qk_packed0_cached.dtype != qk_packed1_cur.dtype:
-                        qk_packed0_cached = qk_packed0_cached.to(qk_packed1_cur.dtype)
-                    qk_packed2_cur = torch.cat(
-                        [qk_packed0_cached, qk_packed1_cur], dim=-1
-                    )  # [1, H, S_cur + total_padding]
-                else:
-                    hs2_cur = F.pad(hs2_cur[:-1], pad=(0, 0, 0, 0, 1, 0))
-                    qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
-
-                hs2_prefill[start_i:end_i] = hs2_cur
-
-                conv_states_cur = nn.functional.pad(
-                    qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0)
-                )
-                conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(
-                    device=conv_states.device, dtype=conv_states.dtype
-                )
-
-                # Computing conv
-                qk_packed3_cur = self.conv_qk(qk_packed2_cur).permute(
-                    2, 0, 1
-                )  # [S, B, E]
-                qk_packed3_prefill[start_i:end_i] = qk_packed3_cur
+            hs2_prefill[1:] = hs_p[:-1]
+            init_hs = prev_hs[state_indices_tensor_p].to(hs.dtype)
+            init_hs = torch.where(
+                has_initial_states_p.view(-1, 1),
+                init_hs,
+                init_hs.new_zeros(()),
+            )
+            hs2_prefill[query_start_loc_p[:-1]] = init_hs.unsqueeze(1)
 
             prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1, 0, :].to(
                 device=prev_hs.device, dtype=prev_hs.dtype
