@@ -10,17 +10,20 @@ cnode-28 (8× MI300X), `vllm-smoe-amd` `jinzhao/tidar_v016`, smoediffusion
 ## TL;DR
 
 Single-GPU works. Captured multi-GPU **now gets past cudagraph capture**
-with two flags (below), but **serving is then blocked by a stack of
-TiDAR-SF × vLLM-DP integration bugs** — SF's token inflation breaks several
-data-parallel invariants. For multi-GPU **today**, run **independent
-single-GPU replicas** behind a load balancer, or **DP=8 no-EP eager** for a
-single integrated endpoint.
+with two flags (below), but **serving is then blocked by TWO independent
+issues**: (1) an **SF×DP Flex-metadata crash** (SF-specific), and (2) a
+**DP-coordination deadlock under uneven/idle load** (DP-general — TF hits it
+too). **EP is not the factor** (DP-alone fails identically) and isn't needed
+for this model anyway (it fits on one GPU). For multi-GPU **today**, run
+**independent single-GPU replicas** behind a load balancer, or **DP=8 no-EP
+eager** for a single integrated endpoint.
 
 | Config | Result |
 |---|---|
 | **Single GPU** (DP=1), captured | ✅ **Works** — 803 tok/s b=16 (148 b=1), accept ~5.6 |
 | `--data-parallel-size 8` (no EP), **eager** | ✅ **Works under load** — ~1187 tok/s aggregate (eager, thin batch). Integrated endpoint. |
-| `--data-parallel-size 8 [--enable-expert-parallel]`, captured | ⚠️ **Captures OK with the two flags below**, but first request crashes on a DP+SF integration bug (Flex offsets / DP-pad disagreement). Does not serve yet. |
+| `--data-parallel-size 8` (**±EP**), SF, captured | ⚠️ Captures with the two flags below, but first request crashes (Flex `query_start_loc`). **Identical with and without EP** → EP-independent, DP-driven. |
+| `--data-parallel-size 8 --enable-expert-parallel`, **TF**, captured | ⚠️ Captures + **dodges the SF crash**, but then **hangs** (DP-coordination deadlock, idle ranks). Needs `VLLM_ENGINE_READY_TIMEOUT_S=1800` (TF init ~600s). |
 | `--data-parallel-size 8 --enable-expert-parallel`, eager | ❌ Serves a single request, deadlocks under load (EP all-to-all desync) |
 | `--tensor-parallel-size 8 --enable-expert-parallel` ("EP-alone"), captured | ❌ Crashes at init — TiDAR scratch-block ordering bug under the TP executor; CCA doesn't split under TP anyway |
 
@@ -84,6 +87,21 @@ These are integration bugs in vLLM's DP coordination / padding /
 Flex-metadata code — TiDAR SF was never validated against the internal DP
 path. Fixable, but a multi-bug effort (each fix so far revealed the next),
 not a quick patch.
+
+**EP-independent, and TF tested (2026-06-12) — there are TWO independent
+serving blockers:**
+- **DP-alone (no EP) captured SF** crashes *identically* (same
+  `query_start_loc`). So blocker #1 above is **DP-driven, not EP-driven** —
+  EP was never what broke serving.
+- **TF** (`VLLM_TIDAR_TWO_FORWARD=1`; DP=8+EP captured; needs
+  `VLLM_ENGINE_READY_TIMEOUT_S=1800` because TF init takes ~600s and the
+  600s default cuts the API-server handshake off) **captures and dodges the
+  SF crash** (TF has no `verify+P·(K+1)` inflation → monotonic offsets) —
+  but then **hangs**: the request gets no decode progress and times out.
+  That exposes **blocker #2 — a DP-coordination deadlock under uneven/idle
+  load** (1 request → 7 idle ranks that don't step in lockstep), the same
+  family as the eager-EP gloo deadlock below. **TF clears #1 but not #2**, so
+  it still doesn't serve. A captured multi-GPU engine needs *both* fixed.
 
 ### Eager: works no-EP; deadlocks +EP under load
 
