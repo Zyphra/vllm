@@ -1,0 +1,381 @@
+"""RSA orchestrator: backend client, tail truncation, and the round loop."""
+
+import asyncio
+import logging
+import random
+import time
+from dataclasses import dataclass
+
+import httpx
+import openai
+
+from rsa import extract, prompts
+from rsa.config import RSAParams
+
+logger = logging.getLogger("rsa")
+
+
+class RSAError(Exception):
+    """A whole RSA round failed; maps to HTTP 502 in the server."""
+
+
+@dataclass
+class Candidate:
+    text: str  # reasoning + content concatenated (aggregation input)
+    content: str  # message.content only (answer-bearing part)
+    finish_reason: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+
+
+@dataclass
+class UsageTotals:
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    n_requests: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+    def add(self, candidate: Candidate) -> None:
+        self.prompt_tokens += candidate.prompt_tokens
+        self.completion_tokens += candidate.completion_tokens
+        self.n_requests += 1
+
+
+@dataclass
+class RSAResult:
+    final_text: str
+    population: list[Candidate]
+    rounds: list[list[Candidate]]
+    usage: UsageTotals
+    selection_method: str  # "majority_vote" | "final_aggregation" | "sample"
+    vote_detail: dict | None = None
+
+
+class BackendClient:
+    """Thin async client for the backend vLLM OpenAI-compatible server."""
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str = "EMPTY",
+        timeout: float = 1800.0,
+    ):
+        self.base_url = base_url
+        root = base_url.rstrip("/").removesuffix("/v1")
+        self.openai = openai.AsyncOpenAI(
+            base_url=base_url, api_key=api_key, timeout=timeout, max_retries=0
+        )
+        self.http = httpx.AsyncClient(base_url=root, timeout=60.0)
+        self._tokenize_broken = False
+
+    async def close(self) -> None:
+        await self.openai.close()
+        await self.http.aclose()
+
+    async def default_model(self) -> str:
+        models = await self.openai.models.list()
+        return models.data[0].id
+
+    async def complete(
+        self,
+        messages: list[dict],
+        *,
+        model: str,
+        temperature: float,
+        max_tokens: int,
+        max_retries: int = 1,
+    ) -> Candidate | None:
+        """One chat completion; returns None on permanent failure."""
+        attempt = 0
+        clamped = False
+        while True:
+            try:
+                kwargs = {} if clamped else {"max_tokens": max_tokens}
+                resp = await self.openai.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=temperature,
+                    **kwargs,
+                )
+                msg = resp.choices[0].message
+                reasoning = (
+                    getattr(msg, "reasoning", None)
+                    or getattr(msg, "reasoning_content", None)
+                    or ""
+                )
+                content = msg.content or ""
+                text = (
+                    (reasoning.rstrip() + "\n" + content).strip()
+                    if reasoning
+                    else content
+                )
+                usage = resp.usage
+                return Candidate(
+                    text=text,
+                    content=content or text,
+                    finish_reason=resp.choices[0].finish_reason,
+                    prompt_tokens=usage.prompt_tokens if usage else 0,
+                    completion_tokens=usage.completion_tokens if usage else 0,
+                )
+            except openai.BadRequestError as e:
+                # Typically max_tokens exceeding remaining context for a long
+                # aggregation prompt; retry once letting the server pick.
+                if not clamped:
+                    logger.warning("400 from backend, retrying clamped: %s", e)
+                    clamped = True
+                    continue
+                logger.error("rollout failed permanently: %s", e)
+                return None
+            except (openai.APIConnectionError, openai.APITimeoutError) as e:
+                if attempt < max_retries:
+                    attempt += 1
+                    logger.warning("rollout transport error, retry %d: %s", attempt, e)
+                    continue
+                logger.error("rollout failed after %d retries: %s", attempt, e)
+                return None
+            except openai.APIStatusError as e:
+                logger.error("rollout failed with status %s: %s", e.status_code, e)
+                return None
+
+    async def tail(self, text: str, tail_tokens: int, model: str) -> str:
+        """Truncate *text* to its final *tail_tokens* tokens (token-exact).
+
+        Uses the backend's /tokenize and /detokenize endpoints; falls back
+        to a character approximation if they are unavailable.
+        """
+        if tail_tokens <= 0:
+            return text
+        # A tail of N tokens can't be shorter than N characters... but it
+        # can't be LONGER than ~N*"max chars per token". Conservatively, any
+        # text under tail_tokens characters cannot exceed tail_tokens tokens.
+        if len(text) <= tail_tokens:
+            return text
+        if not self._tokenize_broken:
+            try:
+                r = await self.http.post(
+                    "/tokenize",
+                    json={
+                        "model": model,
+                        "prompt": text,
+                        "add_special_tokens": False,
+                    },
+                )
+                r.raise_for_status()
+                ids = r.json()["tokens"]
+                if len(ids) <= tail_tokens:
+                    return text
+                r = await self.http.post(
+                    "/detokenize",
+                    json={"model": model, "tokens": ids[-tail_tokens:]},
+                )
+                r.raise_for_status()
+                return prompts.TRUNCATION_MARKER + r.json()["prompt"]
+            except (httpx.HTTPError, KeyError) as e:
+                self._tokenize_broken = True
+                logger.warning(
+                    "tokenize endpoint unavailable (%s); "
+                    "falling back to char-approximate tails",
+                    e,
+                )
+        # Char fallback: ~4 chars/token, cut at next newline for cleanliness.
+        approx = tail_tokens * 4
+        if len(text) <= approx:
+            return text
+        cut = text[-approx:]
+        nl = cut.find("\n")
+        if 0 <= nl < len(cut) // 4:
+            cut = cut[nl + 1 :]
+        return prompts.TRUNCATION_MARKER + cut
+
+
+async def _run_round(
+    client: BackendClient,
+    message_sets: list[list[dict]],
+    *,
+    model: str,
+    params: RSAParams,
+    semaphore: asyncio.Semaphore,
+    usage: UsageTotals,
+    round_idx: int,
+) -> list[Candidate]:
+    async def one(messages: list[dict]) -> Candidate | None:
+        async with semaphore:
+            return await client.complete(
+                messages,
+                model=model,
+                temperature=params.temperature,
+                max_tokens=params.max_tokens,
+                max_retries=params.max_retries,
+            )
+
+    start = time.monotonic()
+    results = await asyncio.gather(*(one(m) for m in message_sets))
+    population = [c for c in results if c is not None]
+    for c in population:
+        usage.add(c)
+    if not population:
+        raise RSAError(f"round {round_idx}: all {len(message_sets)} rollouts failed")
+    logger.info(
+        "round %d: %d/%d candidates, %d prompt + %d completion tokens, %.1fs",
+        round_idx,
+        len(population),
+        len(message_sets),
+        sum(c.prompt_tokens for c in population),
+        sum(c.completion_tokens for c in population),
+        time.monotonic() - start,
+    )
+    return population
+
+
+async def _tails_for(
+    client: BackendClient,
+    population: list[Candidate],
+    params: RSAParams,
+    model: str,
+) -> dict[int, str]:
+    """Compute each candidate's tail once per round (memoized by identity)."""
+    tails = await asyncio.gather(
+        *(client.tail(c.text, params.tail_tokens, model) for c in population)
+    )
+    return {id(c): t for c, t in zip(population, tails)}
+
+
+async def run_rsa(
+    client: BackendClient,
+    params: RSAParams,
+    messages: list[dict],
+    model: str,
+    rng: random.Random | None = None,
+) -> RSAResult:
+    """Run the full RSA loop and return the aggregated result.
+
+    *messages* is the incoming OpenAI-style message list. Round 0 sends it
+    unchanged; later rounds rebuild aggregation prompts from the rendered
+    query plus sampled candidate tails.
+    """
+    rng = rng or random.Random()
+    usage = UsageTotals()
+    semaphore = asyncio.Semaphore(params.max_concurrency)
+    query = prompts.render_query(messages)
+    request_system = prompts.extract_request_system(messages)
+
+    population = await _run_round(
+        client,
+        [messages] * params.n,
+        model=model,
+        params=params,
+        semaphore=semaphore,
+        usage=usage,
+        round_idx=0,
+    )
+    rounds = [population]
+
+    for t in range(1, params.t):
+        tails = await _tails_for(client, population, params, model)
+        message_sets = []
+        for _ in range(params.n):
+            chosen = rng.sample(population, k=min(params.k, len(population)))
+            message_sets.append(
+                prompts.build_aggregation_messages(
+                    query, [tails[id(c)] for c in chosen], request_system
+                )
+            )
+        population = await _run_round(
+            client,
+            message_sets,
+            model=model,
+            params=params,
+            semaphore=semaphore,
+            usage=usage,
+            round_idx=t,
+        )
+        rounds.append(population)
+
+    final_text, method, vote_detail = await _select(
+        client, params, population, query, request_system, model, rng, usage
+    )
+    logger.info(
+        "selection=%s, total: %d requests, %d prompt + %d completion tokens",
+        method,
+        usage.n_requests,
+        usage.prompt_tokens,
+        usage.completion_tokens,
+    )
+    return RSAResult(
+        final_text=final_text,
+        population=population,
+        rounds=rounds,
+        usage=usage,
+        selection_method=method,
+        vote_detail=vote_detail,
+    )
+
+
+async def _select(
+    client: BackendClient,
+    params: RSAParams,
+    population: list[Candidate],
+    query: str,
+    request_system: str | None,
+    model: str,
+    rng: random.Random,
+    usage: UsageTotals,
+) -> tuple[str, str, dict | None]:
+    """Pick the final answer text from the final population."""
+
+    def boxed(c: Candidate) -> str | None:
+        return extract.extract_boxed(c.content) or extract.extract_boxed(c.text)
+
+    if params.selection == "sample":
+        return rng.choice(population).content, "sample", None
+
+    # Normalize up front so empty answers (a literal "\boxed{}" echoed from
+    # the prompt) don't count as extractable votes.
+    answers = [boxed(c) for c in population]
+    normalized = [
+        extract.normalize_answer(a) if a is not None else None for a in answers
+    ]
+    extractable = sum(1 for a in normalized if a)
+    want_vote = params.selection == "majority" or (
+        params.selection == "auto" and extractable >= 2
+    )
+    if want_vote:
+        vote = extract.majority_vote(answers)
+        if vote is not None:
+            winner, tally = vote
+            # Return the full text of the top-voted candidate so the client
+            # receives a complete solution, not just the boxed token —
+            # preferring candidates that finished cleanly over ones cut off
+            # by the token budget mid-reasoning.
+            matching = [c for c, a in zip(population, normalized) if a == winner]
+            best = next((c for c in matching if c.finish_reason == "stop"), matching[0])
+            return (
+                best.content,
+                "majority_vote",
+                {"winner": winner, "tally": dict(tally)},
+            )
+        if params.selection == "majority":
+            # Nothing extractable; cheap fallback.
+            return rng.choice(population).content, "sample", None
+
+    # Fallback (and selection == "final_agg"): one final aggregation call.
+    chosen = rng.sample(population, k=min(params.k, len(population)))
+    tails = await _tails_for(client, chosen, params, model)
+    msgs = prompts.build_final_selection_messages(
+        query, [tails[id(c)] for c in chosen], request_system
+    )
+    final = await client.complete(
+        msgs,
+        model=model,
+        temperature=0.3,
+        max_tokens=params.max_tokens,
+        max_retries=params.max_retries,
+    )
+    if final is None:
+        # Last resort: don't fail the request over the selection call.
+        return rng.choice(population).content, "sample", None
+    usage.add(final)
+    return final.content, "final_aggregation", None
