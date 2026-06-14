@@ -42,16 +42,18 @@ def _run_ar(
     padded_num_tokens_per_ubatch: int,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
+    tidar_draft_tokens: int = 0,
 ) -> torch.Tensor:
     dp_size = parallel_config.data_parallel_size
     dp_rank = parallel_config.data_parallel_rank
     device, group = _get_device_and_group(parallel_config)
-    tensor = torch.zeros(5, dp_size, device=device, dtype=torch.int32)
+    tensor = torch.zeros(6, dp_size, device=device, dtype=torch.int32)
     tensor[0][dp_rank] = orig_num_tokens_per_ubatch
     tensor[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor[2][dp_rank] = 1 if should_ubatch else 0
     tensor[3][dp_rank] = 1 if should_dp_pad else 0
     tensor[4][dp_rank] = cudagraph_mode
+    tensor[5][dp_rank] = tidar_draft_tokens
     dist.all_reduce(tensor, group=group)
     return tensor
 
@@ -107,7 +109,8 @@ def _synchronize_dp_ranks(
     should_attempt_dp_padding: bool,
     cudagraph_mode: int,
     parallel_config: ParallelConfig,
-) -> tuple[bool, torch.Tensor | None, int]:
+    tidar_draft_tokens: int = 0,
+) -> tuple[bool, torch.Tensor | None, int, torch.Tensor | None]:
     """
     1. Decides if each DP rank is going to microbatch. Either all ranks
     run with microbatching or none of them do.
@@ -138,8 +141,10 @@ def _synchronize_dp_ranks(
         padded_num_tokens_per_ubatch=num_tokens_padded,
         cudagraph_mode=cudagraph_mode,
         parallel_config=parallel_config,
+        tidar_draft_tokens=tidar_draft_tokens,
     )
 
+    tidar_draft_across_dp = tensor[5, :].cpu()
     should_dp_pad = bool(torch.all(tensor[3] == 1).item())
 
     # DP ranks should all have the same value for should_attempt_dp_padding.
@@ -167,7 +172,8 @@ def _synchronize_dp_ranks(
     # Synchronize cudagraph_mode across ranks (take min)
     synced_cudagraph_mode = _post_process_cudagraph_mode(tensor)
 
-    return should_ubatch, num_tokens_after_padding, synced_cudagraph_mode
+    return (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode,
+            tidar_draft_across_dp)
 
 
 def coordinate_batch_across_dp(
@@ -179,7 +185,8 @@ def coordinate_batch_across_dp(
     uniform_decode: bool | None = None,
     num_scheduled_tokens_per_request: np.ndarray | None = None,
     cudagraph_mode: int = 0,
-) -> tuple[bool, torch.Tensor | None, int]:
+    tidar_draft_tokens: int = 0,
+) -> tuple[bool, torch.Tensor | None, int, torch.Tensor | None]:
     """
     Coordinates amongst all DP ranks to determine if and how the full batch
     should be split into microbatches.
@@ -210,7 +217,7 @@ def coordinate_batch_across_dp(
     """
     if parallel_config.data_parallel_size == 1:
         # Early exit.
-        return False, None, cudagraph_mode
+        return False, None, cudagraph_mode, None
 
     # If the caller has explicitly enabled microbatching.
     should_attempt_ubatching = False
@@ -226,7 +233,8 @@ def coordinate_batch_across_dp(
     if num_tokens_padded is None:
         num_tokens_padded = num_tokens_unpadded
 
-    (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode) = (
+    (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode,
+     tidar_draft_across_dp) = (
         _synchronize_dp_ranks(
             num_tokens_unpadded,
             num_tokens_padded,
@@ -234,7 +242,9 @@ def coordinate_batch_across_dp(
             allow_dp_padding,
             cudagraph_mode,
             parallel_config,
+            tidar_draft_tokens,
         )
     )
 
-    return (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode)
+    return (should_ubatch, num_tokens_after_padding, synced_cudagraph_mode,
+            tidar_draft_across_dp)

@@ -1011,6 +1011,33 @@ class TiDARProposer(EagleProposer):
         return (draft_input_ids.view(-1), draft_positions.view(-1),
                 draft_common_attn_metadata)
 
+    def _coordinate_draft_forward(
+        self,
+        local_num_tokens: int,
+    ) -> tuple[bool, Optional[torch.Tensor], int]:
+        # Coordinate the nested TiDAR draft forward across DP ranks so its
+        # SMoE/EP all-to-all stays lockstep. No-op unless DP>1 + MoE.
+        # Ranks without real draft work advertise a small dummy draft only
+        # when at least one peer has real work.
+        parallel_config = self.vllm_config.parallel_config
+        if (parallel_config.data_parallel_size <= 1
+                or parallel_config.is_moe_model is False):
+            return local_num_tokens > 0, None, local_num_tokens
+        # SINGLE-BARRIER FOLD: the draft real-count already rode the outer
+        # coordinate barrier (gpu_model_runner._store_tidar_draft_fold).
+        # Read the stored result -- NO separate all_reduce here (that
+        # separate collective was the off-by-one source). Lockstep is
+        # inherited from the outer barrier (exactly once per step).
+        del local_num_tokens
+        runner = self.runner
+        runner._tidar_coordinate_ran = True
+        should_run = getattr(runner, '_tidar_draft_should_run', False)
+        eff_across_dp = getattr(runner, '_tidar_draft_eff_across_dp', None)
+        if not should_run or eff_across_dp is None:
+            return False, eff_across_dp, 0
+        eff = int(eff_across_dp[parallel_config.data_parallel_rank].item())
+        return True, eff_across_dp, eff
+
     def propose(
         self,
         target_token_ids: torch.Tensor,
@@ -1135,6 +1162,18 @@ class TiDARProposer(EagleProposer):
         else:
             num_input_tokens = num_tokens
 
+        # DP: coordinate this draft forward with peer ranks (no-op unless
+        # DP>1 + MoE). Provides per-rank token counts for
+        # set_forward_context so the draft SMoE/EP all-to-all stays
+        # lockstep; zero-work ranks match via dummy_run().
+        (_draft_should_run, _draft_num_tokens_across_dp,
+         num_input_tokens) = self._coordinate_draft_forward(num_input_tokens)
+        if not _draft_should_run:
+            self.last_draft_probs = None
+            return torch.empty(
+                (0, self.num_speculative_tokens),
+                dtype=torch.int32, device=next_token_ids.device)
+
         # Pin input_ids/positions into the runner's persistent buffers so
         # the captured FULL graph (bound to runner addresses) reads
         # drafter data at replay. Both CCA and FlashAttn metadata are
@@ -1207,6 +1246,7 @@ class TiDARProposer(EagleProposer):
             with set_forward_context(per_layer_attn_metadata,
                                      self.vllm_config,
                                      num_tokens=num_input_tokens,
+                                     num_tokens_across_dp=_draft_num_tokens_across_dp,
                                      cudagraph_runtime_mode=_cg_mode,
                                      batch_descriptor=_draft_desc,
                                      slot_mapping=_drafter_slot_map):
@@ -1270,10 +1310,28 @@ class TiDARProposer(EagleProposer):
         is_graph_capturing: bool = False,
         slot_mappings: dict[str, torch.Tensor] | None = None,
     ) -> None:
-        # TiDAR reuses the target model forward; no separate drafter
-        # warmup pass is required at profile time. Accept v0.16's
-        # extended kwargs from EagleProposer's dummy_run signature.
+        # At profile/capture time TiDAR reuses the target forward (no
+        # draft warmup needed). But under DP, a zero-work rank must run a
+        # matching dummy DRAFT forward so the draft pass's SMoE/EP
+        # collectives stay lockstep with active ranks (real draft in
+        # propose()).
         del num_tokens, use_cudagraphs, is_graph_capturing, slot_mappings
+        parallel_config = self.vllm_config.parallel_config
+        if (parallel_config.data_parallel_size <= 1
+                or parallel_config.is_moe_model is False):
+            return
+        _should_run, _ntad, _eff = self._coordinate_draft_forward(0)
+        if not _should_run:
+            return
+        self.runner._dummy_run(
+            _eff,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            force_attention=True,
+            uniform_decode=True,
+            allow_microbatching=False,
+            skip_drafter_dummy=True,
+            num_tokens_across_dp_override=_ntad,
+        )
 
     def validate_same_kv_cache_group(self,
                                      kv_cache_config: KVCacheConfig) -> None:

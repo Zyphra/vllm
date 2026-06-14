@@ -3445,6 +3445,49 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _tidar_step_draft_tokens(self, num_reqs: int) -> int:
+        # This rank's real draft token count for THIS step, computed at
+        # step-start so it can ride the single outer-coordinate barrier.
+        # TF draft = num_reqs * (K+1) (see tidar._build_draft_inputs);
+        # padded to match propose()'s captured-graph shape. 0 unless
+        # TiDAR + DP>1 + MoE. (will_draft gate ~ input_fits_in_drafter is
+        # True except near max context; TODO: tighten near the limit.)
+        if (self.speculative_config is None
+                or not self.speculative_config.use_tidar()
+                or self.parallel_config.data_parallel_size <= 1
+                or not self.parallel_config.is_moe_model
+                or num_reqs <= 0):
+            return 0
+        raw = num_reqs * (self.num_spec_tokens + 1)
+        if getattr(self.drafter, 'use_cuda_graph', False):
+            return self.vllm_config.pad_for_cudagraph(raw)
+        return raw
+
+    def _store_tidar_draft_fold(self, real_across_dp):
+        # Single-barrier fold: derive the effective draft vector LOCALLY
+        # from the all_reduced real-count vector (row 5 of the outer
+        # coordinate). No extra collective. Ranks with 0 real draft tokens
+        # get a padded K+1 dummy iff any peer drafts -> draft SMoE/EP
+        # all-to-all stays lockstep. propose()/dummy_run read this.
+        self._tidar_draft_real_across_dp = real_across_dp
+        if real_across_dp is None:
+            self._tidar_draft_should_run = False
+            self._tidar_draft_eff_across_dp = None
+            return
+        should_run = int(real_across_dp.max().item()) > 0
+        self._tidar_draft_should_run = should_run
+        if not should_run:
+            self._tidar_draft_eff_across_dp = real_across_dp
+            return
+        ql = (self.num_spec_tokens + 1)
+        if getattr(self.drafter, 'use_cuda_graph', False):
+            ql = self.vllm_config.pad_for_cudagraph(ql)
+        eff = real_across_dp.clone()
+        for _r in range(eff.numel()):
+            if int(eff[_r].item()) == 0:
+                eff[_r] = ql
+        self._tidar_draft_eff_across_dp = eff
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -3460,6 +3503,8 @@ class GPUModelRunner(
         force_has_lora: bool | None = None,
         force_num_active_loras: int | None = None,
         num_encoder_reqs: int = 0,
+        num_tokens_across_dp_override: torch.Tensor | None = None,
+        tidar_draft_tokens: int = 0,
     ) -> tuple[
         CUDAGraphMode,
         BatchDescriptor,
@@ -3517,7 +3562,19 @@ class GPUModelRunner(
         # Extra coordination when running data-parallel since we need to coordinate
         # across ranks
         should_ubatch, num_tokens_across_dp = False, None
-        if self.vllm_config.parallel_config.data_parallel_size > 1:
+        if (self.vllm_config.parallel_config.data_parallel_size > 1
+                and num_tokens_across_dp_override is not None):
+            # TiDAR nested draft forward: per-rank token counts were
+            # already agreed via synchronize_tidar_draft_tokens, so use
+            # them directly and skip a second coordinate_batch_across_dp
+            # (which would desync against peers' outer-step coordination).
+            num_tokens_across_dp = num_tokens_across_dp_override
+            _dp_rank = self.parallel_config.data_parallel_rank
+            num_tokens_padded = int(num_tokens_across_dp[_dp_rank].item())
+            cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                num_tokens_padded, disable_full=True)
+            assert batch_descriptor.num_tokens == num_tokens_padded
+        elif self.vllm_config.parallel_config.data_parallel_size > 1:
             # Disable DP padding when running eager to avoid excessive padding when
             # running prefills. This lets us set cudagraph_mode="NONE" on the prefiller
             # in a P/D setup and still use CUDA graphs (enabled by this padding) on the
@@ -3526,7 +3583,8 @@ class GPUModelRunner(
                 self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
             )
 
-            should_ubatch, num_tokens_across_dp, synced_cudagraph_mode = (
+            (should_ubatch, num_tokens_across_dp, synced_cudagraph_mode,
+             _tidar_draft_across_dp) = (
                 coordinate_batch_across_dp(
                     num_tokens_unpadded=num_tokens,
                     parallel_config=self.parallel_config,
@@ -3536,8 +3594,10 @@ class GPUModelRunner(
                     uniform_decode=uniform_decode,
                     num_scheduled_tokens_per_request=num_scheduled_tokens_np,
                     cudagraph_mode=cudagraph_mode.value,
+                    tidar_draft_tokens=tidar_draft_tokens,
                 )
             )
+            self._store_tidar_draft_fold(_tidar_draft_across_dp)
 
             # Extract DP-synced values
             if num_tokens_across_dp is not None:
@@ -3721,8 +3781,10 @@ class GPUModelRunner(
 
             if not num_scheduled_tokens:
                 if (
-                    self.parallel_config.is_external_executor
-                    and self.parallel_config.data_parallel_size > 1
+                    self.parallel_config.data_parallel_size > 1
+                    and (self.parallel_config.is_external_executor
+                         or (self.speculative_config is not None
+                             and self.speculative_config.use_tidar()))
                 ):
                     # this is a corner case when both external launcher
                     # and DP are enabled, num_scheduled_tokens could be
@@ -3833,6 +3895,7 @@ class GPUModelRunner(
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
+                tidar_draft_tokens=self._tidar_step_draft_tokens(num_reqs),
             )
 
             logger.debug(
@@ -4125,6 +4188,10 @@ class GPUModelRunner(
 
         spec_config = self.speculative_config
         propose_drafts_after_bookkeeping = False
+        if (self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and self.parallel_config.data_parallel_size > 1):
+            self._tidar_coordinate_ran = False
         if spec_config is not None:
             input_fits_in_drafter = spec_decode_common_attn_metadata is not None and (
                 spec_decode_common_attn_metadata.max_seq_len + self.num_spec_tokens
@@ -4185,6 +4252,18 @@ class GPUModelRunner(
             # ngram and other speculative decoding methods use the sampled
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
+
+        # FOLD commitment: the outer barrier set should_run (lockstep). If a
+        # draft forward didn't run this step (propose skipped on a boundary),
+        # run a dummy draft so this rank joins the draft all-to-all that
+        # peers are running (else hang). Local check, no collective.
+        if (self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and self.parallel_config.data_parallel_size > 1
+                and self.parallel_config.is_moe_model is not False
+                and getattr(self, '_tidar_draft_should_run', False)
+                and not getattr(self, '_tidar_coordinate_ran', False)):
+            self.drafter.dummy_run(0)
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -5126,6 +5205,8 @@ class GPUModelRunner(
         remove_lora: bool = True,
         is_graph_capturing: bool = False,
         num_active_loras: int = 0,
+        skip_drafter_dummy: bool = False,
+        num_tokens_across_dp_override: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Run a dummy forward pass to warm up/profile run or capture the
@@ -5235,6 +5316,7 @@ class GPUModelRunner(
                 # `force_num_active_loras` is used for cudagraph capture; because we
                 # need to capture graphs for specific num_active_loras counts
                 force_num_active_loras=num_active_loras,
+                num_tokens_across_dp_override=num_tokens_across_dp_override,
             )
         )
 
@@ -5382,7 +5464,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and not skip_drafter_dummy and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
             ):
@@ -5418,6 +5500,16 @@ class GPUModelRunner(
                     is_graph_capturing=is_graph_capturing,
                     slot_mappings=slot_mappings,
                 )
+            elif (
+                self.speculative_config is not None
+                and not skip_drafter_dummy
+                and self.speculative_config.use_tidar()
+                and self.parallel_config.data_parallel_size > 1
+            ):
+                # Idle/dummy DP ranks run a matching dummy TiDAR draft so
+                # the draft pass's SMoE/EP collectives stay lockstep with
+                # active ranks (which run a real draft in propose()).
+                self.drafter.dummy_run(0)
 
         # We register layerwise NVTX hooks here after the first dynamo tracing is
         # done to avoid nvtx operations in hook functions being traced by

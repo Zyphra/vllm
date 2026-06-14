@@ -213,6 +213,12 @@ class EngineCore:
         # Pause state for "keep" mode - freezes requests in queue.
         self._scheduler_paused = False
 
+        # Set by step()/step_with_batch_queue() to indicate execute_model
+        # was called this iteration. Used by DPEngineCoreProc.run_busy_loop()
+        # to avoid a redundant execute_dummy_batch when the worker already
+        # participated in coordinate_batch_across_dp inside execute_model.
+        self._executor_called_this_step = False
+
         # Mark the startup heap as static so that it's ignored by GC.
         # Reduces pause times of oldest generation collections.
         freeze_gc_heap()
@@ -407,8 +413,10 @@ class EngineCore:
         # Check for any requests remaining in the scheduler - unfinished,
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
+            self._executor_called_this_step = False
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        self._executor_called_this_step = True
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -468,8 +476,10 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        self._executor_called_this_step = False
         if self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
+            self._executor_called_this_step = True
             exec_future = self.model_executor.execute_model(
                 scheduler_output, non_block=True
             )
@@ -1433,7 +1443,19 @@ class DPEngineCoreProc(EngineCoreProc):
 
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
-                self.execute_dummy_batch()
+                #
+                # However, when DP is in use AND execute_model was
+                # already called (0 scheduled tokens),
+                # the worker already did _dummy_run ->
+                # coordinate_batch_across_dp. A second execute_dummy_batch
+                # here would issue a SECOND coordinate_batch_across_dp
+                # all_reduce other workers do not match, desynchronising
+                # the DP process group.
+                if not (
+                    self._executor_called_this_step
+                    and self.vllm_config.parallel_config.data_parallel_size > 1
+                ):
+                    self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
             self.engines_running = self._has_global_unfinished_reqs(
@@ -1441,18 +1463,26 @@ class DPEngineCoreProc(EngineCoreProc):
             )
 
             if not self.engines_running:
-                if self.dp_rank == 0 or not self.has_coordinator:
-                    # Notify client that we are pausing the loop.
+                if not self.has_coordinator:
+                    # Without a coordinator there is no START_DP_WAVE
+                    # mechanism to wake idle engines. Letting
+                    # engines_running stay False makes idle engines block
+                    # in _process_input_queue and stop calling
+                    # execute_dummy_batch / _has_global_unfinished_reqs,
+                    # desynchronising the dp_group all-reduce (and EP
+                    # all-to-all) counters across DP ranks. Keep engines
+                    # spinning with dummy batches instead.
+                    self.engines_running = True
+                    continue
+
+                if self.dp_rank == 0:
+                    # Notify coordinator that we are pausing the loop.
                     logger.debug(
                         "Wave %d finished, pausing engine loop.", self.current_wave
                     )
-                    # In the coordinator case, dp rank 0 sends updates to the
-                    # coordinator. Otherwise (offline spmd case), each rank
-                    # sends the update to its colocated front-end process.
-                    client_index = -1 if self.has_coordinator else 0
                     self.output_queue.put_nowait(
                         (
-                            client_index,
+                            -1,
                             EngineCoreOutputs(wave_complete=self.current_wave),
                         )
                     )
