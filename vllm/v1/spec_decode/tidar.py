@@ -1211,6 +1211,19 @@ class TiDARProposer(EagleProposer):
             uniform_decode=True,
             is_drafter_pass=True,
         )
+        # DP+EP: a FULL captured drafter graph bakes its EP all-to-all
+        # routing at warmup (uniform composition). Under concurrent
+        # NON-uniform DP composition the replayed draft all-to-all
+        # mismatches peer/idle ranks and the post-step draft sync
+        # (_get_draft_token_ids_cpu) deadlocks (captured DP + >=8 conc).
+        # Force the draft eager so every rank's draft all-to-all is
+        # runtime-routed and mutually consistent. Main forward stays
+        # captured. Escape hatch: VLLM_TIDAR_DP_EAGER_DRAFT=0.
+        _pc = self.vllm_config.parallel_config
+        if (os.environ.get("VLLM_TIDAR_DP_EAGER_DRAFT", "0") == "1"
+                and _pc.data_parallel_size > 1
+                and _pc.is_moe_model is not False):
+            _cg_mode = CUDAGraphMode.NONE
 
         # Tier 3 lazy capture: the first time we hit this shape, the
         # CUDAGraphWrapper has no entry for the drafter-pass descriptor
@@ -1242,6 +1255,14 @@ class TiDARProposer(EagleProposer):
             _ln: draft_common_attn_metadata.slot_mapping
             for _ln in self.attn_layer_names
         }
+        if os.environ.get("VLLM_TIDAR_DBG") == "1":
+            import sys as _sys
+            _r = self.vllm_config.parallel_config.data_parallel_rank
+            _v = (_draft_num_tokens_across_dp.tolist()
+                  if _draft_num_tokens_across_dp is not None else None)
+            print(f"[TIDAR_DBG r{_r}] draft actual_num_tokens={num_tokens} "
+                  f"eff_num_input_tokens={num_input_tokens} cg_mode={_cg_mode} "
+                  f"ntad={_v}", flush=True, file=_sys.stderr)
         try:
             with set_forward_context(per_layer_attn_metadata,
                                      self.vllm_config,

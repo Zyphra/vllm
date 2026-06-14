@@ -3482,10 +3482,26 @@ class GPUModelRunner(
         ql = (self.num_spec_tokens + 1)
         if getattr(self.drafter, 'use_cuda_graph', False):
             ql = self.vllm_config.pad_for_cudagraph(ql)
-        eff = real_across_dp.clone()
-        for _r in range(eff.numel()):
-            if int(eff[_r].item()) == 0:
-                eff[_r] = ql
+        # UNIFORM draft composition: every DP rank drafts the SAME token
+        # count (max real across ranks, >= ql, padded to a cudagraph size)
+        # so the draft SMoE/EP all-to-all is uniform across ranks. The
+        # draft all-to-all path assumes uniform per-rank counts: non-uniform
+        # composition overflows the receive buffers (eager -> HSA OOB
+        # scatter) and mismatches the warmup-baked uniform routing
+        # (captured -> deadlock). Padding tokens yield unused draft outputs
+        # (only real draft positions are read back). Opt-out:
+        # VLLM_TIDAR_DP_UNIFORM_DRAFT=0.
+        import os as _os_u
+        if _os_u.environ.get("VLLM_TIDAR_DP_UNIFORM_DRAFT", "0") == "1":
+            mx = max(int(real_across_dp.max().item()), ql)
+            if getattr(self.drafter, 'use_cuda_graph', False):
+                mx = self.vllm_config.pad_for_cudagraph(mx)
+            eff = torch.full_like(real_across_dp, mx)
+        else:
+            eff = real_across_dp.clone()
+            for _r in range(eff.numel()):
+                if int(eff[_r].item()) == 0:
+                    eff[_r] = ql
         self._tidar_draft_eff_across_dp = eff
 
     def _determine_batch_execution_and_padding(
@@ -3573,6 +3589,14 @@ class GPUModelRunner(
             num_tokens_padded = int(num_tokens_across_dp[_dp_rank].item())
             cudagraph_mode, batch_descriptor = dispatch_cudagraph(
                 num_tokens_padded, disable_full=True)
+            # DP+EP TiDAR draft: force eager so the dummy draft's EP
+            # all-to-all is runtime-routed, matching active ranks'
+            # forced-eager draft (VLLM_TIDAR_DP_EAGER_DRAFT). Avoids
+            # captured-graph baked-routing mismatch under concurrent
+            # non-uniform DP composition.
+            import os as _os_dp
+            if _os_dp.environ.get("VLLM_TIDAR_DP_EAGER_DRAFT", "0") == "1":
+                cudagraph_mode = CUDAGraphMode.NONE
             assert batch_descriptor.num_tokens == num_tokens_padded
         elif self.vllm_config.parallel_config.data_parallel_size > 1:
             # Disable DP padding when running eager to avoid excessive padding when
