@@ -1,9 +1,13 @@
 # TiDAR SF throughput reproducer (AMD MI300X)
 
 Reproduces the two headline single-forward (SF) numbers in
-[`docs/amd_tidar_perf.md`](../../docs/amd_tidar_perf.md). Everything needed is
-in this repo — you only supply (a) an MI300X box and (b) a smoediffusion
-checkpoint.
+[`docs/amd_tidar_perf.md`](../../docs/amd_tidar_perf.md). `bench_amd_sf.py` is
+**a single self-contained file** — the 30 AIME25 chat-template prompts are
+embedded in it, so you can copy just that one file into a built checkout. You
+only supply (a) an MI300X box and (b) a smoediffusion checkpoint.
+
+(`aime25_zpo_texts.json` is kept here only as the source of the embedded
+prompts; the script does not read it.)
 
 | Config | proposal levels | tok/s (doc) | accept |
 |---|---|---:|---:|
