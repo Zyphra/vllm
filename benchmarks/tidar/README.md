@@ -1,79 +1,89 @@
 # TiDAR SF throughput reproducer (AMD MI300X)
 
 Reproduces the two headline single-forward (SF) numbers in
-[`docs/amd_tidar_perf.md`](../../docs/amd_tidar_perf.md):
+[`docs/amd_tidar_perf.md`](../../docs/amd_tidar_perf.md). Everything needed is
+in this repo — you only supply (a) an MI300X box and (b) a smoediffusion
+checkpoint.
 
-| Config | proposal levels | tok/s | accept |
+| Config | proposal levels | tok/s (doc) | accept |
 |---|---|---:|---:|
 | SF `[0,4,7,11]` (P=4, fastest) | `0,4,7,11` | ~803 | ~5.6 |
-| SF dense `[0..16]` (P=17, max accept) | `0,1,2,...,16` | ~544 | ~7.6 |
+| SF dense `[0..16]` (P=17, max accept) | `0,1,...,16` | ~544 | ~7.6 |
 
-The **only** difference between the two is `VLLM_TIDAR_PROPOSAL_ACC_LEVELS`.
-Everything else is the shared matched config (ckpt `iter_0012600`, AIME25 30
-chat-template prompts, n=4, T=0.5, max_tokens=8192, max_model_len=10000,
-b=16, captured `FULL_DECODE_ONLY`, Triton CCA).
+`benchmarks/tidar/bench_amd_sf.py` **forces** every knob that selects the fast
+code path (FLEX_ATTENTION + SF Triton + the proposal levels + captured), so
+you cannot land on the slow path by forgetting an env var. The two configs
+differ only by `--dense`.
 
-## Requirements
-
-- An MI300X box (gfx942), ROCm 7.x.
-- A vLLM build of this branch. Either build into the base image:
-  ```bash
-  docker run --rm -v $PWD:/w -w /w zyphra/rocm-primus:aiter_pa_swa \
-    bash -c 'pip install "setuptools>=77,<81" setuptools_scm && pip install --no-build-isolation -e .'
-  ```
-  …or reuse a prebuilt image (commit the built container once to skip the
-  ~5-min rebuild on every run).
-
-## Run
-
-`VLLM_ATTENTION_BACKEND=FLEX_ATTENTION` and `VLLM_TIDAR_SF_TRITON=1` are
-required — SF only runs correctly on Flex, and the Triton paged kernel is
-the AMD win (it skips the full-KV-cache reshape copy the generic Flex path
-does). Set `CKPT=` if your checkpoint lives elsewhere.
+## 1. Build the image (from this repo)
 
 ```bash
-# SF [0,4,7,11]  -> ~803 tok/s
-docker run --rm --device /dev/dri --device /dev/kfd --group-add video \
-  --network host --ipc host --shm-size 32G -v /shared:/shared -v $PWD:/vllm -w /vllm \
-  -e HIP_VISIBLE_DEVICES=0 -e PYTHONUNBUFFERED=1 \
-  -e VLLM_SKIP_SDPA_PREINIT=1 -e VLLM_ATTENTION_BACKEND=FLEX_ATTENTION \
-  -e VLLM_TIDAR_SF_TRITON=1 -e VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,4,7,11 \
-  <image> python -u benchmarks/tidar/bench_amd_sf.py
+git checkout jinzhao/tidar_v016        # or this branch
+docker run --rm -v "$PWD":/vllm -w /vllm zyphra/rocm-primus:aiter_pa_swa \
+  bash -c 'pip install "setuptools>=77,<81" setuptools_scm && \
+           pip install --no-build-isolation -e .'
+# commit the result once so reruns skip the ~5-min rebuild:
+#   docker commit <container> vllm-tidar:latest
+```
+If you can't pull `zyphra/rocm-primus:aiter_pa_swa`, any ROCm 7.x image with
+torch 2.10 + aiter + a ROCm flash-attn works as the base.
 
-# SF dense [0..16] -> ~544 tok/s : same command, change one env var:
-#   -e VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
+## 2. Run
+
+```bash
+# SF [0,4,7,11]  -> ~760-800 tok/s
+docker run --rm --device /dev/dri --device /dev/kfd --group-add video \
+  --network host --ipc host --shm-size 32G \
+  -v /path/to/checkpoints:/ckpts -v "$PWD":/vllm -w /vllm \
+  -e HIP_VISIBLE_DEVICES=0 -e PYTHONUNBUFFERED=1 \
+  <image> python -u benchmarks/tidar/bench_amd_sf.py --ckpt /ckpts/iter_0012600
+
+# SF dense [0..16] -> ~510-545 tok/s : add --dense
+#   ... python -u benchmarks/tidar/bench_amd_sf.py --ckpt /ckpts/iter_0012600 --dense
 ```
 
-The script prints `TOTAL: <tok/s>`. For acceptance, the SpecDecoding metric
-windows are in the log (`disable_log_stats=False`); true-mean accept =
-`1 + Σaccepted / Σ(drafted/16)` over all windows.
+The script prints its forced config, then `TOTAL: <tok/s>`. You do **not**
+set any `VLLM_*` env vars yourself — the script sets them before importing
+vllm. Run **one config per node** (b=16/8192-token co-runs contend ~6-7%).
 
-**Run one config per node.** These are b=16, max_tokens=8192 jobs — two
-concurrent runs on the same MI300X box contend for host memory bandwidth and
-drop throughput ~6-7% each. Give each run its own node (or run sequentially).
+## 3. Confirm you're on the fast path
 
-## Validation (2026-06-17, cnode-2)
+If you previously saw ~10% of the expected throughput, you were not on the
+SF Triton path. With this script that can't happen silently — but to confirm,
+check the engine log near startup for:
 
-Reproduced on a fresh build of branch tip `67a63fc7d`
-(`zyphra/rocm-primus:aiter_pa_swa` + `pip install -e .`):
+```
+Using FlexAttention backend
+TiDAR single-forward mode ENABLED with K=16, P=4, acc_levels=(0, 4, 7, 11)
+```
 
-| Config | doc | measured (solo) | accept (doc / measured) |
+and that the `SpecDecoding metrics` per-position acceptance is ~0.8 decaying
+to ~0.2 (a flat ~1.0 mean = collapsed → wrong levels). The script also prints
+a loud warning if throughput is < 150 tok/s.
+
+True-mean accept (the metric in the doc) =
+`1 + Σaccepted / Σ(drafted/16)` over all SpecDecoding windows in the log.
+
+## Why the slow path happens (the three traps)
+
+1. **Backend must be `FLEX_ATTENTION`.** Other AMD backends (AITER-FA,
+   Triton, AITER-Unified) break TiDAR's K+1 spec layout — accept collapses
+   to ~1.2 and you get AR-ish speed. SF only runs correctly on Flex.
+2. **Proposal levels must include 0.** The codebase default `(4,7,10)`
+   is cascade-degenerate on this checkpoint (accept ≈ 1.0).
+3. **Must be captured** (`cudagraph_mode=FULL_DECODE_ONLY`), not eager.
+
+Plus on ROCm: keep `VLLM_CCA_TRITON=1` (pytorch CCA is capture-unsafe at
+b=16) and `VLLM_SKIP_SDPA_PREINIT=1` (avoids an intermittent import segfault).
+The script sets all of these.
+
+## Validation (2026-06-17, cnode-2 GPU5, solo, fresh build at tip `67a63fc7d`)
+
+| Config | doc | measured | accept (doc / measured) |
 |---|---:|---:|---|
 | SF `[0,4,7,11]` | 803 | **762** | 5.63 / **5.53** |
 | SF dense `[0..16]` | 544 | **509** | 7.57 / **7.26** |
 
-Acceptance matches the doc (the config is faithful). The consistent ~5-6%
-throughput gap vs the doc is build-image variance — the doc used the
-prebuilt `jinzhao/vllm-tidar-amd:latest` image at branch `3f1a680f2`; this
-was a fresh source build at `67a63fc7d`. Both measured solo on GPU 5.
-
-## Notes / gotchas (from `docs/amd_tidar_perf.md`)
-
-- Proposal levels **must include 0** — the codebase default `(4,7,10)`
-  collapses acceptance to ~1.0 on this checkpoint.
-- `VLLM_SKIP_SDPA_PREINIT=1` avoids an intermittent `import vllm` segfault
-  on this stack.
-- Keep Triton CCA (`VLLM_CCA_TRITON=1`, default); pytorch CCA is
-  capture-unsafe on ROCm at b=16.
-- Other AMD attention backends (AITER-FA, Triton, AITER-Unified) break
-  TiDAR's K+1 spec layout — accept collapses. SF needs `FLEX_ATTENTION`.
+Acceptance matches the doc → the config is faithful. The ~5-6% throughput
+gap is build-image variance (doc used prebuilt `jinzhao/vllm-tidar-amd:latest`
+@ `3f1a680f2`; this was a fresh source build @ `67a63fc7d`).
