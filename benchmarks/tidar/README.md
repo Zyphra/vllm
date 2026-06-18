@@ -60,13 +60,12 @@ Reproduced on a fresh build of branch tip `67a63fc7d`
 | Config | doc | measured (solo) | accept (doc / measured) |
 |---|---:|---:|---|
 | SF `[0,4,7,11]` | 803 | **762** | 5.63 / **5.53** |
-| SF dense `[0..16]` | 544 | ~498 (contended)* | 7.57 / 7.08 |
+| SF dense `[0..16]` | 544 | **509** | 7.57 / **7.26** |
 
-Acceptance matches the doc (the config is faithful). The ~5% throughput
-gap vs the doc is build-image variance — the doc used the prebuilt
-`jinzhao/vllm-tidar-amd:latest` image at branch `3f1a680f2`; this was a
-fresh source build at `67a63fc7d`. *The dense number was measured under
-contention (co-run); solo it lands ~530-540.
+Acceptance matches the doc (the config is faithful). The consistent ~5-6%
+throughput gap vs the doc is build-image variance — the doc used the
+prebuilt `jinzhao/vllm-tidar-amd:latest` image at branch `3f1a680f2`; this
+was a fresh source build at `67a63fc7d`. Both measured solo on GPU 5.
 
 ## Notes / gotchas (from `docs/amd_tidar_perf.md`)
 
