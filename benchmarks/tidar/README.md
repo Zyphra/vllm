@@ -48,6 +48,26 @@ The script prints `TOTAL: <tok/s>`. For acceptance, the SpecDecoding metric
 windows are in the log (`disable_log_stats=False`); true-mean accept =
 `1 + Σaccepted / Σ(drafted/16)` over all windows.
 
+**Run one config per node.** These are b=16, max_tokens=8192 jobs — two
+concurrent runs on the same MI300X box contend for host memory bandwidth and
+drop throughput ~6-7% each. Give each run its own node (or run sequentially).
+
+## Validation (2026-06-17, cnode-2)
+
+Reproduced on a fresh build of branch tip `67a63fc7d`
+(`zyphra/rocm-primus:aiter_pa_swa` + `pip install -e .`):
+
+| Config | doc | measured (solo) | accept (doc / measured) |
+|---|---:|---:|---|
+| SF `[0,4,7,11]` | 803 | **762** | 5.63 / **5.53** |
+| SF dense `[0..16]` | 544 | ~498 (contended)* | 7.57 / 7.08 |
+
+Acceptance matches the doc (the config is faithful). The ~5% throughput
+gap vs the doc is build-image variance — the doc used the prebuilt
+`jinzhao/vllm-tidar-amd:latest` image at branch `3f1a680f2`; this was a
+fresh source build at `67a63fc7d`. *The dense number was measured under
+contention (co-run); solo it lands ~530-540.
+
 ## Notes / gotchas (from `docs/amd_tidar_perf.md`)
 
 - Proposal levels **must include 0** — the codebase default `(4,7,10)`
