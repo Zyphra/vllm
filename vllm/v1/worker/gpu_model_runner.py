@@ -3225,9 +3225,20 @@ class GPUModelRunner(
             _mixed = (_v1_w * _target_logits
                       + (1.0 - _v1_w) * _draft_logits)
             logits[_tli] = _mixed.to(_target_dtype)
+            # FIX: feed the soft draft distribution q = softmax(draft_logits)
+            # to the rejection sampler. Passing None routes to the Dirac /
+            # NO_DRAFT_PROBS branch, which nullifies the mix lift (and reads
+            # *below* the no-mix floor because the blended target is then
+            # inconsistent with a point-mass q). Mirrors the working mix
+            # branch (jinzhao/tidar_mix-logits). At T_diff>0 a real draft_probs
+            # already exists; only synthesize when it is None.
+            _draft_probs_mix = spec_decode_metadata.draft_probs
+            if _draft_probs_mix is None:
+                _draft_probs_mix = torch.softmax(
+                    _draft_logits, dim=-1).contiguous()
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
-                spec_decode_metadata.draft_probs,
+                _draft_probs_mix,
                 logits,
                 sampling_metadata,
             )
