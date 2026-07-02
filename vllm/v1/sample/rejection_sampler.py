@@ -3,6 +3,7 @@
 
 from collections.abc import Sequence
 from dataclasses import replace
+import os
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,21 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 logger = init_logger(__name__)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_env_float(name: str) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return float(raw)
+
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
@@ -49,9 +65,20 @@ class RejectionSampler(nn.Module):
         output tokens = accepted tokens + recovered tokens + bonus tokens
     """
 
-    def __init__(self, sampler: Sampler):
+    def __init__(self, sampler: Sampler, tidar_ar_temperature: float | None = None):
         super().__init__()
         self.sampler = sampler
+        env_tidar_ar_temperature = _optional_env_float("VLLM_TIDAR_AR_TEMPERATURE")
+        self.tidar_ar_temperature = float(
+            env_tidar_ar_temperature
+            if env_tidar_ar_temperature is not None
+            else (1.0 if tidar_ar_temperature is None else tidar_ar_temperature)
+        )
+        if self.tidar_ar_temperature <= 0.0:
+            raise ValueError(
+                "TiDAR AR verifier logprob temperature must be positive; "
+                f"got {self.tidar_ar_temperature}."
+            )
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
@@ -98,6 +125,10 @@ class RejectionSampler(nn.Module):
         # won't affect the original logits tensor.
         assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
+        # Preserve raw AR bonus logits for VLLM_TIDAR_RETURN_AR_LOGPROBS.
+        # The sampler override may return post-sampling/temperature-processed
+        # logits when VERL's post-sampling logprob patch is installed.
+        raw_bonus_logits = bonus_logits.to(torch.float32).clone()
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
@@ -150,19 +181,86 @@ class RejectionSampler(nn.Module):
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
+            return_ar_logprobs = _env_flag("VLLM_TIDAR_RETURN_AR_LOGPROBS")
+            if return_ar_logprobs and not getattr(
+                self, "_tidar_return_ar_logprobs_logged", False
+            ):
+                logger.warning(
+                    "VLLM_TIDAR_RETURN_AR_LOGPROBS=1: returning AR "
+                    "verifier logprobs for post-rejection-sampling tokens "
+                    "with tidar_ar_temperature=%s",
+                    self.tidar_ar_temperature,
+                )
+                self._tidar_return_ar_logprobs_logged = True
+            if return_ar_logprobs:
+                ar_target_logits, ar_bonus_logits = self._get_ar_logprob_logits(
+                    raw_target_logits,
+                    raw_bonus_logits,
+                    sampling_metadata,
+                    metadata,
+                )
+                target_logprob_logits = ar_target_logits
+                bonus_logprob_logits = ar_bonus_logits
+            else:
+                target_logprob_logits = (
+                    raw_target_logits
+                    if not self.is_processed_logprobs_mode
+                    else target_logits
+                )
+                bonus_logprob_logits = bonus_sampler_output.logprobs_tensors.logprobs
             logprobs_tensors = self._get_logprobs_tensors(
                 sampling_metadata.max_num_logprobs,
                 metadata,
                 logits,
-                target_logits if self.is_processed_logprobs_mode else raw_target_logits,
-                bonus_sampler_output.logprobs_tensors.logprobs,
+                target_logprob_logits,
+                bonus_logprob_logits,
                 output_token_ids,
+                force_logprobs=return_ar_logprobs,
             )
 
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    def _get_ar_logprob_logits(
+        self,
+        raw_target_logits: torch.Tensor,
+        raw_bonus_logits: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+        metadata: SpecDecodeMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return AR verifier logits in the same space as rollout logprobs.
+
+        The two-forward TiDAR path samples/accepts with the rollout sampling
+        distribution, but training compares against AR verifier logprobs. For
+        that comparison, use the verifier logits after the same post-sampling
+        transforms that vLLM exposes through processed logits: logits processors,
+        the configured AR verifier temperature, then top-k/top-p masking.
+        """
+        ar_target_logits = raw_target_logits.clone()
+        ar_target_logits = self.apply_logits_processors(
+            ar_target_logits, sampling_metadata, metadata
+        )
+        ar_target_logits = self._apply_ar_logprob_temperature(ar_target_logits)
+
+        ar_bonus_logits = raw_bonus_logits.clone()
+        ar_bonus_logits = self.sampler.apply_logits_processors(
+            ar_bonus_logits, sampling_metadata, predict_bonus_token=True
+        )
+        ar_bonus_logits = self._apply_ar_logprob_temperature(ar_bonus_logits)
+        return ar_target_logits, ar_bonus_logits
+
+    def _apply_ar_logprob_temperature(
+        self,
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        assert logits.ndim == 2
+        # Keep returned AR verifier logprobs aligned with VERL's
+        # logprob_post_sampling patch: processors + temperature, before
+        # sampling-time top-k/top-p masking.
+        logits.div_(self.tidar_ar_temperature)
+        return logits
 
     def _get_logprobs_tensors(
         self,
@@ -172,6 +270,7 @@ class RejectionSampler(nn.Module):
         target_logits: torch.Tensor,
         bonus_logits: torch.Tensor,
         sampled_token_ids: torch.Tensor,
+        force_logprobs: bool = False,
     ) -> LogprobsTensors:
         cu_num_sampled_tokens = torch.zeros_like(metadata.cu_num_sampled_tokens)
         cu_num_sampled_tokens[1:] = metadata.cu_num_sampled_tokens[:-1]
@@ -183,19 +282,31 @@ class RejectionSampler(nn.Module):
         final_logits[target_logits_indices] = target_logits.to(torch.float32)
         final_logits[bonus_logits_indices] = bonus_logits.to(torch.float32)
 
-        # NOTE: To avoid cpu-gpu synchronization, we now simply compute indices for
-        # all draft tokens, including the rejected ones. The rejected tokens will
-        # be filtered out in the `parse_output`.
-        logit_start_indices = cu_num_sampled_tokens
-        offsets = torch.arange(
-            sampled_token_ids.shape[-1],
-            device=logit_start_indices.device,
-            dtype=logit_start_indices.dtype,
+        # Map each post-rejection output slot back to the actual verifier row.
+        # This cannot be derived from cu_num_sampled_tokens when the engine mixes
+        # prefill and TiDAR decode rows in the same batch: verifier target/bonus
+        # rows may not be a simple packed [req][slot] layout. Use the metadata
+        # row maps that were used to split logits in the first place.
+        batch_size, max_num_sampled = sampled_token_ids.shape
+        accepted_logit_indices = torch.empty(
+            (batch_size, max_num_sampled),
+            device=target_logits_indices.device,
+            dtype=target_logits_indices.dtype,
         )
-        accepted_logit_indices = (
-            logit_start_indices.unsqueeze(1) + offsets.unsqueeze(0)
-        ).flatten()
-        accepted_logit_indices.clamp_(max=final_logits.shape[0] - 1)
+        draft_start = 0
+        for req_idx, num_draft in enumerate(metadata.num_draft_tokens):
+            num_draft = int(num_draft)
+            if num_draft > 0:
+                draft_end = draft_start + num_draft
+                accepted_logit_indices[req_idx, :num_draft] = target_logits_indices[
+                    draft_start:draft_end
+                ]
+                draft_start = draft_end
+            # Slot num_draft is the all-accepted bonus position. Later slots are
+            # placeholders and will be filtered out by parse_output; fill them
+            # with the bonus row to keep gather indices valid.
+            accepted_logit_indices[req_idx, num_draft:] = bonus_logits_indices[req_idx]
+        accepted_logit_indices = accepted_logit_indices.flatten()
         accepted_tokens = sampled_token_ids.clone().flatten()
         # we replace rejected token ids with 0 to avoid gather_logprobs error
         accepted_tokens[accepted_tokens == PLACEHOLDER_TOKEN_ID] = 0
@@ -204,7 +315,7 @@ class RejectionSampler(nn.Module):
         accepted_logits = final_logits[accepted_logit_indices]
         accepted_logprobs = (
             accepted_logits
-            if self.is_logits_logprobs_mode
+            if self.is_logits_logprobs_mode and not force_logprobs
             else self.sampler.compute_logprobs(accepted_logits)
         )
         return self.sampler.gather_logprobs(

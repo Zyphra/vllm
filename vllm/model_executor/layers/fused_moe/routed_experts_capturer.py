@@ -33,6 +33,41 @@ _global_experts_capturer: RoutedExpertsCapturer | None = None
 _global_experts_reader: RoutedExpertsReader | None = None
 
 
+def _get_num_layer_slots(hf_config) -> int:
+    """Number of layer slots for the capture buffer.
+
+    The buffer is indexed by ``FusedMoE.layer_id`` = the integer in the
+    module name (``model.layers.N....``). For SMoE hybrid checkpoints the
+    module numbering follows the ``smoe_layers`` schedule, which can be
+    longer than ``num_hidden_layers`` (e.g. 80-entry schedule with
+    num_hidden_layers=40, MoE at odd indices 1..79). Sizing by
+    num_hidden_layers silently dropped every MoE layer with id >= 40 and
+    left the rest at odd rows of a half-sized buffer.
+    """
+    num_layers = int(hf_config.num_hidden_layers)
+    smoe_layers = getattr(hf_config, "smoe_layers", None)
+    if smoe_layers:
+        num_layers = max(num_layers, len(smoe_layers))
+    return num_layers
+
+
+def _get_num_experts_per_tok(hf_config) -> int:
+    for attr in (
+        "num_experts_per_tok",
+        "num_experts_per_token",
+        "moe_router_topk",
+        "moe_top_k",
+        "moe_topk",
+        "top_k",
+    ):
+        value = getattr(hf_config, attr, None)
+        if value is not None:
+            return int(value)
+    raise AttributeError(
+        f"{type(hf_config).__name__} does not define an MoE top-k field"
+    )
+
+
 @contextmanager
 def _file_lock(lock_file: str, mode: str = "wb+") -> Generator[None, None, None]:
     """Context manager for file-based locking."""
@@ -90,6 +125,7 @@ class RoutedExpertsCapturer:
         self._shm: shared_memory.SharedMemory | None = None
         self._host_buffer_view: np.ndarray | None = None
         self._lock_file: str | None = None
+        self._capture_enabled = True
 
     @classmethod
     def create(cls) -> RoutedExpertsCapturer:
@@ -125,8 +161,8 @@ class RoutedExpertsCapturer:
             raise RuntimeError("Device buffer has already been initialized")
 
         hf_config = vllm_config.model_config.hf_text_config
-        num_layers = hf_config.num_hidden_layers
-        num_experts_per_tok = hf_config.num_experts_per_tok
+        num_layers = _get_num_layer_slots(hf_config)
+        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
 
         # Initialize device buffer
         self._device_buffer = torch.zeros(
@@ -168,6 +204,8 @@ class RoutedExpertsCapturer:
         """
         if self._device_buffer is None:
             raise RuntimeError("Buffer not initialized. Call init_buffer() first.")
+        if not self._capture_enabled:
+            return
 
         ctx = get_forward_context()
         if ctx.dp_metadata is None:  # single dp
@@ -177,9 +215,25 @@ class RoutedExpertsCapturer:
         else:  # multi dp
             token_num_per_dp = ctx.dp_metadata.num_tokens_across_dp_cpu[self.dp_rank]
             cumsum = torch.cumsum(ctx.dp_metadata.num_tokens_across_dp_cpu, dim=0)
-            assert cumsum[-1] == topk_ids.shape[0]
-            end_loc = cumsum[self.dp_rank]
-            start_loc = end_loc - token_num_per_dp
+            total_tokens = int(cumsum[-1].item())
+            local_tokens = int(token_num_per_dp.item())
+            actual_tokens = int(topk_ids.shape[0])
+            if actual_tokens == total_tokens:
+                end_loc = int(cumsum[self.dp_rank].item())
+                start_loc = end_loc - local_tokens
+            elif actual_tokens == local_tokens:
+                start_loc = 0
+                end_loc = local_tokens
+            else:
+                logger.warning(
+                    "Skipping routed expert capture for unexpected DP token layout: "
+                    "actual=%s local=%s total=%s dp_rank=%s",
+                    actual_tokens,
+                    local_tokens,
+                    total_tokens,
+                    self.dp_rank,
+                )
+                return
 
         if layer_id >= self._device_buffer.shape[1]:
             return
@@ -192,6 +246,16 @@ class RoutedExpertsCapturer:
         """Clear the device buffer."""
         if self._device_buffer is not None:
             self._device_buffer.zero_()
+
+    @contextmanager
+    def capture_disabled(self) -> Generator[None, None, None]:
+        """Temporarily suppress capture for nested drafter forwards."""
+        previous = self._capture_enabled
+        self._capture_enabled = False
+        try:
+            yield
+        finally:
+            self._capture_enabled = previous
 
     def save_captured_experts(self, indices: np.ndarray) -> None:
         """
@@ -209,11 +273,16 @@ class RoutedExpertsCapturer:
         if self._device_buffer is None:
             raise RuntimeError("Device buffer not initialized.")
 
+        indices = np.asarray(indices, dtype=np.int64)
         num_tokens = len(indices)
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
+        capacity = self._host_buffer_view.shape[0]
+        valid_mask = indices >= 0
+        write_indices = np.remainder(indices[valid_mask], capacity)
+        data = data[valid_mask]
 
         with _file_lock(self._lock_file):
-            self._host_buffer_view[indices, :, :] = data
+            self._host_buffer_view[write_indices, :, :] = data
 
     def cleanup(self) -> None:
         """Explicitly clean up shared memory resources."""
@@ -280,10 +349,11 @@ class RoutedExpertsReader:
             return  # Already attached
 
         hf_config = vllm_config.model_config.hf_text_config
+        num_experts_per_tok = _get_num_experts_per_tok(hf_config)
         shape = (
             max_num_kv_tokens,
-            hf_config.num_hidden_layers,
-            hf_config.num_experts_per_tok,
+            _get_num_layer_slots(hf_config),
+            num_experts_per_tok,
         )
 
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -318,8 +388,11 @@ class RoutedExpertsReader:
         if self._lock_file is None:
             raise RuntimeError("Lock file not initialized.")
 
+        capacity = self._host_buffer_view.shape[0]
+        read_indices = np.remainder(indices, capacity)
+
         with _file_lock(self._lock_file, mode="rb+"):
-            return self._host_buffer_view[indices, :, :].copy()
+            return self._host_buffer_view[read_indices, :, :].copy()
 
     def cleanup(self) -> None:
         """Explicitly clean up resources (close without unlink)."""

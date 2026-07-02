@@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
 from .interfaces import HasInnerState, IsHybrid
 from .utils import (make_empty_intermediate_tensors_factory, maybe_prefix)
@@ -116,33 +117,15 @@ _VLLM_TIDAR_SMOE_MOE_OP = (
     in ("1", "true", "yes"))
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
-    """LM-head projection that returns fp32 logits via out_dtype.
-
-    Uses bf16 inputs/weights with fp32 accumulation via ``out_dtype``,
-    which dispatches to Hopper SM90 Tensor Cores (cublasLt). The earlier
-    v0.16 implementation upcast both operands to fp32 first; that path
-    falls back to SM80 (Ampere) fp32 GEMM kernels on H100 and costs
-    ~2.3ms/step on TF spec-decode (verifier + drafter compute_logits at
-    K+1=17 tokens, vocab=262272). Matches v0.15 behavior. Falls back
-    to explicit fp32 upcast on platforms that don't support out_dtype
-    (e.g. ROCm).
-    """
+    """LM-head projection that returns fp32 logits via explicit upcast."""
 
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
-        try:
-            out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
-        except (TypeError, RuntimeError):
-            # ROCm / older torch path: upcast operands; cache the fp32
-            # weight transpose so we don't materialize 2GB per call.
-            _cached = getattr(layer, "_fp32_weight_t_cache", None)
-            if (_cached is None
-                    or _cached.data_ptr() == 0
-                    or _cached.dtype != torch.float32):
-                _cached = layer.weight.t().to(torch.float32).contiguous()
-                layer._fp32_weight_t_cache = _cached
-            out = torch.mm(x.to(torch.float32), _cached)
+        # Match minimal_fp32: explicitly upcast both operands and keep logits
+        # accumulation in fp32.
+        out = torch.mm(x.to(torch.float32),
+                       layer.weight.t().to(torch.float32))
         if bias is not None:
             out = out + bias.to(torch.float32)
         return out
@@ -361,9 +344,9 @@ class SMoEDecoderATTLayer(nn.Module):
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)      
         if residual is not None:
-            residual = residual.float() + hidden_states.float()
+            residual = residual + hidden_states
         else:
-            residual = hidden_states.float()
+            residual = hidden_states
         hidden_states = _apply_norm_with_fp32_residual(self.input_norm, residual,
                                                        layer_input_dtype)
         
@@ -437,8 +420,10 @@ class SMoERouter(nn.Module):
         use_eda_cfg = bool(getattr(config, "smoe_use_eda", False))
         self.use_eda = use_eda_cfg and (smoe_first_layer is not None) and (self.layer_number != smoe_first_layer)
 
-        ln_eps = float(getattr(config, "layernorm_epsilon", 1e-5))
-        self.rmsnorm_eda = RMSNorm(self.mlp_expansion, eps=ln_eps)
+        # Match minimal_fp32: use the SMoE config epsilon and torch reference
+        # RMSNorm on the router path.
+        ln_eps = float(getattr(config, "norm_epsilon", 1e-5))
+        self.rmsnorm_eda = torch.nn.RMSNorm(self.mlp_expansion, eps=ln_eps)
         if self.use_eda:
             # eda
             self.router_states_scale = nn.Parameter(torch.ones(self.mlp_expansion))
@@ -550,13 +535,10 @@ class SMoERouter(nn.Module):
             logits = _logits_padded[..., :self.num_experts]
         else:
             logits = self.router_mlp(hs_norm)
-        if self.router_softmax_fp32:
-            expert_prob = torch.softmax(logits, dim=-1, dtype=torch.float32)
-        else:
-            expert_prob = torch.softmax(logits, dim=-1)
+        expert_prob = torch.softmax(logits, dim=-1)
 
         # 4) Expert choice with balancing biases (biases affect choice only, not probabilities)
-        biased = expert_prob.detach().to(torch.float32) + self.balancing_biases
+        biased = expert_prob.detach() + self.balancing_biases.to(expert_prob.dtype)
         _, expert_choice_t = torch.topk(biased, self.topk, dim=-1)  # (S, topk)
 
         # 5) If MOD and topk>1, once skip expert is selected, force all subsequent choices to skip as well, but this never happens since we use topk=1
@@ -687,6 +669,14 @@ class SMoEBlock(nn.Module):
                     probs, indices.to(probs.dtype)], dim=-1)
                 hidden_states = self.experts(
                     hidden_states, packed_logits)
+
+        # FusedMoE only sees MOD-clamped expert ids. Router replay needs the
+        # original SMoE router indices, including the MOD lane, so overwrite the
+        # sidecar after the expert call. capture_disabled() still suppresses
+        # drafter forwards in TiDAR two-forward mode.
+        capturer = RoutedExpertsCapturer.get_instance()
+        if capturer is not None:
+            capturer.capture(self.experts.layer_id, indices)
 
         if self.tp_size > 1:
             hidden_states = self.experts.maybe_all_reduce_tensor_model_parallel(hidden_states)

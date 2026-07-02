@@ -485,6 +485,81 @@ class CCA(MambaBase, CustomOp):
         hs2_prefill_props.copy_(
             hs2.reshape(hs2_prefill_props.shape))
 
+    def _stash_spec_candidates_rowwise(
+        self,
+        hs_p: torch.Tensor,                 # [Tp, H] prefill tokens
+        qk_packed0_p: torch.Tensor,         # [Tp, E] prefill conv inputs
+        state_indices_p: torch.Tensor,      # [P] read slots
+        conv_states: torch.Tensor,
+        prev_hs: torch.Tensor,
+        num_prefills: int,
+        query_start_loc_p: torch.Tensor,
+        has_initial_states_p: torch.Tensor,
+        query_start_loc_p_cpu: Optional[torch.Tensor] = None,
+        has_initial_states_p_cpu: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Row-wise stash for NON-uniform prefill batches.
+
+        The vectorized prefill path stashes all K+1 post-position candidate
+        states per request so ``commit_spec_decode_state`` can roll the CCA
+        state back to the accepted prefix after rejection sampling. Batches
+        that mix TiDAR verify rows with ordinary prompt-prefill rows (or
+        contain a partial final verify block, drafts < K) fail the uniform
+        shape gate and take the fused/eager prefill path, which does not
+        stash: the verify rows would keep the default post-full-draft-suffix
+        state AND the stale stash from an earlier step would be committed
+        over live slots.
+
+        Stash row i corresponds to prefill row i (batch order), matching the
+        vectorized layout. Rows longer than the stash window (ordinary
+        prompt prefills; spec rows always satisfy L = drafts + 1 <= K + 1)
+        get slot -1 so commit skips them. Must run BEFORE the prefill path
+        updates conv_states, because candidate windows are built from the
+        pre-forward cached state. Non-uniform shapes are never cudagraph-
+        captured, so the Python control flow here is safe.
+        """
+        if query_start_loc_p_cpu is not None:
+            qsl = [int(x) for x in query_start_loc_p_cpu.tolist()]
+        else:
+            qsl = [int(x) for x in query_start_loc_p.tolist()]
+        if has_initial_states_p_cpu is not None:
+            has_init = [bool(x) for x in has_initial_states_p_cpu.tolist()]
+        else:
+            has_init = [bool(x) for x in has_initial_states_p.tolist()]
+        slots_cpu = [
+            int(x) for x in
+            state_indices_p[:num_prefills].detach().cpu().tolist()
+        ]
+        max_S = self._spec_max_S
+        time0 = self.cca_time0
+        total_padding = self.total_padding
+        start_off = total_padding - time0 + 1
+        n = min(num_prefills, self._spec_max_P, len(qsl) - 1, len(slots_cpu))
+        if n <= 0:
+            return
+        new_slots = torch.full((n, ), -1, dtype=torch.int64,
+                               device=self._spec_stash_slots.device)
+        for i in range(n):
+            start_i, end_i = qsl[i], qsl[i + 1]
+            L = end_i - start_i
+            if L < 1 or L > max_S or slots_cpu[i] < 0:
+                continue
+            qk_row = qk_packed0_p[start_i:end_i].T  # [E, L]
+            if has_init[i]:
+                cached = conv_states[slots_cpu[i]].to(qk_row.dtype)
+                qk2 = torch.cat([cached, qk_row], dim=-1)
+            else:
+                qk2 = F.pad(qk_row, (total_padding, 0))
+            # Candidate window n ends at row token n (same layout as the
+            # vectorized path): [E, L, time0] -> [L, E, time0].
+            windowed = qk2[:, start_off:].unfold(-1, time0, 1)
+            self._spec_stash_conv[i, :L].copy_(
+                windowed.permute(1, 0, 2).to(self._spec_stash_conv.dtype))
+            self._spec_stash_hs[i, :L].copy_(
+                hs_p[start_i:end_i].to(self._spec_stash_hs.dtype))
+            new_slots[i] = slots_cpu[i]
+        self._spec_stash_slots[:n].copy_(new_slots)
+
     @torch.inference_mode()
     def commit_spec_decode_state(
         self,
@@ -492,11 +567,17 @@ class CCA(MambaBase, CustomOp):
         virtual_engine: int = 0,
         idx_gpu: Optional[torch.Tensor] = None,
         arange_gpu: Optional[torch.Tensor] = None,
+        mask_gpu: Optional[torch.Tensor] = None,
     ) -> None:
         """Overwrite conv_states / prev_hs with the post-acceptance state.
 
         Called by the model runner after rejection sampling, OUTSIDE the
-        captured cudagraph.
+        captured cudagraph. ``num_accepted_per_batch_idx[i]`` refers to
+        stash row i (= prefill row i of the verify forward, batch order).
+        Entries < 0 mark rows that must NOT be committed (non-spec prefill
+        rows in a mixed batch); rows whose stashed slot is < 0 (not stashed
+        this step) are skipped as well. Skipping is implemented as a no-op
+        write-back of the row's current state so no host sync is needed.
         """
         n_used = min(len(num_accepted_per_batch_idx), self._spec_max_P)
         if (n_used == 0 or self._spec_stash_conv is None
@@ -509,27 +590,44 @@ class CCA(MambaBase, CustomOp):
 
         if idx_gpu is None or arange_gpu is None:
             K_max = self._spec_max_S - 1
-            accepted = [
-                min(max(0, n), K_max)
-                for n in num_accepted_per_batch_idx[:n_used]
-            ]
-            if len(accepted) < n_used:
-                accepted.extend([0] * (n_used - len(accepted)))
+            raw = list(num_accepted_per_batch_idx[:n_used])
+            if len(raw) < n_used:
+                raw.extend([-1] * (n_used - len(raw)))
+            accepted = [min(max(0, n), K_max) for n in raw]
             idx = torch.as_tensor(accepted, dtype=torch.long,
                                   device=self._spec_stash_conv.device)
             arange = torch.arange(n_used, device=idx.device)
+            mask = torch.as_tensor([n >= 0 for n in raw],
+                                   dtype=torch.bool, device=idx.device)
         else:
             idx = idx_gpu
             arange = arange_gpu
+            mask = mask_gpu
 
         selected_conv = self._spec_stash_conv[arange, idx]
         selected_hs = self._spec_stash_hs[arange, idx]
 
         slots = self._spec_stash_slots[:n_used].to(torch.long)
-        conv_states[slots] = selected_conv.to(
-            device=conv_states.device, dtype=conv_states.dtype)
-        prev_hs[slots] = selected_hs.to(
-            device=prev_hs.device, dtype=prev_hs.dtype)
+        valid = slots >= 0
+        if mask is not None:
+            valid = valid & mask
+        # Skipped rows write their own current state back (slot 0 is the
+        # reserved pad block for rows whose slot is -1) — keeps the scatter
+        # shape static and avoids a host sync on the valid mask.
+        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
+        cur_conv = conv_states[safe_slots]
+        cur_hs = prev_hs[safe_slots]
+        out_conv = torch.where(
+            valid.view(-1, 1, 1),
+            selected_conv.to(device=conv_states.device,
+                             dtype=conv_states.dtype),
+            cur_conv)
+        out_hs = torch.where(
+            valid.view(-1, 1),
+            selected_hs.to(device=prev_hs.device, dtype=prev_hs.dtype),
+            cur_hs)
+        conv_states[safe_slots] = out_conv
+        prev_hs[safe_slots] = out_hs
 
     def forward_native(
         self,
@@ -998,6 +1096,31 @@ class CCA(MambaBase, CustomOp):
                 and sf_verify_len <= self._spec_max_S
                 and P_pref <= self._spec_max_P
             )
+
+            # Non-uniform prefill batch under TiDAR (mixed verify + prompt
+            # prefill rows, or a partial final verify block): the fused /
+            # eager paths below don't stash spec candidates, so refresh the
+            # stash row-wise here BEFORE conv_states is updated. Without
+            # this, commit_spec_decode_state would commit a stale stash and
+            # the verify rows would keep the post-full-draft-suffix state.
+            if (self._spec_stash_conv is not None
+                    and not drafter_pass
+                    and not use_vectorized_prefill
+                    and not use_single_forward_prefill):
+                self._stash_spec_candidates_rowwise(
+                    hs_p=hs_p,
+                    qk_packed0_p=qk_packed0_p,
+                    state_indices_p=state_indices_tensor_p,
+                    conv_states=conv_states,
+                    prev_hs=prev_hs,
+                    num_prefills=P_pref,
+                    query_start_loc_p=query_start_loc_p,
+                    has_initial_states_p=has_initial_states_p,
+                    query_start_loc_p_cpu=getattr(
+                        attn_metadata, "query_start_loc_p_cpu", None),
+                    has_initial_states_p_cpu=getattr(
+                        attn_metadata, "has_initial_states_p_cpu", None),
+                )
 
             if use_vectorized_prefill:
                 hs2 = torch.empty(

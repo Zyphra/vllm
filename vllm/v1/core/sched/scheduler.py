@@ -262,8 +262,14 @@ class Scheduler(SchedulerInterface):
             assert len(kv_cache_config.kv_cache_groups) > 0, (
                 "enable_return_routed_experts requires at least one kv cache group"
             )
+            self._routed_experts_kv_groups = kv_cache_config.kv_cache_groups
+            # Block IDs returned by the KV cache manager are absolute across DP
+            # cache space, so routed-expert replay must use the same slot space.
             self.max_num_kv_tokens = (
-                kv_cache_config.num_blocks // len(kv_cache_config.kv_cache_groups) + 1
+                kv_cache_config.num_blocks
+                * self.parallel_config.data_parallel_size
+                * len(kv_cache_config.kv_cache_groups)
+                + 1
             ) * self.block_size
 
             self.routed_experts_reader.attach_buffer(
@@ -1520,7 +1526,15 @@ class Scheduler(SchedulerInterface):
         # compute slot mapping
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
+        # The worker saves captured routes at slot_mappings[0], i.e. KV cache
+        # GROUP 0's slot space. For hybrid models group 0 can be a Mamba/CCA
+        # group whose block_size (= max_model_len) differs from the cache
+        # config block size; using self.block_size here silently addressed a
+        # different slot space and made replayed routes garbage.
         block_size = self.block_size
+        kv_groups = getattr(self, "_routed_experts_kv_groups", None)
+        if kv_groups:
+            block_size = int(kv_groups[0].kv_cache_spec.block_size)
 
         # generate block offsets
         block_offsets = np.arange(0, block_size)
@@ -1531,6 +1545,10 @@ class Scheduler(SchedulerInterface):
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
+        # NOTE(TiDAR TF): the worker recomputes the same block-based slots
+        # from its input-batch block table before saving captured routes
+        # (slot_mappings[0] under TF is the TiDAR FA window layout, not this
+        # address space), so no window remap is needed on either side.
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(

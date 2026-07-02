@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator, Sequence
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import dataclass
 from functools import reduce
@@ -482,7 +482,11 @@ class GPUModelRunner(
                     "Unknown speculative decoding method: "
                     f"{self.speculative_config.method}"
                 )
-            self.rejection_sampler = RejectionSampler(self.sampler)
+            self.rejection_sampler = RejectionSampler(
+                self.sampler,
+                tidar_ar_temperature=getattr(
+                    self.speculative_config, "tidar_ar_temperature", None),
+            )
 
         self.num_spec_tokens = 0
         if self.speculative_config:
@@ -1882,7 +1886,6 @@ class GPUModelRunner(
                 if cascade_attn_prefix_lens
                 else 0
             )
-
             extra_attn_metadata_args = {}
             if use_spec_decode and isinstance(builder, GDNAttentionMetadataBuilder):
                 assert ubid is None, "UBatching not supported with GDN yet"
@@ -2399,16 +2402,22 @@ class GPUModelRunner(
     def _commit_tidar_cca_state(
         self,
         valid_sampled_token_ids: list,
+        num_draft_tokens: Sequence[int] | torch.Tensor | None = None,
+        query_lens_per_req: Sequence[int] | None = None,
     ) -> None:
         """Write the post-acceptance candidate state into each CCA layer.
 
         For each TiDAR-verified request, the rejection sampler emitted
         ``num_accepted + 1`` tokens (accepted drafts + bonus/recovered).
-        The CCA layer's vectorized prefill stashed K+1 candidate states
-        per req; here we pass num_accepted per req in batch order so
-        each layer writes the matching candidate to conv_states /
-        prev_hs. Required for FULL_DECODE_ONLY because the captured
-        graph cannot do this step itself.
+        The CCA layer's prefill stashed the per-position candidate states
+        for every prefill row of the verify forward, in prefill-row order.
+        The commit list must therefore be indexed by PREFILL ROW, not by
+        input-batch position and not compacted over spec rows: a mixed
+        batch can interleave prompt-prefill rows (no drafts) with verify
+        rows, and stash row i always means "i-th prefill row". Non-spec
+        rows get a -1 sentinel so the layer skips them. Required for
+        FULL_DECODE_ONLY because the captured graph cannot do this step
+        itself.
         """
         from vllm.config import get_layers_from_vllm_config
         from vllm.model_executor.layers.mamba.cca import CCA
@@ -2417,44 +2426,79 @@ class GPUModelRunner(
                 self.vllm_config, CCA)
         if not self._cca_layers_cache:
             return
-        num_accepted_per_batch_idx = [
-            max(0, len(tokens) - 1) for tokens in valid_sampled_token_ids
-        ]
-        if not num_accepted_per_batch_idx:
+        draft_counts: list[int] | None = None
+        if num_draft_tokens is not None:
+            if isinstance(num_draft_tokens, torch.Tensor):
+                draft_counts = [
+                    int(x) for x in num_draft_tokens.detach().cpu().tolist()
+                ]
+            else:
+                draft_counts = [int(x) for x in num_draft_tokens]
+
+        num_accepted_per_batch_idx: list[int]
+        if query_lens_per_req is not None:
+            # Replicate split_decodes_and_prefills(threshold=1) on the
+            # reordered batch: decode rows are the leading run of <=1-token
+            # rows; everything from the first longer row on is a prefill
+            # row (the CCA stash space).
+            qlens = [int(x) for x in query_lens_per_req]
+            num_reqs = len(qlens)
+            if num_reqs == 0 or max(qlens) <= 1:
+                return
+            if qlens[0] > 1:
+                num_decode_reqs = 0
+            else:
+                num_decode_reqs = next(
+                    i for i, q in enumerate(qlens) if q > 1)
+            num_accepted_per_batch_idx = []
+            for req_idx in range(num_decode_reqs, num_reqs):
+                has_draft = (
+                    draft_counts is None
+                    or (req_idx < len(draft_counts)
+                        and draft_counts[req_idx] > 0))
+                if has_draft and req_idx < len(valid_sampled_token_ids):
+                    num_accepted_per_batch_idx.append(
+                        max(0, len(valid_sampled_token_ids[req_idx]) - 1))
+                else:
+                    num_accepted_per_batch_idx.append(-1)
+        else:
+            # Legacy fallback: assume every batch row is a spec verify row.
+            num_accepted_per_batch_idx = [
+                max(0, len(tokens) - 1) for tokens in valid_sampled_token_ids
+            ]
+        if not num_accepted_per_batch_idx or all(
+                n < 0 for n in num_accepted_per_batch_idx):
             return
-        # Build idx_gpu / arange_gpu ONCE here (then pass to every layer).
-        # Each layer's commit_spec_decode_state would otherwise re-allocate
-        # both tensors on GPU. For ~40 CCA layers per step that's ~120
-        # tiny torch.as_tensor / torch.arange calls per spec-decode step
-        # -- the dominant verifier-side TiDAR overhead at b=1.
-        # Eligibility: idx_gpu/arange_gpu only useful when n_used > 0 and
-        # _spec_stash_conv exists on the layer; we mirror the layer's
-        # check approximately (any one layer can decide to ignore the
-        # passed tensors and fall back if needed).
+        # Build idx_gpu / arange_gpu / mask_gpu ONCE here (then pass to
+        # every layer). Each layer's commit_spec_decode_state would
+        # otherwise re-allocate them on GPU; for ~40 CCA layers per step
+        # that's the dominant verifier-side TiDAR overhead at b=1.
         _first_layer = next(iter(self._cca_layers_cache.values()))
         _spec_max_P = getattr(_first_layer, "_spec_max_P", 0) or 0
         _spec_max_S = getattr(_first_layer, "_spec_max_S", 0) or 0
         _stash_conv = getattr(_first_layer, "_spec_stash_conv", None)
         _idx_gpu = None
         _arange_gpu = None
+        _mask_gpu = None
         if _spec_max_P > 0 and _spec_max_S > 0 and _stash_conv is not None:
             n_used = min(len(num_accepted_per_batch_idx), _spec_max_P)
             if n_used > 0:
                 K_max = _spec_max_S - 1
-                accepted = [
-                    min(max(0, n), K_max)
-                    for n in num_accepted_per_batch_idx[:n_used]
-                ]
-                if len(accepted) < n_used:
-                    accepted.extend([0] * (n_used - len(accepted)))
+                raw = num_accepted_per_batch_idx[:n_used]
+                accepted = [min(max(0, n), K_max) for n in raw]
                 _idx_gpu = torch.as_tensor(
                     accepted, dtype=torch.long, device=_stash_conv.device)
                 _arange_gpu = torch.arange(n_used, device=_stash_conv.device)
+                _mask_gpu = torch.as_tensor(
+                    [n >= 0 for n in raw], dtype=torch.bool,
+                    device=_stash_conv.device)
         for cca_layer in self._cca_layers_cache.values():
             cca_layer.commit_spec_decode_state(
                 num_accepted_per_batch_idx,
                 idx_gpu=_idx_gpu,
-                arange_gpu=_arange_gpu)
+                arange_gpu=_arange_gpu,
+                mask_gpu=_mask_gpu)
+
     # === end TiDAR Block 11 ===========================================
 
     def _prepare_kv_sharing_fast_prefill(
@@ -3320,7 +3364,17 @@ class GPUModelRunner(
                 # the next forward's logits would be garbage.
                 if (self.speculative_config is not None
                         and self.speculative_config.use_tidar()):
-                    self._commit_tidar_cca_state(valid_sampled_token_ids)
+                    _sched_tokens = scheduler_output.num_scheduled_tokens
+                    self._commit_tidar_cca_state(
+                        valid_sampled_token_ids,
+                        num_draft_tokens=(
+                            spec_decode_metadata.num_draft_tokens
+                            if spec_decode_metadata is not None else None),
+                        query_lens_per_req=[
+                            _sched_tokens.get(rid, 0)
+                            for rid in self.input_batch.req_ids
+                        ],
+                    )
         else:
             valid_sampled_token_ids = []
             invalid_req_indices = discard_sampled_tokens_req_indices.tolist()
@@ -4125,6 +4179,18 @@ class GPUModelRunner(
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
 
+        if self.model_config.enable_return_routed_experts:
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                # slot_mappings[0] is KV cache group 0's standard slot
+                # mapping (block_id * group0_block_size + offset).
+                # Scheduler._get_routed_experts reads back with the same
+                # group-0 block ids and group-0 spec block size.
+                routed_expert_indices = self.slot_mapping
+                capturer.save_captured_experts(indices=routed_expert_indices)  # noqa
+            else:
+                logger.error("RoutedExpertsCapturer not initialized.")
+
         self.execute_model_state = ExecuteModelState(
             scheduler_output,
             logits,
@@ -4208,17 +4274,27 @@ class GPUModelRunner(
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
-                self._draft_token_ids = self.propose_draft_token_ids(
-                    scheduler_output,
-                    sampled_token_ids,
-                    self.input_batch.sampling_metadata,
-                    hidden_states,
-                    sample_hidden_states,
-                    aux_hidden_states,
-                    spec_decode_metadata,
-                    spec_decode_common_attn_metadata,
-                    slot_mappings,
-                )
+                capture_guard = nullcontext()
+                if (
+                    self.model_config.enable_return_routed_experts
+                    and self.speculative_config is not None
+                    and self.speculative_config.use_tidar()
+                ):
+                    capturer = RoutedExpertsCapturer.get_instance()
+                    if capturer is not None:
+                        capture_guard = capturer.capture_disabled()
+                with capture_guard:
+                    self._draft_token_ids = self.propose_draft_token_ids(
+                        scheduler_output,
+                        sampled_token_ids,
+                        self.input_batch.sampling_metadata,
+                        hidden_states,
+                        sample_hidden_states,
+                        aux_hidden_states,
+                        spec_decode_metadata,
+                        spec_decode_common_attn_metadata,
+                        slot_mappings,
+                    )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         spec_config = self.speculative_config
@@ -4235,7 +4311,11 @@ class GPUModelRunner(
             use_gpu_toks = (
                 spec_config.use_eagle() or spec_config.uses_draft_model()
             ) and not spec_config.disable_padded_drafter_batch
-            if use_gpu_toks:
+            # TiDAR two-forward must propose after bookkeeping: the draft
+            # reads the post-rejection CCA state, which is only committed
+            # once the compacted accepted/recovered tokens are parsed.
+            tidar_after_bookkeeping = spec_config.use_tidar()
+            if use_gpu_toks and not tidar_after_bookkeeping:
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
@@ -4263,6 +4343,9 @@ class GPUModelRunner(
                     ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
                     self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
             else:
+                # TiDAR two-forward must run after bookkeeping: that path
+                # parses compacted accepted/recovered tokens and commits the
+                # post-rejection CCA state before the next draft reads cache.
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
@@ -4304,13 +4387,6 @@ class GPUModelRunner(
             self.eplb_step()
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
-            if self.model_config.enable_return_routed_experts:
-                capturer = RoutedExpertsCapturer.get_instance()
-                if capturer is not None:
-                    capturer.save_captured_experts(indices=self.slot_mapping)  # noqa
-                else:
-                    logger.error("RoutedExpertsCapturer not initialized.")
-
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
                 req_id_to_index=req_id_to_index_output_copy,
@@ -6756,8 +6832,12 @@ class GPUModelRunner(
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
         block_size = self.cache_config.block_size
+        # Block IDs in scheduler slot mappings use the cache manager's absolute
+        # block namespace, not a per-kv-cache-group or per-DP namespace.
         self.max_num_kv_tokens = (
-            self.kv_cache_config.num_blocks // len(self.kv_cache_config.kv_cache_groups)
+            self.kv_cache_config.num_blocks
+            * self.parallel_config.data_parallel_size
+            * len(self.kv_cache_config.kv_cache_groups)
             + 1
         ) * block_size
         routed_experts_capturer.init_buffer(

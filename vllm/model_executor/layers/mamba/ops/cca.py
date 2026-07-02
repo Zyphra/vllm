@@ -293,9 +293,13 @@ def _causal_conv1d_update_kernel(
     idx_feats = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N) 
     mask_feat = idx_feats < dim 
 
-    # Always use state_indices_tensor_d
+    # Always use state_indices_tensor_d. The tensor can be a strided VIEW
+    # (e.g. a column of the per-token block table with stride == table
+    # width), so the row stride must be honored: indexing by idx_seq alone
+    # reads garbage slots for batch rows > 0, which silently froze the conv
+    # state of every request but the first under concurrent decode.
     cache_row = tl.load(
-        conv_state_indices_ptr + idx_seq,
+        conv_state_indices_ptr + idx_seq * stride_state_indices,
         mask = True,
         other = pad_slot_id,
     ).to(tl.int64)
@@ -506,6 +510,9 @@ def fused_pad_gather_scatter(
     S = state_indices.shape[0]
     H = hs_d.shape[-1]
 
+    # state_indices can be a strided view (block-table column); the kernel
+    # indexes it as a dense [S] array.
+    state_indices = state_indices.contiguous()
     hs_d_cast = hs_d.to(dtype=prev_hs.dtype) if hs_d.dtype != prev_hs.dtype else hs_d
     hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=prev_hs.dtype)
     decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)

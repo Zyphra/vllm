@@ -134,6 +134,13 @@ class SpeculativeConfig:
     and produce a full draft probability tensor for exact Leviathan-style
     rejection sampling. Engine-wide; per-request override is a TODO."""
 
+    tidar_ar_temperature: float = 1.0
+    """Temperature used when returning TiDAR AR verifier logprobs.
+    This is intentionally separate from tidar_diff_temperature: the drafter
+    can sample blocks with one temperature while the second forward's AR
+    verifier logprobs are reported under the trainer-matched score
+    temperature. Must be positive when AR logprobs are requested."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""

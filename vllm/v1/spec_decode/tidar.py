@@ -900,6 +900,7 @@ class TiDARProposer(EagleProposer):
         target_positions: torch.Tensor,
         last_token_indices: Optional[torch.Tensor],
         common_attn_metadata: CommonAttentionMetadata,
+        num_rejected_tokens_gpu: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, CommonAttentionMetadata]:
         batch_size = next_token_ids.shape[0]
         # FIX (drafter alignment): K+1 input tokens [next_token, mask×K]
@@ -965,14 +966,28 @@ class TiDARProposer(EagleProposer):
         query_start_loc_cpu = torch.arange(0, n_plus * query_len,
                                            query_len, dtype=torch.int32)
 
-        # seq_lens: prompt_len + query_len per req, clamped to max_model_len.
-        new_seq = torch.clamp(common_attn_metadata.seq_lens + query_len,
+        # seq_lens: live_prefix_len + query_len per req, clamped to
+        # max_model_len. After an intra-block rejection the verifier forward
+        # has advanced metadata through the full draft block, but the live
+        # continuation is only accepted_prefix plus the recovered token. Mirror
+        # Eagle's rollback here so the next TiDAR draft reads
+        # prefix + accepted_prefix, then consumes next_token_ids[req].
+        base_seq_lens = common_attn_metadata.seq_lens
+        base_seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        if num_rejected_tokens_gpu is not None:
+            rejected = num_rejected_tokens_gpu.to(dtype=base_seq_lens.dtype)
+            base_seq_lens = base_seq_lens - rejected
+            rejected_cpu = num_rejected_tokens_gpu.detach().cpu().to(
+                dtype=base_seq_lens_cpu.dtype)
+            base_seq_lens_cpu = base_seq_lens_cpu - rejected_cpu
+
+        new_seq = torch.clamp(base_seq_lens + query_len,
                               max=self.max_model_len).to(torch.int32)
         runner.seq_lens.gpu[:batch_size].copy_(new_seq)
         runner.seq_lens.gpu[batch_size:].fill_(0)
         seq_lens = runner.seq_lens.gpu[:batch_size]
-        seq_lens_cpu = torch.clamp(common_attn_metadata.seq_lens_cpu +
-                                   query_len, max=self.max_model_len)
+        seq_lens_cpu = torch.clamp(base_seq_lens_cpu + query_len,
+                                   max=self.max_model_len)
 
         # slot_mapping: write into FlashAttn group's persistent slot_mapping.
         # Use FA group id dynamically — hardcoded [0] picked the CCA group
@@ -999,7 +1014,7 @@ class TiDARProposer(EagleProposer):
             # v0.16: seq_lens_cpu is a @property; private field is
             # _seq_lens_cpu. Pass through if available.
             _seq_lens_cpu=seq_lens_cpu,
-            _num_computed_tokens_cpu=common_attn_metadata.seq_lens_cpu,
+            _num_computed_tokens_cpu=base_seq_lens_cpu,
             num_reqs=batch_size,
             num_actual_tokens=n_tokens,
             max_query_len=query_len,
@@ -1065,7 +1080,7 @@ class TiDARProposer(EagleProposer):
         if mm_embeds is None:
             mm_embeds = mm_embed_inputs
         del target_token_ids, target_hidden_states, sampling_metadata
-        del num_rejected_tokens_gpu, slot_mappings
+        del slot_mappings
 
         if mm_embeds is not None:
             raise NotImplementedError(
@@ -1082,6 +1097,7 @@ class TiDARProposer(EagleProposer):
                 target_positions=target_positions,
                 last_token_indices=last_token_indices,
                 common_attn_metadata=common_attn_metadata,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
 
         attn_metadata = self.attn_metadata_builder.build_for_drafting(
@@ -1357,7 +1373,6 @@ class TiDARProposer(EagleProposer):
     def validate_same_kv_cache_group(self,
                                      kv_cache_config: KVCacheConfig) -> None:
         super().validate_same_kv_cache_group(kv_cache_config)
-
 
 
 
