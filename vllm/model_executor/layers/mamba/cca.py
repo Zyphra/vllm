@@ -802,7 +802,7 @@ class CCA(MambaBase, CustomOp):
         if has_decode:
             # Generation
             # Handle PAD_SLOT_ID with torch.where for CUDA graph compatibility
-            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+            decode_is_pad = ((state_indices_tensor_d == PAD_SLOT_ID) | (state_indices_tensor_d < 0) | (state_indices_tensor_d >= prev_hs.shape[0]))  # ccaoob-fix(JZ): treat <0 / >=num_slots as pad -> avoids forward_triton illegal-mem (Xid31)
             safe_decode_indices = torch.where(
                 decode_is_pad,
                 torch.zeros_like(state_indices_tensor_d),
@@ -1294,7 +1294,7 @@ class CCA(MambaBase, CustomOp):
                     state_indices_tensor_d, hs_d, prev_hs,
                 )
             else:
-                decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+                decode_is_pad = ((state_indices_tensor_d == PAD_SLOT_ID) | (state_indices_tensor_d < 0) | (state_indices_tensor_d >= prev_hs.shape[0]))  # ccaoob-fix(JZ): treat <0 / >=num_slots as pad -> avoids forward_triton illegal-mem (Xid31)
                 safe_decode_indices = torch.where(
                     decode_is_pad,
                     torch.zeros_like(state_indices_tensor_d),

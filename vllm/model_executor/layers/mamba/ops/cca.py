@@ -513,6 +513,14 @@ def fused_pad_gather_scatter(
     # state_indices can be a strided view (block-table column); the kernel
     # indexes it as a dense [S] array.
     state_indices = state_indices.contiguous()
+    # ccaoob-fix(JZ): map OOB slots (<0 / >=num_blocks) to PAD_SLOT_ID (-1) so the
+    # kernel's existing pad-masking handles them. The kernel only tests ==PAD_SLOT_ID
+    # and never receives prev_hs.shape[0], so it cannot bounds-check on its own.
+    state_indices = torch.where(
+        (state_indices < 0) | (state_indices >= prev_hs.shape[0]),
+        torch.full_like(state_indices, -1),
+        state_indices,
+    )
     hs_d_cast = hs_d.to(dtype=prev_hs.dtype) if hs_d.dtype != prev_hs.dtype else hs_d
     hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=prev_hs.dtype)
     decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
