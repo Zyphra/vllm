@@ -3269,20 +3269,18 @@ class GPUModelRunner(
             _mixed = (_v1_w * _target_logits
                       + (1.0 - _v1_w) * _draft_logits)
             logits[_tli] = _mixed.to(_target_dtype)
-            # FIX: feed the soft draft distribution q = softmax(draft_logits)
-            # to the rejection sampler. Passing None routes to the Dirac /
-            # NO_DRAFT_PROBS branch, which nullifies the mix lift (and reads
-            # *below* the no-mix floor because the blended target is then
-            # inconsistent with a point-mass q). Mirrors the working mix
-            # branch (jinzhao/tidar_mix-logits). At T_diff>0 a real draft_probs
-            # already exists; only synthesize when it is None.
-            _draft_probs_mix = spec_decode_metadata.draft_probs
-            if _draft_probs_mix is None:
-                _draft_probs_mix = torch.softmax(
-                    _draft_logits, dim=-1).contiguous()
+            # Proper rejection sampling with the ACTUAL draft distribution q:
+            #  - T_diff>0: draft_probs holds the real softmax(draft_logits/T_diff)
+            #    the draft was multinomial-sampled from -> correct importance rej.
+            #  - T_diff==0: draft is argmax, so q is Dirac; draft_probs is None ->
+            #    the sampler's NO_DRAFT_PROBS branch (accept p(x*), recover from the
+            #    exact residual p with x* removed). This IS proper rejection sampling.
+            # Do NOT synthesize a soft q = softmax(draft_logits) when None: the argmax
+            # draft was never sampled from it, so dividing by that q over-accepts and
+            # biases the emitted sequence off the target (reverts jinzhao/tidar 4bba965c7).
             sampler_output = self.rejection_sampler(
                 spec_decode_metadata,
-                _draft_probs_mix,
+                spec_decode_metadata.draft_probs,
                 logits,
                 sampling_metadata,
             )
