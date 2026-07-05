@@ -3252,8 +3252,7 @@ class GPUModelRunner(
                 logprobs_tensors=None,
             )
         elif (_truthy_b5(_mix_v1) and _has_spec_meta
-                and spec_decode_metadata.draft_logits is not None
-                and sampling_metadata.temperature is not None):
+                and spec_decode_metadata.draft_logits is not None):
             # MIX-LOGIT V1: blend target + draft logits in-place, pass
             # to rejection sampler. mixed = w*target + (1-w)*draft.
             # Default w=0.5. draft_probs stays None at T_diff=0
