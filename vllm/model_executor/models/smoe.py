@@ -1004,6 +1004,41 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
         if bool(getattr(config, "smoe_high_prec", False)):
             self.lm_head.quant_method = _FP32EmbeddingMethod()
 
+        # --- DSpark diffusion draft head + Markov sampler (inference) ---
+        # Present when the checkpoint carries the DSpark semi-autoregressive
+        # draft head (config flag `dspark_markov_draft_head`, stamped by the
+        # HF conversion). Three replicated tensors (checkpoint is TP=1,
+        # vocab unsharded):
+        #   diffusion_output_layer.weight [vocab, hidden]  untied draft head W_d
+        #   diffusion_markov_head.w1      [vocab, rank]    prev-token table
+        #   diffusion_markov_head.w2      [rank, vocab]    bias projection
+        # Param names match checkpoint keys exactly so load_weights' generic
+        # path picks them up. Consumed by TiDARProposer's DSpark branch
+        # (vllm/v1/spec_decode/tidar.py); the AR lm_head above remains the
+        # verifier/target head.
+        self.dspark_markov_enabled = bool(
+            getattr(config, "dspark_markov_draft_head", False))
+        if self.dspark_markov_enabled:
+            if get_tensor_model_parallel_world_size() > 1:
+                raise NotImplementedError(
+                    "DSpark draft head requires TP=1 (vocab dim unsharded); "
+                    "shard diffusion_output_layer.weight/w2 column-wise and "
+                    "all-gather logits to lift this.")
+            _markov_rank = int(getattr(config, "diffusion_markov_rank", 256))
+            self.dspark_block_len = int(
+                getattr(config, "diffusion_block_len", 16))
+            self.diffusion_output_layer = nn.Module()
+            self.diffusion_output_layer.weight = nn.Parameter(
+                torch.empty(config.vocab_size, config.hidden_size),
+                requires_grad=False)
+            self.diffusion_markov_head = nn.Module()
+            self.diffusion_markov_head.w1 = nn.Parameter(
+                torch.empty(config.vocab_size, _markov_rank),
+                requires_grad=False)
+            self.diffusion_markov_head.w2 = nn.Parameter(
+                torch.empty(_markov_rank, config.vocab_size),
+                requires_grad=False)
+
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors)
 
