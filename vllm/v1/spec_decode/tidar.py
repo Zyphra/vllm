@@ -496,6 +496,10 @@ class TiDARProposer(EagleProposer):
 
         # 3. Drafter logits + sampling. Mirrors the existing propose()'s
         # logits + sampling block.
+        if self._dspark_active():
+            draft_token_ids = self._dspark_sample_drafts(proposal_hs, B)
+            return draft_token_ids.view(B, K).to(torch.int32)
+
         logits = self.model.compute_logits(proposal_hs)
         if logits is None:
             raise RuntimeError(
@@ -786,6 +790,76 @@ class TiDARProposer(EagleProposer):
             DEFAULT_TIDAR_MASK_TOKEN_ID,
         )
         return DEFAULT_TIDAR_MASK_TOKEN_ID
+
+    def _dspark_active(self) -> bool:
+        """DSpark draft head auto-enables when the target model carries the
+        weights (config flag -> smoe.py registers them). Kill switch:
+        VLLM_TIDAR_DSPARK=0 falls back to the AR-head drafter."""
+        return (getattr(self.model, "dspark_markov_enabled", False)
+                and os.environ.get("VLLM_TIDAR_DSPARK", "1") != "0")
+
+    def _dspark_sample_drafts(self, hidden: torch.Tensor,
+                              batch_size: int) -> torch.Tensor:
+        """DSpark draft: untied head + sequential Markov logit bias.
+
+        Per-position math (see dspark handoff doc):
+            U_k    = h_k @ W_d.T                (parallel, one matmul)
+            B_k    = w1[prev] @ w2              (sequential, cheap)
+            q_k    = softmax((U_k + B_k) / T)
+            x_k    ~ q_k                        (sample, not argmax)
+        `prev` resets to the neutral id 0 at every block boundary
+        (k % block_len == 0) and is chained through the sampled ids
+        within a block. It is deliberately NOT seeded from the bonus /
+        verified token -- the head was trained with the reset, and the
+        cross-block dependency is carried by the backbone attention.
+
+        Args:
+            hidden:     [B*K, hidden] mask-position hidden states,
+                        per-request contiguous.
+            batch_size: B.
+
+        Returns:
+            [B*K] flat draft token ids (caller reshapes). Stashes
+            last_draft_probs (exact q, fp32) and last_draft_logits
+            (biased logits) exactly like the AR-head path, so the
+            rejection sampler computes the exact accept ratio
+            min(1, p/q).
+        """
+        model = self.model
+        W_d = model.diffusion_output_layer.weight    # [V, H]
+        w1 = model.diffusion_markov_head.w1          # [V, R]
+        w2 = model.diffusion_markov_head.w2          # [R, V]
+        block_len = int(getattr(model, "dspark_block_len", 16))
+        K = self.num_speculative_tokens
+        B = batch_size
+        assert hidden.shape[0] == B * K, (
+            f"dspark expected {B}*{K} rows, got {hidden.shape[0]}")
+
+        U = torch.matmul(hidden, W_d.t()).view(B, K, -1)  # [B, K, V]
+        V = U.shape[-1]
+        T = self.diff_temperature
+        tokens = torch.empty(B, K, dtype=torch.long, device=U.device)
+        probs = (None if T == 0.0 else torch.empty(
+            B, K, V, dtype=torch.float32, device=U.device))
+        prev = torch.zeros(B, dtype=torch.long, device=U.device)
+        for k in range(K):
+            if k > 0 and k % block_len == 0:
+                prev.zero_()
+            bias = torch.matmul(w1.index_select(0, prev), w2)  # [B, V]
+            U[:, k].add_(bias)          # keep biased logits for the stash
+            logits_k = U[:, k].to(torch.float32)
+            if T == 0.0:
+                x = logits_k.argmax(dim=-1)
+            else:
+                q = torch.softmax(logits_k / T, dim=-1)
+                x = torch.multinomial(q, num_samples=1).squeeze(-1)
+                probs[:, k] = q
+            tokens[:, k] = x
+            prev = x
+        self.last_draft_logits = U.view(B * K, V).detach().contiguous()
+        self.last_draft_probs = (None if probs is None else
+                                 probs.view(B * K, V).contiguous())
+        return tokens.view(-1)
 
     def load_model(self, target_model: nn.Module) -> None:
         # TiDAR reuses the target checkpoint for drafting and verification.
@@ -1313,6 +1387,14 @@ class TiDARProposer(EagleProposer):
         draft_hidden_states = draft_hidden_states.view(
             batch_size_local, K + 1, -1)[:, 1:K + 1, :].contiguous().view(
             batch_size_local * K, -1)
+
+        if self._dspark_active():
+            # DSpark: untied draft head + Markov bias, sequential within
+            # the block. Stashes last_draft_probs/logits internally.
+            draft_token_ids = self._dspark_sample_drafts(
+                draft_hidden_states, batch_size_local)
+            return draft_token_ids.view(
+                -1, self.num_speculative_tokens).to(torch.int32)
 
         logits = self.model.compute_logits(draft_hidden_states)
         if logits is None:
