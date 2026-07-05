@@ -776,7 +776,8 @@ class CCA(MambaBase, CustomOp):
                 qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                 qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
                 
-                if has_initial_states_p[i]:
+                _use_init_p = bool(has_initial_states_p[i]) and (0 <= int(state_indices_tensor_p[i]) < prev_hs.shape[0])  # ccaoob-prefill-fix(JZ): OOB read slot -> no initial state
+                if _use_init_p:
                     hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                     hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
                     qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]
@@ -787,9 +788,11 @@ class CCA(MambaBase, CustomOp):
                     
                 hs2[start_i:end_i] = hs2_cur
 
-                conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                conv_states[state_indices_tensor_p[i]] = conv_states_cur.squeeze(0).to(
-                    device=conv_states.device, dtype=conv_states.dtype)
+                _widx_p = int(state_indices_tensor_p[i])  # ccaoob-prefill-fix(JZ): skip OOB write slot
+                if 0 <= _widx_p < conv_states.shape[0]:
+                    conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
+                    conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
+                        device=conv_states.device, dtype=conv_states.dtype)
                 
                 # Computing conv
                 qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
@@ -797,7 +800,12 @@ class CCA(MambaBase, CustomOp):
 
             qk_packed3_output_list.append(qk_packed3_p)
             hs2_output_list.append(hs2)
-            prev_hs[state_indices_tensor_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
+            _vals_p = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)  # ccaoob-prefill-fix(JZ)
+            _wv_p = (state_indices_tensor_p >= 0) & (state_indices_tensor_p < prev_hs.shape[0])
+            if bool(_wv_p.all()):
+                prev_hs[state_indices_tensor_p] = _vals_p
+            else:
+                prev_hs[state_indices_tensor_p[_wv_p]] = _vals_p[_wv_p]
 
         if has_decode:
             # Generation
@@ -1262,7 +1270,8 @@ class CCA(MambaBase, CustomOp):
                     qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                     qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
 
-                    if has_initial_states_p[i]:
+                    _use_init_p = bool(has_initial_states_p[i]) and (0 <= int(state_indices_tensor_p[i]) < prev_hs.shape[0])  # ccaoob-prefill-fix(JZ): OOB read slot -> no initial state
+                    if _use_init_p:
                         hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                         hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
                         qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]
@@ -1274,9 +1283,11 @@ class CCA(MambaBase, CustomOp):
                     hs2[start_i:end_i] = hs2_cur
 
                     if not drafter_pass:
-                        conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                        conv_states[_sit_write_p[i]] = conv_states_cur.squeeze(0).to(
-                            device=conv_states.device, dtype=conv_states.dtype)
+                        _widx_p = int(_sit_write_p[i])  # ccaoob-prefill-fix(JZ): skip OOB write slot
+                        if 0 <= _widx_p < conv_states.shape[0]:
+                            conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
+                            conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
+                                device=conv_states.device, dtype=conv_states.dtype)
 
                     # Computing conv
                     qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
@@ -1284,7 +1295,12 @@ class CCA(MambaBase, CustomOp):
                 qk_packed3_output_list.append(qk_packed3_p)
                 hs2_output_list.append(hs2)
                 if not drafter_pass:
-                    prev_hs[_sit_write_p] = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)
+                    _vals_p = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)  # ccaoob-prefill-fix(JZ)
+                    _wv_p = (_sit_write_p >= 0) & (_sit_write_p < prev_hs.shape[0])
+                    if bool(_wv_p.all()):
+                        prev_hs[_sit_write_p] = _vals_p
+                    else:
+                        prev_hs[_sit_write_p[_wv_p]] = _vals_p[_wv_p]
 
         _fused_decode_active = False
         if has_decode:
