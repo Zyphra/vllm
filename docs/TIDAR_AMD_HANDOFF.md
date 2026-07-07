@@ -10,6 +10,8 @@ The old production TiDAR TF path on AMD was correct after the AITER-FA causal-ma
 
 Path B is not "stock vLLM 0.24"; it is a v0.24-style adoption inside the v0.16-based fork. v0.24/DiffusionGemma helped by showing the clean architecture: V2 runner + spec-decode data path + model-state-style per-request state + async/cudagraph-friendly execution.
 
+2026-07-07 AMD/NVIDIA parity update: low AMD TF acceptance was traced to runs that missed the TiDAR TF paged AITER attention path and fell back to generic ROCm AITER extend attention. The branch now defaults that route on for TiDAR TF; older trees should set `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1` explicitly.
+
 ## 2. TF throughput numbers
 
 ### Current V2 TiDAR TF, single GPU, async captured
@@ -40,6 +42,7 @@ Acceptance caveats from the 2026-07-06 follow-up:
 - The old probe formula `total_tokens / (batch * propose_calls)` undercounts acceptance when requests finish early. `/shared/home/jinzhao/tidar_m5_logs/probe_v2_tidar_accept.py` now also accumulates actual V2 `num_sampled` across active requests and reports the old formula as `legacy_mean_accept_len`.
 - `vllm/attention/ops/tf_attention.py` now honors `VLLM_TIDAR_TF_PAGED_NO_SPLITS=1` and the legacy `VLLM_TIDAR_FA_NO_SPLITS=1`. `vllm/v1/attention/backends/rocm_aiter_fa.py` now uses a gated TiDAR K+1 decode branch instead of the older unconditional `_dmql > 1` branch.
 - Corrected b16/MT256 eager diagnostic on `ibm-head -> Slurm cnode-26`, GPU3, `iter_0012600`, AIME first16, `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, `PATCH_PROBE_REPEATS=2`: the log confirms `Using TiDAR TF paged attention in ROCm AITER-FA` for both draft (`causal=False`) and verify (`causal=True`). Warmed repeat-2 results: default split-K `272.221 tok/s`, corrected `mean_accept_len=5.542` (`legacy_mean_accept_len=3.821`); no-splits `286.869 tok/s`, corrected `mean_accept_len=5.613` (`legacy_mean_accept_len=3.765`). No-splits is a small tput win here, not an acceptance fix. The earlier low accept was mostly the legacy denominator plus short/workload mismatch, not temperature.
+- 2026-07-07 AMD-vs-NVIDIA b1 parity trace: without TF paged attention on AMD (`ibm-cnode-107`, GPU1), the drafter collapsed to constant token `47599`, output was incoherent, and corrected `mean_accept_len=1.000`. With `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, AMD produced coherent text and corrected `mean_accept_len=2.913`, matching the same short NVIDIA H100 trace (`2.870`). This was a run/config path issue, not a rejection-sampler or checkpoint mismatch. Logs: `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_054222_amd_cnode107_gpu1_b1_eager_trace.log`, `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_055619_amd_cnode107_gpu1_b1_eager_trace_tfpaged.log`, `/data/home/jinzhao/nv_v2_tidar_logs/accept_parity/20260706_233626_nv_b1_eager_trace_gpu7_nomproc.log`.
 - These eager diagnostic numbers do **not** replace the best captured V2 TF table above; they only validate the gated TF-paged helper and corrected acceptance accounting.
 
 Main logs:
@@ -304,6 +307,7 @@ TiDAR TF env:
 VLLM_USE_V2_MODEL_RUNNER=1
 VLLM_ATTENTION_BACKEND=ROCM_AITER_FA
 VLLM_TIDAR_TWO_FORWARD=1
+VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1  # explicit for older trees; default-on in tidar_v024
 VLLM_ENABLE_V1_MULTIPROCESSING=0
 VLLM_SKIP_SDPA_PREINIT=1
 VLLM_CCA_TRITON=1
@@ -351,12 +355,13 @@ Key implementation choices:
 - It builds `[accepted_token, mask x K]`, runs the draft pass bidirectionally, then returns K draft IDs to the existing V2 spec-decode path.
 - CCA state uses stable per-request slots so async scheduling does not move recurrent state between rows.
 - CUDA graph replay requires exact TiDAR verify shapes and exact TiDAR drafter shapes. Both are now captured on the single-GPU path.
+- On ROCm, TiDAR TF uses the TF paged AITER attention helper by default so draft and verify get their per-pass causal flags. Debug opt-outs remain `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=0` or `VLLM_TIDAR_DISABLE_TF_PAGED_ATTENTION=1`.
 - V2 fallback mask token id must be `4` when the checkpoint config lacks a TiDAR mask token id.
 
 ## 7. Next work
 
 1. **Debug M6.6:** captured DP+EP+EPLB concurrency. Focus on captured main graph + EPLB expert rearrangement/state, since eager EPLB concurrency passes and disabling drafter graphs did not help.
-2. **Use the corrected acceptance probe for any future TF tput claims.** The b16/MT256 corrected probe now reports active-request accept around `5.5-5.6`; the old legacy denominator should only be used for comparison with old logs.
+2. **Use the corrected acceptance probe for any future TF tput claims.** The b16/MT256 corrected probe reports active-request accept around `5.5-5.6`; the old legacy denominator should only be used for comparison with old logs. On AMD, also confirm the log line `Using TiDAR TF paged attention in ROCm AITER-FA` appears for both draft (`causal=False`) and verify (`causal=True`).
 3. **Rerun AMD b64 after the V2 TF graph-cap and fp32-LM-head fixes, and use a saturated/windowed benchmark for NVIDIA b64.** The old AMD b64 run capped graphs at `510` tokens and missed the true `1088`-token b64 TiDAR shapes. On NVIDIA the cap is fixed and the rebased branch now uses the fast `out_dtype=torch.float32` LM-head path, but short V2 b64 aggregates are drain-tail dominated; compare against `3803.7 tok/s` with a long MT10000-style run or a steady-state throughput window.
 4. **Refine DP pause/resume** so EPLB does not need `VLLM_TIDAR_V2_DP_KEEPALIVE=1` busy-spin while idle.
 5. **Decide whether to submit the v0.24 OOB PR** from `docs/tidar_amd_handoff/`; it is independent and already validated.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import socket
 import json
 import os
 import time
@@ -179,6 +180,143 @@ class ProfileStats:
 
 
 PROFILE_STATS = ProfileStats()
+
+
+class TraceStats:
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("PATCH_PROBE_TRACE", "0") == "1"
+        self.max_events = int(os.environ.get("PATCH_PROBE_TRACE_MAX_EVENTS",
+                                             "16"))
+        self.max_reqs = int(os.environ.get("PATCH_PROBE_TRACE_MAX_REQS",
+                                           "2"))
+        self.topk = int(os.environ.get("PATCH_PROBE_TRACE_TOPK", "5"))
+        self.reset(active=False)
+
+    def reset(self, active: bool = True) -> None:
+        self.active = self.enabled and active
+        self.sample_events = 0
+        self.propose_events = 0
+        self.run_label = os.environ.get("PATCH_PROBE_TRACE_LABEL", "")
+
+    def deactivate(self) -> None:
+        self.active = False
+
+    def _emit(self, payload: dict[str, Any]) -> None:
+        if self.run_label:
+            payload["label"] = self.run_label
+        payload["host"] = socket.gethostname()
+        print("PATCH_PROBE_TRACE " + json.dumps(payload, sort_keys=True),
+              flush=True)
+
+    def observe_sample(self, input_batch: Any, sampled_tokens: torch.Tensor,
+                       num_sampled: torch.Tensor,
+                       num_rejected: torch.Tensor) -> None:
+        if not self.active or self.sample_events >= self.max_events:
+            return
+        try:
+            num_reqs = int(input_batch.num_reqs)
+            limit = min(num_reqs, self.max_reqs)
+            cu = input_batch.cu_num_logits_np
+            expanded_input_ids = (
+                input_batch.input_ids[input_batch.logits_indices]
+                .detach().cpu().tolist())
+            sampled_cpu = sampled_tokens[:limit].detach().cpu().tolist()
+            num_sampled_cpu = num_sampled[:limit].detach().cpu().tolist()
+            num_rejected_cpu = num_rejected[:limit].detach().cpu().tolist()
+            rows = []
+            for req_idx in range(limit):
+                start = int(cu[req_idx])
+                end = int(cu[req_idx + 1])
+                input_row = expanded_input_ids[start:end]
+                ns = int(num_sampled_cpu[req_idx])
+                nr = int(num_rejected_cpu[req_idx])
+                sampled_row = sampled_cpu[req_idx][:ns]
+                max_drafts = max(0, len(input_row) - 1)
+                compare_len = min(ns, max_drafts)
+                matches = [
+                    int(sampled_row[i]) == int(input_row[i + 1])
+                    for i in range(compare_len)
+                ]
+                first_mismatch = None
+                for i, ok in enumerate(matches):
+                    if not ok:
+                        first_mismatch = i
+                        break
+                rows.append({
+                    "req": req_idx,
+                    "input_ids": input_row,
+                    "sampled_tokens": sampled_row,
+                    "num_sampled": ns,
+                    "num_rejected": nr,
+                    "accepted_drafts": max(0, ns - 1),
+                    "matches": matches,
+                    "first_mismatch": first_mismatch,
+                })
+            self._emit({
+                "event": "sample",
+                "step": self.sample_events,
+                "num_reqs": num_reqs,
+                "rows": rows,
+            })
+            self.sample_events += 1
+        except Exception as exc:
+            self._emit({
+                "event": "sample_trace_error",
+                "error": repr(exc),
+            })
+            self.sample_events = self.max_events
+
+    def observe_propose(self, speculator: tidar_v2.TiDARSpeculator,
+                        draft_tokens: torch.Tensor, num_reqs: int) -> None:
+        if not self.active or self.propose_events >= self.max_events:
+            return
+        try:
+            limit = min(num_reqs, self.max_reqs)
+            k = int(speculator.num_speculative_steps)
+            draft_cpu = draft_tokens[:limit].detach().cpu().tolist()
+            rows = []
+            logits = getattr(speculator, "last_draft_logits", None)
+            if logits is not None and self.topk > 0:
+                top_vals, top_ids = torch.topk(
+                    logits[:limit * k].float(), k=self.topk, dim=-1)
+                top_ids_cpu = top_ids.detach().cpu().tolist()
+                top_vals_cpu = top_vals.detach().cpu().tolist()
+            else:
+                top_ids_cpu = []
+                top_vals_cpu = []
+            for req_idx in range(limit):
+                row: dict[str, Any] = {
+                    "req": req_idx,
+                    "draft_tokens": draft_cpu[req_idx],
+                }
+                if top_ids_cpu:
+                    start = req_idx * k
+                    end = start + k
+                    row["topk_ids"] = top_ids_cpu[start:end]
+                    row["topk_values"] = top_vals_cpu[start:end]
+                    row["top1_top2_margin"] = [
+                        float(vals[0] - vals[1])
+                        for vals in top_vals_cpu[start:end]
+                        if len(vals) > 1
+                    ]
+                rows.append(row)
+            self._emit({
+                "event": "propose",
+                "step": self.propose_events,
+                "num_reqs": num_reqs,
+                "num_spec_tokens": k,
+                "rows": rows,
+            })
+            self.propose_events += 1
+        except Exception as exc:
+            self._emit({
+                "event": "propose_trace_error",
+                "error": repr(exc),
+            })
+            self.propose_events = self.max_events
+
+
+TRACE_STATS = TraceStats()
 _ORIG_PROPOSE = tidar_v2.TiDARSpeculator.propose
 _ORIG_TIDAR_RUN_MODEL = tidar_v2.TiDARSpeculator.run_model
 _ORIG_EXECUTE_MODEL = v2_model_runner.GPUModelRunner.execute_model
@@ -206,8 +344,14 @@ def _counted_propose(self: tidar_v2.TiDARSpeculator, *args: Any,
             }
         except Exception:
             meta = None
-    return PROFILE_STATS.timed_call(
+    draft_tokens = PROFILE_STATS.timed_call(
         "tidar_propose_total", _ORIG_PROPOSE, self, *args, meta=meta, **kwargs)
+    try:
+        input_batch = args[0]
+        TRACE_STATS.observe_propose(self, draft_tokens, int(input_batch.num_reqs))
+    except Exception:
+        pass
+    return draft_tokens
 
 
 tidar_v2.TiDARSpeculator.propose = _counted_propose
@@ -253,9 +397,17 @@ def _profiled_sample(self: v2_model_runner.GPUModelRunner, hidden_states: torch.
             "tokens": int(input_batch.num_tokens),
             "draft_tokens": int(input_batch.num_draft_tokens),
         }
-    return PROFILE_STATS.timed_call(
+    result = PROFILE_STATS.timed_call(
         "sample_logits_sampler_reject", _ORIG_SAMPLE, self, hidden_states,
         input_batch, grammar_output, meta=meta)
+    try:
+        sampler_output, num_sampled, num_rejected = result
+        TRACE_STATS.observe_sample(
+            input_batch, sampler_output.sampled_token_ids, num_sampled,
+            num_rejected)
+    except Exception:
+        pass
+    return result
 
 
 def _profiled_sample_tokens(self: v2_model_runner.GPUModelRunner,
@@ -360,10 +512,12 @@ def percentile(sorted_lens: Sequence[int], pct: float) -> int:
 def run_once(llm: LLM, prompts: list[str], sampling: SamplingParams) -> dict[str, Any]:
     ACCEPT_STATS.reset()
     PROFILE_STATS.reset()
+    TRACE_STATS.reset(active=True)
     torch.cuda.synchronize()
     start = time.perf_counter()
     outputs = llm.generate(prompts, sampling, use_tqdm=False)
     torch.cuda.synchronize()
+    TRACE_STATS.deactivate()
     elapsed = time.perf_counter() - start
 
     total_tokens, lens = output_token_count(outputs)

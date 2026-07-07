@@ -848,7 +848,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
             return False
         use_tf_paged_attention = os.environ.get(
             "VLLM_TIDAR_USE_TF_PAGED_ATTENTION",
-            os.environ.get("VLLM_TIDAR_USE_PAGED_ATTENTION", "0"),
+            os.environ.get("VLLM_TIDAR_USE_PAGED_ATTENTION", "1"),
         )
         if use_tf_paged_attention != "1":
             return False
