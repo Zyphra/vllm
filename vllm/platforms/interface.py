@@ -738,6 +738,10 @@ class Platform:
             if cache_config.user_specified_mamba_block_size
             else None
         )
+        # Zaya CCA stores block-boundary states, not Mamba2 chunks.
+        use_cache_block_size_for_mamba_all = (
+            getattr(model_config.hf_text_config, "model_type", None) == "zaya"
+        )
 
         # Get kernel block alignment from the backend's supported sizes
         with set_current_vllm_config(vllm_config):
@@ -754,7 +758,11 @@ class Platform:
             # TODO(tdoublep): this constraint can be relaxed fairly
             # easily by changing the way we layout chunks in the
             # mamba2 kernels.
-            base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
+            if use_cache_block_size_for_mamba_all:
+                base_chunk_size = cache_config.mamba_block_size
+            else:
+                base_chunk_size = mamba_block_size
+            base_chunk_size = base_chunk_size or model_config.get_mamba_chunk_size()
             assert base_chunk_size is not None
             attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)

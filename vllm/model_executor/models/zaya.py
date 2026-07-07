@@ -21,6 +21,8 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.cca import CCA
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
+    MambaStateCopyFuncCalculator,
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
@@ -36,7 +38,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.zaya import ZayaConfig
 
-from .interfaces import HasInnerState, IsHybrid
+from .interfaces import HasInnerState, IsHybrid, SupportsMambaPrefixCaching
 from .utils import make_empty_intermediate_tensors_factory, maybe_prefix
 
 logger = logging.getLogger(__name__)
@@ -479,7 +481,9 @@ class ZayaModel(nn.Module):
         return hidden_states
 
 
-class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
+class ZayaForCausalLM(
+    nn.Module, HasInnerState, IsHybrid, SupportsMambaPrefixCaching
+):
     @classmethod
     def get_mamba_state_dtype_from_config(
         cls,
@@ -509,14 +513,18 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
             ),
         )
 
+    @classmethod
+    def get_mamba_state_copy_func(
+        cls,
+    ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
+        return MambaStateCopyFuncCalculator.cca_state_copy_func()
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         lora_config = vllm_config.lora_config
         scheduler_config = vllm_config.scheduler_config
         assert config.num_experts_per_tok == 1, "Only topk=1 is supported in Zaya!"
-        assert not cache_config.enable_prefix_caching, (
-            "Zaya currently does not support prefix caching")
 
         tp_world_size = get_tensor_model_parallel_world_size()
         if tp_world_size > 1:
