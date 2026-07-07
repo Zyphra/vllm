@@ -25,8 +25,8 @@ Run context: `ibm-cnode-19`, GPU 3, `FULL_AND_PIECEWISE`, `ROCM_AITER_FA`, K=16,
 | 1 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `108.635 tok/s` | `4.000` | MT128, offset 0, seed 0 | Current V2 |
 | 3 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `298.601 tok/s` | `4.000` | MT256, offset 12, seed 1 | Best of two b3 cases |
 | 8 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | **`553.839 tok/s`** | `3.103` | MT512, offset 0, seed 0 | Current headline |
-| 16 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `799.495 tok/s` | `2.560` | MT128, offset 0, seed 0 | Short MT; includes harder prompts 8-15 |
-| 64 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `570.355 tok/s` | `2.723` | MT128, offset 0, seed 0 | 64 prompts by cycling the 30-prompt AIME set |
+| 16 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `940.229 tok/s` | `6.548` | MT2000, AIME25 thinking-off, `iter_0012600`, seed 0 | Long v0.16-like config; corrected accept |
+| 64 | V2 + async + `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` + verify/drafter graphs | `2743.088 tok/s` | `6.120` | MT2000, AIME25 thinking-off, `iter_0012600`, seed 0 | Cap fixed; single full-sweep repeat. Separate b64 rerun best: `2699.349 tok/s`, accept `6.552` |
 
 Other measured V2 TF cases:
 
@@ -34,6 +34,8 @@ Other measured V2 TF cases:
 |---|---:|---:|---|
 | b3, MT128, offset 0, seed 0 | `224.316 tok/s` | `3.048` | Lower than b3/MT256 offset12 |
 | b8, MT256, offset 8, seed 1 | `438.955 tok/s` | `2.485` | Harder prompt slice |
+| b1, MT2000, AIME25 thinking-off | `100.146 tok/s` | `5.208` | Long v0.16-like config, `iter_0012600` |
+| b8, MT2000, AIME25 thinking-off | `482.468 tok/s` | `5.400` | Long v0.16-like config; repeat 1 was `459.985 tok/s`, accept `6.499` |
 
 Acceptance caveats from the 2026-07-06 follow-up:
 
@@ -43,7 +45,8 @@ Acceptance caveats from the 2026-07-06 follow-up:
 - `vllm/attention/ops/tf_attention.py` now honors `VLLM_TIDAR_TF_PAGED_NO_SPLITS=1` and the legacy `VLLM_TIDAR_FA_NO_SPLITS=1`. `vllm/v1/attention/backends/rocm_aiter_fa.py` now uses a gated TiDAR K+1 decode branch instead of the older unconditional `_dmql > 1` branch.
 - Corrected b16/MT256 eager diagnostic on `ibm-head -> Slurm cnode-26`, GPU3, `iter_0012600`, AIME first16, `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, `PATCH_PROBE_REPEATS=2`: the log confirms `Using TiDAR TF paged attention in ROCm AITER-FA` for both draft (`causal=False`) and verify (`causal=True`). Warmed repeat-2 results: default split-K `272.221 tok/s`, corrected `mean_accept_len=5.542` (`legacy_mean_accept_len=3.821`); no-splits `286.869 tok/s`, corrected `mean_accept_len=5.613` (`legacy_mean_accept_len=3.765`). No-splits is a small tput win here, not an acceptance fix. The earlier low accept was mostly the legacy denominator plus short/workload mismatch, not temperature.
 - 2026-07-07 AMD-vs-NVIDIA b1 parity trace: without TF paged attention on AMD (`ibm-cnode-107`, GPU1), the drafter collapsed to constant token `47599`, output was incoherent, and corrected `mean_accept_len=1.000`. With `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, AMD produced coherent text and corrected `mean_accept_len=2.913`, matching the same short NVIDIA H100 trace (`2.870`). This was a run/config path issue, not a rejection-sampler or checkpoint mismatch. Logs: `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_054222_amd_cnode107_gpu1_b1_eager_trace.log`, `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_055619_amd_cnode107_gpu1_b1_eager_trace_tfpaged.log`, `/data/home/jinzhao/nv_v2_tidar_logs/accept_parity/20260706_233626_nv_b1_eager_trace_gpu7_nomproc.log`.
-- These eager diagnostic numbers do **not** replace the best captured V2 TF table above; they only validate the gated TF-paged helper and corrected acceptance accounting.
+- 2026-07-07 AMD long v0.16-like sweep on `ibm-cnode-107` GPU1 used AIME25 thinking-off prompts, `MT=2000`, K=16, target/draft temp `0.0`, `ROCM_AITER_FA`, `FULL_AND_PIECEWISE`, `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, `VLLM_TIDAR_TF_PAGED_NO_SPLITS=1`, prompt-token IDs with a single BOS, and ignore-EOS. AMD does not have `iter_0012000` under `/shared`, so this used available checkpoint `iter_0012600`. Results: b1 `100.146 tok/s`, accept `5.208`; b8 `482.468`, accept `5.400` (second repeat accept `6.499`); b16 `940.229`, accept `6.548`; b64 `2743.088`, accept `6.120` from the full sweep, plus a clean b64 rerun best `2699.349`, accept `6.552`. Logs: `/shared/home/jinzhao/tfscope/amd_long_v016/20260707_062913_cnode-107_gpu1_v2_tf_fp_long_iter12600_b1_b8_b16_b64_mt2000.log`, `/shared/home/jinzhao/tfscope/amd_long_v016/20260707_065110_cnode-107_gpu1_v2_tf_fp_long_iter12600_b64_mt2000_rerun.log`.
+- The eager diagnostic numbers do **not** replace the best captured V2 TF table above; they only validate the gated TF-paged helper and corrected acceptance accounting.
 
 Main logs:
 
@@ -52,15 +55,15 @@ Main logs:
 - `/shared/home/jinzhao/tidar_m5_logs/20260706_181316_cnode19_v2_async_captured_b64_mt128.log`
 - `/shared/home/jinzhao/tidar_m5_logs/20260706_214938_cnode26_v2_tfpaged_repeats2_b16_mt256_default_vs_nosplits.log`
 
-Current V2 has surpassed the old AMD TF path at b1 and b16. The new b64/MT128 point is **lower** than the historical b64 number, so the old b64 result remains the best-known AMD TF b64 throughput for now. That comparison is not perfectly apples-to-apples because the historical table used the older matched-config long-run setup, while the current V2 b64 point is a short MT128 sweep with cycled prompts.
+Current V2 has surpassed the old AMD TF path at b1, b16, and b64. The old b64/MT128 point was lower because it was short-window and graph-cap limited; the 2026-07-07 MT2000 rerun captured the `1088 = 64 * (K + 1)` TiDAR shapes and is the current best AMD b64 TF result.
 
-2026-07-06 scaling follow-up: the b64 V2 run was also **graph-cap limited**. The log shows `max_cudagraph_capture_size=510`, but a b64 TiDAR TF verify/draft batch is `64 * (K + 1) = 1088` tokens. That means the exact b64 TiDAR verify/draft graph shapes could not be captured. `vllm/config/vllm.py` now bumps the V2 TF TiDAR graph cap to at least `max_num_seqs * (K + 1)`; rerun b64 before treating the `570.355 tok/s` result as real scaling.
+2026-07-06 scaling follow-up: the b64 V2 run was also **graph-cap limited**. The log shows `max_cudagraph_capture_size=510`, but a b64 TiDAR TF verify/draft batch is `64 * (K + 1) = 1088` tokens. That means the exact b64 TiDAR verify/draft graph shapes could not be captured. `vllm/config/vllm.py` now bumps the V2 TF TiDAR graph cap to at least `max_num_seqs * (K + 1)`. This is superseded by the 2026-07-07 MT2000 b64 rerun above, which captured `1088` and reached `2.7k tok/s`.
 
 | bsz | Historical AMD TF | Current V2 AMD TF | Status |
 |---:|---:|---:|---|
 | 1 | `23.9 tok/s` | `108.635 tok/s` | V2 is **4.54x** faster |
-| 16 | `351.5 tok/s` | `799.495 tok/s` | V2 is **2.27x** faster |
-| 64 | `862.6 tok/s` | `570.355 tok/s` | V2 b64/MT128 is **0.66x** of historical b64 |
+| 16 | `351.5 tok/s` | `940.229 tok/s` | V2 is **2.67x** faster |
+| 64 | `862.6 tok/s` | `2743.088 tok/s` | V2 is **3.18x** faster; clean b64 rerun best `2699.349 tok/s` |
 
 ### NVIDIA V2 TiDAR TF cross-check
 
@@ -121,6 +124,25 @@ Fresh b64 rerun on GPU0 confirmed the fixed cap path
 (`max_cudagraph_capture_size=1088`, capture sizes include `1088`) and measured
 `2031.500 tok/s`, corrected accept `7.597`; the best b64 value remains
 `2065.417 tok/s`.
+
+2026-07-07 AMD follow-up with the same long prompt/window/capture config: AIME25
+thinking-off, `MT=2000`, K=16, target/draft temp `0.0`, prompt-token IDs with a
+single BOS, ignore-EOS, `ROCM_AITER_FA`, `FULL_AND_PIECEWISE`,
+`VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1`, and `VLLM_TIDAR_TF_PAGED_NO_SPLITS=1`.
+The only non-match is checkpoint: AMD has `iter_0012600` available under
+`/shared`, not the NVIDIA apple `iter_0012000`.
+
+| bsz | NVIDIA V2 FP tput / acc (`iter_0012000`) | AMD V2 FP tput / acc (`iter_0012600`) | AMD/NVIDIA tput |
+|---:|---:|---:|---:|
+| 1 | `262.855 tok/s` / `8.541` | `100.146 tok/s` / `5.208` | `0.38x` |
+| 8 | `1211.162 tok/s` / `7.263` | `482.468 tok/s` / `5.400` | `0.40x` |
+| 16 | `1815.837 tok/s` / `7.065` | `940.229 tok/s` / `6.548` | `0.52x` |
+| 64 | `2065.417 tok/s` / `7.433` | `2743.088 tok/s` / `6.120` | `1.33x` |
+
+AMD b64 note: the full sweep container was reaped after one b64 repeat, but that
+repeat completed. A separate b64-only rerun completed two repeats and measured
+best `2699.349 tok/s`, corrected accept `6.552`, so use `2.7k tok/s` as the
+stable AMD long-config b64 result.
 
 2026-07-06 profile + historical b64 follow-up:
 
@@ -208,14 +230,14 @@ NVIDIA V2 probe logs:
 
 ### Historical cross-platform table, not apples-to-apples
 
-This began as a b1/b16/b64 matched-config AR/TF/SF comparison on AIME thinking-on, max_tokens=10000, K=16. It predates the current V2 TiDAR path. The table below now reports **best-known** throughput per mode/platform/batch. NVIDIA TF b1 and b16 use the current V2 `FULL_AND_PIECEWISE` apple-config run; NVIDIA TF b64 stays on the v0.16-family old-runner long run. AMD TF b1 and b16 use the current V2 path; AMD TF b64 stays on the historical path because the AMD V2 b64 cap-fix rerun has not landed yet.
+This began as a b1/b16/b64 matched-config AR/TF/SF comparison on AIME thinking-on, max_tokens=10000, K=16. It predates the current V2 TiDAR path. The table below now reports **best-known** throughput per mode/platform/batch. NVIDIA TF b1 and b16 use the current V2 `FULL_AND_PIECEWISE` apple-config run; NVIDIA TF b64 stays on the v0.16-family old-runner long run. AMD TF b1 uses the earlier current V2 short run; AMD TF b16/b64 use the 2026-07-07 long V2 `FULL_AND_PIECEWISE` sweep.
 
 **Best throughput by mode and batch size, with backend used for each mode:**
 
 | Mode | NVIDIA backend | AMD backend | b=1 NV / AMD | b=16 NV / AMD | b=64 NV / AMD |
 |---|---|---|---:|---:|---:|
 | AR | `FLASH_ATTN` v3 + FULL cudagraph | `ROCM_AITER_FA` + FULL cudagraph + AITER-MoE | 101 / **75.9** | 1142 / **833.8** | 2803 / **2457.9** |
-| TF | mixed best: b1/b16 V2 async `FLASH_ATTN` v3 + `FULL_AND_PIECEWISE`; b64 v0.16-family old runner `FLASH_ATTN` v3 + `FULL_DECODE_ONLY` | mixed best: b1/b16 V2 async captured `ROCM_AITER_FA` + `FULL_AND_PIECEWISE`; b64 historical fixed `ROCM_AITER_FA` TF attention + PIECEWISE | **262.855** / **108.635** | **1815.837** / **799.495** | **3803.7** / **862.6** |
+| TF | mixed best: b1/b16 V2 async `FLASH_ATTN` v3 + `FULL_AND_PIECEWISE`; b64 v0.16-family old runner `FLASH_ATTN` v3 + `FULL_DECODE_ONLY` | V2 async captured `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` | **262.855** / **108.635** | **1815.837** / **940.229** | **3803.7** / **2743.088** |
 | SF | FLEX + Triton split-K + FULL cudagraph | FLEX + Triton split-K + FULL cudagraph | 181 / **159** | 994 / **952** | 1337 / **1406** |
 
 Best tput for each mode on each platform after applying the V2 TF supersession where it wins:
@@ -223,7 +245,7 @@ Best tput for each mode on each platform after applying the V2 TF supersession w
 | Mode | NVIDIA backend | NVIDIA best tput | NVIDIA best bsz | AMD backend | AMD best tput | AMD best bsz |
 |---|---|---:|---:|---|---:|---:|
 | AR | `FLASH_ATTN` v3 + FULL cudagraph | **2803 tok/s** | 64 | `ROCM_AITER_FA` + FULL cudagraph + AITER-MoE | **2457.9 tok/s** | 64 |
-| TF | mixed: V2 `FLASH_ATTN` v3 + `FULL_AND_PIECEWISE` at b1/b16; v0.16-family old runner `FLASH_ATTN` v3 + `FULL_DECODE_ONLY` at b64 | **3803.7 tok/s** | 64 | historical fixed `ROCM_AITER_FA` TF attention + PIECEWISE at b64; V2 async captured wins b1/b16 | **862.6 tok/s** | 64 |
+| TF | mixed: V2 `FLASH_ATTN` v3 + `FULL_AND_PIECEWISE` at b1/b16; v0.16-family old runner `FLASH_ATTN` v3 + `FULL_DECODE_ONLY` at b64 | **3803.7 tok/s** | 64 | V2 async captured `ROCM_AITER_FA` + `FULL_AND_PIECEWISE` | **2743.088 tok/s** | 64 |
 | SF | FLEX + Triton split-K + FULL cudagraph | **1337 tok/s** | 64 | FLEX + Triton split-K + FULL cudagraph | **1406 tok/s** | 64 |
 
 Takeaway from that older table: pre-Path-B AMD TF was the outlier because TF paid eager attention plus the per-step host barrier twice per step. The current V2 path addresses that with async scheduling and graph replay.

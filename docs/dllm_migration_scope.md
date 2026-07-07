@@ -346,16 +346,16 @@ Main logs:
 `/shared/home/jinzhao/tidar_m5_logs/20260702_192418_cnode19_b3_parity_after_cleanup.log`,
 `/shared/home/jinzhao/tidar_m5_logs/20260706_181316_cnode19_v2_async_captured_b64_mt128.log`.
 
-The b64 V2 point does **not** beat the older historical AMD TF b64 number (`862.6 tok/s`),
-so use current V2 as the best-known AMD TF result at b1/b16 and the historical path as
-the best-known AMD TF result at b64 until a longer apples-to-apples b64 sweep is run.
+This b64 V2 point did **not** beat the older historical AMD TF b64 number
+(`862.6 tok/s`) and was temporarily left below the historical result. It is now
+superseded by the 2026-07-07 long/cap-fixed b64 run (`2743.088 tok/s`, clean
+rerun `2699.349 tok/s`) documented below.
 2026-07-06 scaling follow-up: the old b64 V2 point was graph-cap limited. Its log shows
 `max_cudagraph_capture_size=510`, while a b64 TiDAR TF verify/draft batch is
 `64 * (K + 1) = 1088` tokens, so exact b64 TiDAR graph replay could not happen.
 `vllm/config/vllm.py` now bumps the V2 TF TiDAR graph cap to at least
-`max_num_seqs * (K + 1)`. Rerun b64 with
-`/shared/home/jinzhao/tidar_m5_logs/probe_v2_tidar_captured.py` before drawing any
-scaling conclusion.
+`max_num_seqs * (K + 1)`. The 2026-07-07 run below is that b64 rerun and confirms
+capture sizes include `1088`.
 
 2026-07-06 acceptance follow-up: the short V2 probe used target temperature `0.0`
 and `tidar_diff_temperature=0.0`, so acceptance is greedy argmax equality, not a
@@ -384,6 +384,19 @@ corrected `mean_accept_len=2.913`; the matching NVIDIA H100 trace was `2.870`.
 Logs: `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_054222_amd_cnode107_gpu1_b1_eager_trace.log`,
 `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_055619_amd_cnode107_gpu1_b1_eager_trace_tfpaged.log`,
 `/data/home/jinzhao/nv_v2_tidar_logs/accept_parity/20260706_233626_nv_b1_eager_trace_gpu7_nomproc.log`.
+
+2026-07-07 AMD long-config follow-up: ran the NVIDIA apple-style prompt/window/capture
+setup on MI300X (`ibm-cnode-107` GPU1): AIME25 thinking-off, `MT=2000`, K=16,
+target/draft temp `0.0`, prompt-token IDs with single BOS, ignore-EOS,
+`ROCM_AITER_FA`, `FULL_AND_PIECEWISE`, TF-paged AITER attention, and no-splits. The
+only mismatch is checkpoint because AMD lacks `iter_0012000` under `/shared`, so the
+run used `iter_0012600`. Results: b1 `100.146 tok/s`, accept `5.208`; b8
+`482.468`, accept `5.400` (second repeat accept `6.499`); b16 `940.229`, accept
+`6.548`; b64 `2743.088`, accept `6.120` from the full sweep, plus a clean b64-only
+rerun best `2699.349`, accept `6.552`. The b64 log confirms cap/capture sizes include
+`1088 = 64 * (K+1)`, so the old cap-limited `570 tok/s` point is superseded. Logs:
+`/shared/home/jinzhao/tfscope/amd_long_v016/20260707_062913_cnode-107_gpu1_v2_tf_fp_long_iter12600_b1_b8_b16_b64_mt2000.log`,
+`/shared/home/jinzhao/tfscope/amd_long_v016/20260707_065110_cnode-107_gpu1_v2_tf_fp_long_iter12600_b64_mt2000_rerun.log`.
 
 Conclusion after M5: the implementation is past the perf/correctness gate for this
 Path-B slice. Remaining pre-commit work is review cleanup of the broader diff, a decision
