@@ -33,8 +33,6 @@ pytestmark = [
 MODEL = os.getenv("VLLM_ZAYA_TEST_MODEL", "")
 BLOCK_SIZE = int(os.getenv("VLLM_ZAYA_TEST_BLOCK_SIZE", "16"))
 MAX_MODEL_LEN = int(os.getenv("VLLM_ZAYA_TEST_MAX_MODEL_LEN", "3072"))
-EXPECTED_CACHED_TOKENS = int(
-    os.getenv("VLLM_ZAYA_TEST_EXPECTED_CACHED_TOKENS", "2048"))
 GPU_MEMORY_UTILIZATION = float(
     os.getenv("VLLM_ZAYA_TEST_GPU_MEMORY_UTILIZATION", "0.9"))
 MOE_BACKEND = os.getenv("VLLM_ZAYA_TEST_MOE_BACKEND", "triton")
@@ -92,7 +90,8 @@ def test_zaya_prefix_cache_hit_matches_cold_cache():
         tokenizer = cold_llm.get_tokenizer()
         common_len = len(tokenizer.encode(COMMON_PREFIX))
         hit_len = len(tokenizer.encode(HIT_PROMPT))
-        assert common_len >= EXPECTED_CACHED_TOKENS, common_len
+        expected_cached_tokens = common_len // BLOCK_SIZE * BLOCK_SIZE
+        assert expected_cached_tokens > 2048, expected_cached_tokens
         assert hit_len + SAMPLING_PARAMS.max_tokens <= MAX_MODEL_LEN, hit_len
         cold_output = cold_llm.generate([HIT_PROMPT], SAMPLING_PARAMS)[0]
     finally:
@@ -107,9 +106,10 @@ def test_zaya_prefix_cache_hit_matches_cold_cache():
         del warm_llm
         cleanup_dist_env_and_memory()
 
-    assert warm_output.num_cached_tokens >= EXPECTED_CACHED_TOKENS, (
-        "expected a real prefix-cache hit, got "
-        f"{warm_output.num_cached_tokens} cached tokens")
+    assert warm_output.num_cached_tokens >= expected_cached_tokens, (
+        "expected a block-size-granular prefix-cache hit, got "
+        f"{warm_output.num_cached_tokens} cached tokens; expected at least "
+        f"{expected_cached_tokens}")
     check_logprobs_close(
         outputs_0_lst=[_tuple(cold_output)],
         outputs_1_lst=[_tuple(warm_output)],
