@@ -525,8 +525,6 @@ class ZayaForCausalLM(
         lora_config = vllm_config.lora_config
         scheduler_config = vllm_config.scheduler_config
         assert config.num_experts_per_tok == 1, "Only topk=1 is supported in Zaya!"
-        assert not cache_config.enable_prefix_caching, (
-            "Zaya currently does not support prefix caching")
 
         tp_world_size = get_tensor_model_parallel_world_size()
         if tp_world_size > 1:
