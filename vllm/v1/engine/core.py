@@ -213,10 +213,11 @@ class EngineCore:
         # Pause state for "keep" mode - freezes requests in queue.
         self._scheduler_paused = False
 
-        # Set by step()/step_with_batch_queue() to indicate execute_model
-        # was called this iteration. Used by DPEngineCoreProc.run_busy_loop()
-        # to avoid a redundant execute_dummy_batch when the worker already
-        # participated in coordinate_batch_across_dp inside execute_model.
+        # Set by step()/step_with_batch_queue() to indicate execute_model was
+        # called this iteration. Used by DPEngineCoreProc to avoid a redundant
+        # execute_dummy_batch when the worker already participated in the DP
+        # model-forward coordination path, including zero-token runtime dummy
+        # forwards.
         self._executor_called_this_step = False
 
         # Mark the startup heap as static so that it's ignored by GC.
@@ -416,6 +417,7 @@ class EngineCore:
             self._executor_called_this_step = False
             return {}, False
         scheduler_output = self.scheduler.schedule()
+        model_executed = scheduler_output.total_num_scheduled_tokens > 0
         self._executor_called_this_step = True
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
@@ -434,7 +436,7 @@ class EngineCore:
             scheduler_output, model_output
         )
 
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        return engine_core_outputs, model_executed
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -1216,6 +1218,15 @@ class EngineCoreProc(EngineCore):
                     request: Any
                     if request_type == EngineCoreRequestType.ADD:
                         req: EngineCoreRequest = add_request_decoder.decode(data_frames)
+                        if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+                            logger.info(
+                                "[V2DPDBG engine=%s] input_add_received "
+                                "req=%s req_wave=%d client=%d",
+                                getattr(self, "engine_index", "?"),
+                                req.request_id,
+                                req.current_wave,
+                                req.client_index,
+                            )
                         try:
                             request = self.preprocess_add_request(req)
                         except Exception:
@@ -1223,6 +1234,14 @@ class EngineCoreProc(EngineCore):
                             continue
                     else:
                         request = generic_decoder.decode(data_frames)
+                        if (os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1"
+                                and request_type
+                                == EngineCoreRequestType.START_DP_WAVE):
+                            logger.info(
+                                "[V2DPDBG engine=%s] input_start_wave %s",
+                                getattr(self, "engine_index", "?"),
+                                request,
+                            )
 
                         if request_type == EngineCoreRequestType.ABORT:
                             # Aborts are added to *both* queues, allows us to eagerly
@@ -1351,6 +1370,10 @@ class DPEngineCoreProc(EngineCoreProc):
         self.step_counter = 0
         self.current_wave = 0
         self.last_counts = (0, 0)
+        self.force_dp_keepalive = (
+            os.environ.get("VLLM_TIDAR_V2_DP_KEEPALIVE") == "1"
+        )
+        self._dp_keepalive_reported = False
 
         # Initialize the engine.
         dp_rank = vllm_config.parallel_config.data_parallel_rank
@@ -1383,6 +1406,17 @@ class DPEngineCoreProc(EngineCoreProc):
             stateless_destroy_torch_distributed_process_group(dp_group)
 
     def add_request(self, request: Request, request_wave: int = 0):
+        if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+            logger.info(
+                "[V2DPDBG rank=%d] add_request req=%s req_wave=%d "
+                "current_wave=%d running=%s has_reqs=%s",
+                self.dp_rank,
+                request.request_id,
+                request_wave,
+                self.current_wave,
+                self.engines_running,
+                self.scheduler.has_requests(),
+            )
         if self.has_coordinator and request_wave != self.current_wave:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
@@ -1393,13 +1427,41 @@ class DPEngineCoreProc(EngineCoreProc):
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
+        if self.has_coordinator and not self.engines_running:
+            logger.debug(
+                "EngineCore starting idle loop for request wave %d.", request_wave
+            )
+            self.engines_running = True
+
         super().add_request(request, request_wave)
+        if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+            running_reqs, waiting_reqs = self.scheduler.get_request_counts()
+            logger.info(
+                "[V2DPDBG rank=%d] add_request_done req=%s "
+                "current_wave=%d waiting=%d running_reqs=%d unfinished=%s",
+                self.dp_rank,
+                request.request_id,
+                self.current_wave,
+                waiting_reqs,
+                running_reqs,
+                self.scheduler.has_unfinished_requests(),
+            )
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
     ) -> None:
         if request_type == EngineCoreRequestType.START_DP_WAVE:
             new_wave, exclude_eng_index = request
+            if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+                logger.info(
+                    "[V2DPDBG rank=%d] start_wave new=%d exclude=%s "
+                    "current=%d running=%s",
+                    self.dp_rank,
+                    new_wave,
+                    exclude_eng_index,
+                    self.current_wave,
+                    self.engines_running,
+                )
             if exclude_eng_index != self.engine_index and (
                 new_wave >= self.current_wave
             ):
@@ -1444,13 +1506,12 @@ class DPEngineCoreProc(EngineCoreProc):
                 # We are in a running state and so must execute a dummy pass
                 # if the model didn't execute any ready requests.
                 #
-                # However, when DP is in use AND execute_model was
-                # already called (0 scheduled tokens),
-                # the worker already did _dummy_run ->
-                # coordinate_batch_across_dp. A second execute_dummy_batch
-                # here would issue a SECOND coordinate_batch_across_dp
-                # all_reduce other workers do not match, desynchronising
-                # the DP process group.
+                # However, when DP is in use AND execute_model was already
+                # called, the worker already participated in the DP
+                # model-forward coordination path. In the TiDAR runtime-dummy
+                # case that can include a zero-local-token forward matching a
+                # peer's real batch, so a second execute_dummy_batch here would
+                # issue another DP all-reduce that other workers do not match.
                 if not (
                     self._executor_called_this_step
                     and self.vllm_config.parallel_config.data_parallel_size > 1
@@ -1463,7 +1524,7 @@ class DPEngineCoreProc(EngineCoreProc):
             )
 
             if not self.engines_running:
-                if not self.has_coordinator:
+                if not self.has_coordinator or self.force_dp_keepalive:
                     # Without a coordinator there is no START_DP_WAVE
                     # mechanism to wake idle engines. Letting
                     # engines_running stay False makes idle engines block
@@ -1472,6 +1533,15 @@ class DPEngineCoreProc(EngineCoreProc):
                     # desynchronising the dp_group all-reduce (and EP
                     # all-to-all) counters across DP ranks. Keep engines
                     # spinning with dummy batches instead.
+                    if (self.force_dp_keepalive
+                            and not self._dp_keepalive_reported):
+                        logger.info(
+                            "V2 DP keepalive is enabled; rank %d will keep "
+                            "spinning dummy batches instead of pausing at "
+                            "wave completion.",
+                            self.dp_rank,
+                        )
+                        self._dp_keepalive_reported = True
                     self.engines_running = True
                     continue
 
@@ -1491,11 +1561,11 @@ class DPEngineCoreProc(EngineCoreProc):
                 self.step_counter = 0
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
-        # Optimization - only perform finish-sync all-reduce every 32 steps.
+        # DP model/dummy collectives can be reached from different local code
+        # paths on each rank. Keep the finish-sync collective in a fixed
+        # per-loop position so it cannot drift into a peer's model-forward
+        # metadata all-reduce.
         self.step_counter += 1
-        if self.step_counter % 32 != 0:
-            return True
-
         return ParallelConfig.has_unfinished_dp(self.dp_group, local_unfinished)
 
     def reinitialize_distributed(

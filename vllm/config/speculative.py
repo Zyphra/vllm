@@ -339,11 +339,15 @@ class SpeculativeConfig:
                 # Draft fires AFTER bookkeep, so bookkeep's .cpu() only waits for
                 # verify+sample (not drafter). Drafter runs in parallel with
                 # next step's preprocess+forward, saving ~5-10ms/step.
-                # Opt-out: set disable_padded_drafter_batch=False explicitly.
+                # Opt-out: set VLLM_TIDAR_KEEP_PADDED_DRAFTER=1 explicitly.
+                # The V2 GPU runner uses its own self-speculator and async
+                # draft-token path, so keep padded drafter batches there.
                 import os as _os_dpdb
                 if (not self.disable_padded_drafter_batch
                         and _os_dpdb.environ.get(
-                            "VLLM_TIDAR_KEEP_PADDED_DRAFTER", "0") != "1"):
+                            "VLLM_TIDAR_KEEP_PADDED_DRAFTER", "0") != "1"
+                        and _os_dpdb.environ.get(
+                            "VLLM_USE_V2_MODEL_RUNNER", "0") != "1"):
                     self.disable_padded_drafter_batch = True
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"

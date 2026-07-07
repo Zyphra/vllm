@@ -43,6 +43,14 @@ class CudaGraphManager:
             self.max_num_tokens,
             self.cudagraph_mode,
         )
+        speculative_config = vllm_config.speculative_config
+        self._tidar_tokens_per_verify_req: int | None = None
+        if (speculative_config is not None
+                and getattr(speculative_config, "use_tidar", lambda: False)()):
+            num_spec_tokens = getattr(
+                speculative_config, "num_speculative_tokens", None)
+            if num_spec_tokens is not None:
+                self._tidar_tokens_per_verify_req = int(num_spec_tokens) + 1
 
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle()
@@ -56,12 +64,45 @@ class CudaGraphManager:
         num_tokens_after_padding: int,
         num_tokens_per_request: Iterable[int],
     ) -> int | None:
-        return get_cudagraph_size(
+        num_tokens_per_request = list(num_tokens_per_request)
+        tidar_verify_len = self._tidar_tokens_per_verify_req
+        if tidar_verify_len is not None:
+            decode_only = all(x == 1 for x in num_tokens_per_request)
+            verify_only = all(
+                x == tidar_verify_len for x in num_tokens_per_request)
+            if not decode_only and not verify_only:
+                return None
+            if verify_only:
+                # TiDAR TF verify is a uniform (batch, K + 1) prefill. Let it
+                # use full CUDA graphs even when the global mode is
+                # FULL_AND_PIECEWISE, whose generic mixed-batch path would
+                # otherwise route prefill-like batches to piecewise only.
+                size = self.cudagraph_sizes.get(num_tokens_after_padding)
+                if size == num_tokens_after_padding:
+                    return size
+                return None
+
+        size = get_cudagraph_size(
             num_tokens_after_padding,
             num_tokens_per_request,
             self.cudagraph_sizes,
             self.cudagraph_mode,
         )
+        if size is None or tidar_verify_len is None:
+            return size
+        if size > self.max_num_reqs:
+            # A decode-only batch cannot safely replay a TiDAR verify graph.
+            return None
+        return size
+
+    def _get_num_reqs_for_capture(self, num_tokens: int) -> int:
+        tidar_verify_len = self._tidar_tokens_per_verify_req
+        if (tidar_verify_len is not None and num_tokens % tidar_verify_len == 0
+                and num_tokens > self.max_num_reqs):
+            num_reqs = num_tokens // tidar_verify_len
+            if 0 < num_reqs <= self.max_num_reqs:
+                return num_reqs
+        return min(num_tokens, self.max_num_reqs)
 
     def capture_graph(
         self,
@@ -74,7 +115,7 @@ class CudaGraphManager:
         attn_metadata_builders: list[AttentionMetadataBuilder],
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        num_reqs = min(num_tokens, self.max_num_reqs)
+        num_reqs = self._get_num_reqs_for_capture(num_tokens)
         input_ids = input_buffers.input_ids[:num_tokens]
         positions = input_buffers.positions[:num_tokens]
         if self.uses_mrope:
@@ -272,5 +313,6 @@ def prepare_inputs_to_capture(
         block_tables=input_block_tables,
         slot_mappings=slot_mappings,
         kv_cache_config=kv_cache_config,
+        for_cudagraph_capture=True,
     )
     return attn_metadata, slot_mappings_by_layer

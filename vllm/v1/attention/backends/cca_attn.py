@@ -115,16 +115,21 @@ class CCAAttentionMetadataBuilder(
         # Defer to the base class for the common fields, then augment.
         meta = self._compute_common_metadata(common_attn_metadata)
 
-        # v0.15 parity: respect state_indices_tensor_override (read-side
-        # override). The TiDAR drafter sets this to the AR slot (col 0 of
-        # CCA's block table) so the drafter reads the post-acceptance
-        # state. Without this override, _compute_common_metadata uses
-        # mamba_get_block_table_tensor(FA_block_table, seq_lens, ...)[:, 0]
-        # which gives a DIFFERENT slot than where the verifier wrote
-        # (different seq_lens → different start_indices). The drafter then
-        # reads stale data and produces wrong logits, rejected 100%.
+        # v0.15 parity: TiDAR uses a single recurrent CCA state slot per
+        # request. In align-mode Mamba metadata, the generic state-index
+        # selection derives a slot from seq_lens, which moves across the
+        # K+1 verify/draft shapes and can decouple verify/commit/draft
+        # recurrent state. Keep TiDAR keyed to the stable AR slot (column 0)
+        # unless a caller supplies a more specific override. The drafter path
+        # does supply one explicitly; this default covers the verify path.
         _sit_ovr = getattr(common_attn_metadata,
                            "state_indices_tensor_override", None)
+        spec = self.vllm_config.speculative_config
+        if _sit_ovr is None and (
+                spec is not None
+                and getattr(spec, "use_tidar", lambda: False)()):
+            _sit_ovr = common_attn_metadata.block_table_tensor[
+                :common_attn_metadata.num_reqs, 0]
         if _sit_ovr is not None:
             meta.state_indices_tensor = _sit_ovr
 

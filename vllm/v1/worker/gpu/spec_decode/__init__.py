@@ -8,6 +8,10 @@ from vllm.config import VllmConfig
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.use_tidar():
+        from vllm.v1.worker.gpu.spec_decode.tidar import TiDARSpeculator
+
+        return TiDARSpeculator(vllm_config, device)
     if speculative_config.use_eagle():
         from vllm.v1.worker.gpu.spec_decode.eagle import EagleSpeculator
 

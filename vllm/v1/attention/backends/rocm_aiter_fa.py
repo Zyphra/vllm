@@ -2,12 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with AiterFlashAttention."""
 
+import os
 from dataclasses import dataclass
 from typing import ClassVar
 
 import torch
 
 from vllm._aiter_ops import rocm_aiter_ops
+from vllm.attention.ops.tf_attention import tf_attention_triton_paged
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -391,6 +393,13 @@ class AiterFlashAttentionMetadata:
     k_scale: dict[str, torch.Tensor] | None
     v_scale: dict[str, torch.Tensor] | None
 
+    # TiDAR (cf. vllm#39703): verify pass is causal within the K+1 block; the
+    # two-forward drafter pass is bidirectional within the block (causal=False)
+    # + full prefix. Threaded from CommonAttentionMetadata.causal so
+    # extend_forward picks the right mask per pass. Defaults True so all
+    # non-spec / verify paths are unchanged.
+    causal: bool = True
+    tidar_tf_block_size: int | None = None
 
 class AiterFlashAttentionMetadataBuilder(
     AttentionMetadataBuilder[AiterFlashAttentionMetadata]
@@ -442,6 +451,7 @@ class AiterFlashAttentionMetadataBuilder(
             device=device,
         )
         self.scale = torch.tensor([1.0], dtype=torch.float, device=self.device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
@@ -645,6 +655,15 @@ class AiterFlashAttentionMetadataBuilder(
 
         use_cascade = common_prefix_len > 0
 
+        tidar_tf_block_size = None
+        speculative_config = self.vllm_config.speculative_config
+        if (
+            speculative_config is not None
+            and speculative_config.use_tidar()
+            and os.environ.get("VLLM_TIDAR_TWO_FORWARD", "0") == "1"
+        ):
+            tidar_tf_block_size = speculative_config.num_speculative_tokens + 1
+
         attn_metadata = AiterFlashAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_actual_kv_tokens=num_actual_kv_tokens,
@@ -668,6 +687,10 @@ class AiterFlashAttentionMetadataBuilder(
             total_tokens=self.total_tokens,
             k_scale=self.scale,
             v_scale=self.scale,
+            # TiDAR drafter passes causal=False (bidirectional K+1 block);
+            # verify / all other paths default to True.
+            causal=getattr(common_attn_metadata, "causal", True),
+            tidar_tf_block_size=tidar_tf_block_size,
         )
         return attn_metadata
 
@@ -813,6 +836,75 @@ class AiterFlashAttentionImpl(AttentionImpl):
             out=output,
         )
 
+    def _should_use_tidar_tf_paged_attention(
+        self,
+        attn_metadata: AiterFlashAttentionMetadata,
+        max_seqlen_q: int,
+        min_seqlen_q: int,
+        block_table: torch.Tensor,
+    ) -> bool:
+        s_block = attn_metadata.tidar_tf_block_size
+        if s_block is None:
+            return False
+        use_tf_paged_attention = os.environ.get(
+            "VLLM_TIDAR_USE_TF_PAGED_ATTENTION",
+            os.environ.get("VLLM_TIDAR_USE_PAGED_ATTENTION", "0"),
+        )
+        if use_tf_paged_attention != "1":
+            return False
+        if os.environ.get("VLLM_TIDAR_DISABLE_TF_PAGED_ATTENTION", "0") == "1":
+            return False
+        if max_seqlen_q != s_block or min_seqlen_q != s_block:
+            return False
+        if block_table.numel() == 0:
+            return False
+        if self.sliding_window[0] != -1:
+            return False
+        if self.alibi_slopes is not None or self.logits_soft_cap != 0.0:
+            return False
+        if self.kv_cache_dtype.startswith("fp8"):
+            return False
+        if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+            return False
+        return True
+
+    def _run_tidar_tf_paged_attention(
+        self,
+        attn_metadata: AiterFlashAttentionMetadata,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        assert attn_metadata.tidar_tf_block_size is not None
+        s_block = attn_metadata.tidar_tf_block_size
+        logger.info_once(
+            "Using TiDAR TF paged attention in ROCm AITER-FA "
+            "(S=%d, causal=%s).",
+            s_block,
+            attn_metadata.causal,
+        )
+        prefix_lens = torch.clamp(seq_lens - s_block, min=0).to(torch.int32)
+        block_size = key_cache.shape[1]
+        tf_attention_triton_paged(
+            q=query,
+            inline_k=key,
+            inline_v=value,
+            kv_cache_k=key_cache,
+            kv_cache_v=value_cache,
+            block_table=block_table,
+            prefix_lens=prefix_lens,
+            s_block=s_block,
+            block_size=block_size,
+            softmax_scale=self.scale,
+            is_causal=attn_metadata.causal,
+            out=output,
+        )
+
     def extend_forward(
         self,
         attn_metadata: AiterFlashAttentionMetadata,
@@ -827,6 +919,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
         max_seqlen_k: int,
         min_seqlen_q: int,
         block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
         slot_mapping: torch.Tensor,
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
@@ -845,6 +938,22 @@ class AiterFlashAttentionImpl(AttentionImpl):
                 v_scale,
             )
             return
+        if self._should_use_tidar_tf_paged_attention(
+            attn_metadata, max_seqlen_q, min_seqlen_q, block_table
+        ):
+            self._run_tidar_tf_paged_attention(
+                attn_metadata=attn_metadata,
+                query=query,
+                key=key,
+                value=value,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                output=output,
+                block_table=block_table,
+                seq_lens=seq_lens,
+            )
+            return
+
         out, lse = rocm_aiter_ops.flash_attn_varlen_func(
             q=query,
             k=key,
@@ -1093,8 +1202,11 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     cu_seqlens_q=attn_metadata.extend_metadata.query_start_loc,
                     max_seqlen_q=attn_metadata.extend_metadata.max_query_len,
                     max_seqlen_k=attn_metadata.extend_metadata.max_seq_len,
-                    min_seqlen_q=1,
+                    min_seqlen_q=attn_metadata.extend_metadata.min_query_len,
                     block_table=attn_metadata.block_table[
+                        num_decodes : num_decodes + num_extends
+                    ],
+                    seq_lens=attn_metadata.seq_lens[
                         num_decodes : num_decodes + num_extends
                     ],
                     slot_mapping=attn_metadata.slot_mapping[
@@ -1107,7 +1219,30 @@ class AiterFlashAttentionImpl(AttentionImpl):
             # calculate for decodes
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
-                if self.sliding_window[0] != -1:
+                decode_block_table = attn_metadata.block_table[:num_decodes]
+                if self._should_use_tidar_tf_paged_attention(
+                    attn_metadata,
+                    attn_metadata.decode_metadata.max_query_len,
+                    attn_metadata.decode_metadata.min_query_len,
+                    decode_block_table,
+                ):
+                    assert attn_metadata.tidar_tf_block_size is not None
+                    assert (
+                        num_decode_tokens
+                        == num_decodes * attn_metadata.tidar_tf_block_size
+                    )
+                    self._run_tidar_tf_paged_attention(
+                        attn_metadata=attn_metadata,
+                        query=query[:num_decode_tokens],
+                        key=key[:num_decode_tokens],
+                        value=value[:num_decode_tokens],
+                        key_cache=key_cache,
+                        value_cache=value_cache,
+                        output=output[:num_decode_tokens],
+                        block_table=decode_block_table,
+                        seq_lens=attn_metadata.seq_lens[:num_decodes],
+                    )
+                elif self.sliding_window[0] != -1:
                     assert not rocm_aiter_ops.is_shuffle_kv_cache_enabled(), (
                         "Sliding window with shuffle layout is not supported yet."
                     )
@@ -1139,9 +1274,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         v_descale=layer._v_scale.expand(descale_shape),
                     )
                     return
-                assert attn_metadata.decode_metadata is not None
-
-                if rocm_aiter_ops.is_shuffle_kv_cache_enabled():
+                elif rocm_aiter_ops.is_shuffle_kv_cache_enabled():
                     num_blocks, block_size, num_kv_heads, head_size = key_cache.shape
                     x = 16 // key_cache.element_size()
                     contiguous_block_elems = (
@@ -1149,7 +1282,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                     )
                     kc_stride0 = key_cache.stride(0)
                     vc_stride0 = value_cache.stride(0)
-                    bt = attn_metadata.block_table[:num_decodes]
+                    bt = decode_block_table
 
                     if kc_stride0 != contiguous_block_elems:
                         stride_ratio = kc_stride0 // contiguous_block_elems
@@ -1225,7 +1358,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         key_cache,
                         value_cache,
                         self.scale,
-                        attn_metadata.block_table[:num_decodes],
+                        decode_block_table,
                         attn_metadata.query_start_loc[:num_decodes],
                         attn_metadata.seq_lens[:num_decodes],
                         attn_metadata.max_seq_len,

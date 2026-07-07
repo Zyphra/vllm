@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import multiprocessing
+import os
 import queue
 import sys
 import uuid
@@ -1185,13 +1186,37 @@ class DPAsyncMPClient(AsyncMPClient):
         request.client_index = self.client_index
 
         chosen_engine = self.get_core_engine_for_request(request)
+        if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+            logger.info(
+                "[V2DPDBG client=%d] add_request req=%s wave=%d "
+                "running=%s chosen=%r counts=%s",
+                self.client_index,
+                request.request_id,
+                request.current_wave,
+                self.engines_running,
+                chosen_engine,
+                self.lb_engines,
+            )
         to_await = self._send_input(EngineCoreRequestType.ADD, request, chosen_engine)
         if not self.engines_running:
+            # Make sure the ADD is fully handed to the target engine socket
+            # before waking peer engines. Otherwise the coordinator can start
+            # a wave where peers run dummy work before the target has received
+            # the real request, leaving the request stranded after idle.
+            await to_await
+            if os.environ.get("VLLM_TIDAR_V2_DP_DEBUG") == "1":
+                logger.info(
+                    "[V2DPDBG client=%d] first_req req=%s wave=%d chosen=%r",
+                    self.client_index,
+                    request.request_id,
+                    request.current_wave,
+                    chosen_engine,
+                )
             # Notify coordinator that we're sending a request
             req_msg = msgspec.msgpack.encode(("FIRST_REQ", chosen_engine))
             await self.first_req_send_socket.send(req_msg)
-
-        await to_await
+        else:
+            await to_await
 
         self._ensure_output_queue_task()
 

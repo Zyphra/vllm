@@ -50,6 +50,12 @@ _CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
+    # Monotonic per-engine-step sequence number, bumped by the model runner
+    # before each execute_model. The eager prefill loop tags its sparse
+    # stash with the current value so the runner can tell a fresh stash
+    # from a stale one (class attr: one write per step covers all layers).
+    _tidar_step_seq: int = -1
+
     def __init__(
             self,
             config,
@@ -189,6 +195,19 @@ class CCA(MambaBase, CustomOp):
             self._spec_stash_hs = None
             self._spec_stash_slots = None
 
+        # Eager-fallback stash bookkeeping (mixed prefill/decode steps).
+        # When the prefill segment is NOT a uniform K+1 verify batch (e.g.
+        # a cold prompt prefill co-scheduled with TiDAR verify rows), the
+        # vectorized path is skipped and the Python prefill loop stashes
+        # spec-sized rows sparsely instead. These attributes record which
+        # step (runner-provided ``CCA._tidar_step_seq``) the sparse stash
+        # belongs to and which prefill-segment rows were stashed, so the
+        # runner can (a) detect staleness and (b) pair stash rows with the
+        # right requests. Python attrs are safe here: the eager loop never
+        # runs inside a captured cudagraph.
+        self._spec_stash_eager_seq = -1
+        self._spec_stash_eager_rows: list = []
+
         # Whether the captured-friendly vectorized prefill path is REQUIRED
         # this run. True when:
         #   (a) FULL_DECODE_ONLY (or FULL_AND_PIECEWISE) cudagraph mode is
@@ -207,6 +226,7 @@ class CCA(MambaBase, CustomOp):
         _full_active = (_cg_mode is not None
                         and _cg_mode != CUDAGraphMode.NONE
                         and _cg_mode.decode_mode() == CUDAGraphMode.FULL)
+        self._use_capture_vectorized = bool(_full_active)
         # _spec_stash_conv is non-None whenever TiDAR is active (SF or TF).
         # We need vectorized path whenever stash is needed — that's any
         # TiDAR run, because commit_spec_decode_state always wants the
@@ -368,10 +388,10 @@ class CCA(MambaBase, CustomOp):
         """Cudagraph-replay-safe vectorized prefill for uniform (P, S).
 
         Eliminates Python-state-on-metadata branches from the captured
-        path. ALWAYS performs the "default commit" + "stash" writes
-        unless ``skip_writes`` is set (TiDAR drafter scratch path).
-        ``commit_spec_decode_state`` runs post-rejection-sampling and
-        overwrites the default-commit with the right candidate.
+        path. Performs the default commit unless ``skip_writes`` is set
+        (TiDAR drafter scratch path). TiDAR runs additionally stash
+        candidates so ``commit_spec_decode_state`` can overwrite the
+        default commit with the right post-sampling state.
         """
         H_conv = self.in_out_ch
         H_hs = self.hidden_size
@@ -413,7 +433,7 @@ class CCA(MambaBase, CustomOp):
         hs2_prefill.copy_(hs2_p_2d.reshape(hs2_prefill.shape))
 
         if not skip_writes:
-            # Default commit + stash all K+1 candidates.
+            # Default commit. TiDAR runs additionally stash all candidates.
             last_conv = qk_packed2_p[..., -cca_time0:].contiguous()
             last_hs = hs_p_2d[:, -1, :]
             conv_states[state_indices_p_write] = last_conv.to(
@@ -421,17 +441,20 @@ class CCA(MambaBase, CustomOp):
             prev_hs[state_indices_p_write] = last_hs.to(
                 device=prev_hs.device, dtype=prev_hs.dtype)
 
-            start_off = total_padding - cca_time0 + 1
-            windowed = (qk_packed2_p[..., start_off:]
-                        .unfold(-1, cca_time0, 1))
-            # [P, H_conv, S, cca_time0] -> [P, S, H_conv, cca_time0]
-            cand_conv = windowed.permute(0, 2, 1, 3).contiguous().to(
-                dtype=self._spec_stash_conv.dtype)
-            cand_hs = hs_p_2d.to(dtype=self._spec_stash_hs.dtype)
-            self._spec_stash_conv[:P, :S].copy_(cand_conv)
-            self._spec_stash_hs[:P, :S].copy_(cand_hs)
-            self._spec_stash_slots[:P].copy_(
-                state_indices_p.to(torch.int64))
+            if (self._spec_stash_conv is not None
+                    and P <= self._spec_max_P
+                    and S <= self._spec_max_S):
+                start_off = total_padding - cca_time0 + 1
+                windowed = (qk_packed2_p[..., start_off:]
+                            .unfold(-1, cca_time0, 1))
+                # [P, H_conv, S, cca_time0] -> [P, S, H_conv, cca_time0]
+                cand_conv = windowed.permute(0, 2, 1, 3).contiguous().to(
+                    dtype=self._spec_stash_conv.dtype)
+                cand_hs = hs_p_2d.to(dtype=self._spec_stash_hs.dtype)
+                self._spec_stash_conv[:P, :S].copy_(cand_conv)
+                self._spec_stash_hs[:P, :S].copy_(cand_hs)
+                self._spec_stash_slots[:P].copy_(
+                    state_indices_p.to(torch.int64))
 
     def _spec_decode_proposal_sub_loop(
         self,
@@ -607,7 +630,10 @@ class CCA(MambaBase, CustomOp):
         selected_conv = self._spec_stash_conv[arange, idx]
         selected_hs = self._spec_stash_hs[arange, idx]
 
-        slots = self._spec_stash_slots[:n_used].to(torch.long)
+        # Key slot lookup by the same fresh stash rows used to gather
+        # candidates. Some mixed prefill/decode steps stash sparse rows, so
+        # assuming stash row == positional batch row would write stale state.
+        slots = self._spec_stash_slots[arange.to(torch.long)].to(torch.long)
         valid = slots >= 0
         if mask is not None:
             valid = valid & mask
@@ -1088,13 +1114,46 @@ class CCA(MambaBase, CustomOp):
                         f"verify_len={sf_verify_len}, P_props={sf_P_props}")
                 sf_K = (S_uniform - sf_verify_len) // sf_P_props
                 sf_total_S = sf_verify_len + sf_P_props * sf_K
+            capture_vectorized_active = (
+                self._use_capture_vectorized
+            )
+            if capture_vectorized_active:
+                from vllm.distributed.parallel_state import (
+                    is_in_graph_capture_context,
+                )
+                capture_vectorized_active = is_in_graph_capture_context()
+            # True per-row uniformity, not just divisibility of the total:
+            # a [16, 18] pair also satisfies num_prefill_tokens == P * 17
+            # but would garble the (P, S) reshape AND desync the runner's
+            # commit-context mirror of this gate. Host-side check on the
+            # pinned CPU mirror; falls back to the divisibility-only gate
+            # when the CPU mirror is unavailable.
+            _rows_uniform = True
+            _qsl_p_cpu_gate = getattr(
+                attn_metadata, "query_start_loc_p_cpu", None)
+            if _qsl_p_cpu_gate is not None and P_pref > 0:
+                _row_lens_gate = (
+                    _qsl_p_cpu_gate[1:] - _qsl_p_cpu_gate[:-1])
+                _rows_uniform = bool(
+                    (_row_lens_gate == S_uniform).all().item())
             use_vectorized_prefill = (
-                self._use_spec_vectorized
-                and P_pref > 0
-                and num_prefill_tokens == P_pref * S_uniform
-                and S_uniform == self._spec_max_S
-                and P_pref <= self._spec_max_P
-                and not single_forward_mode
+                (
+                    self._use_spec_vectorized
+                    and P_pref > 0
+                    and num_prefill_tokens == P_pref * S_uniform
+                    and S_uniform == self._spec_max_S
+                    and P_pref <= self._spec_max_P
+                    and _rows_uniform
+                    and not single_forward_mode
+                )
+                or (
+                    capture_vectorized_active
+                    and P_pref > 0
+                    and S_uniform > 0
+                    and num_prefill_tokens == P_pref * S_uniform
+                    and _rows_uniform
+                    and not single_forward_mode
+                )
             )
             use_single_forward_prefill = (
                 single_forward_mode
@@ -1264,9 +1323,34 @@ class CCA(MambaBase, CustomOp):
                 _sit_write_p = (state_indices_tensor_write_p
                                 if state_indices_tensor_write_p is not None
                                 else state_indices_tensor_p)
-                for i in range(len(query_start_loc_p) - 1):
-                    start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
-                    hs2_cur = hs_p[start_i:end_i]  # [S_cur, H]
+                # AMD host-overhead fix: pull the per-seq loop bounds and
+                # initial-state flags to CPU ONCE (2 D2H) instead of paying a
+                # blocking .item()/__bool__ sync on every GPU-scalar slice
+                # inside the loop (~5x per seq). On ROCm each such sync is a
+                # ~1ms blocking hipMemcpyWithStream; these were the dominant
+                # TiDAR host overhead (GPU ~94% idle). Math is identical; only
+                # the host<->device sync pattern changes.
+                _qsl_cpu = (query_start_loc_p.tolist()
+                            if torch.is_tensor(query_start_loc_p)
+                            else query_start_loc_p)
+                _has_init_cpu = (has_initial_states_p.tolist()
+                                 if torch.is_tensor(has_initial_states_p)
+                                 else has_initial_states_p)
+                # Sparse spec stash for mixed prefill/decode steps: TiDAR
+                # verify rows (S_cur <= K+1) still need their K+1 candidate
+                # states stashed so commit_spec_decode_state can roll the
+                # recurrent state back to the post-acceptance position. The
+                # vectorized path only handles uniform-S segments, so this
+                # loop stashes eligible rows itself and records which rows
+                # it stashed (+ the runner's step seq) for the commit.
+                _stash_here = (not drafter_pass
+                               and self._spec_stash_conv is not None)
+                _stash_j = 0
+                _stash_rows: list = []
+                for i in range(len(_qsl_cpu) - 1):
+                    start_i, end_i = _qsl_cpu[i], _qsl_cpu[i + 1]
+                    hs_row = hs_p[start_i:end_i]  # [S_cur, H] raw
+                    hs2_cur = hs_row
                     qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                     qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
 
@@ -1289,6 +1373,25 @@ class CCA(MambaBase, CustomOp):
                             conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
                                 device=conv_states.device, dtype=conv_states.dtype)
 
+                    _s_cur = end_i - start_i
+                    if (_stash_here and _s_cur <= self._spec_max_S
+                            and _stash_j < self._spec_max_P):
+                        # Same candidate math as the vectorized path:
+                        # window n ends at position n+1 of this row.
+                        _start_off = self.total_padding - self.cca_time0 + 1
+                        _win = (qk_packed2_cur[..., _start_off:]
+                                .unfold(-1, self.cca_time0, 1))
+                        # [1, E, S_cur, t0] -> [S_cur, E, t0]
+                        self._spec_stash_conv[_stash_j, :_s_cur].copy_(
+                            _win.permute(0, 2, 1, 3)[0].to(
+                                dtype=self._spec_stash_conv.dtype))
+                        self._spec_stash_hs[_stash_j, :_s_cur].copy_(
+                            hs_row.to(dtype=self._spec_stash_hs.dtype))
+                        self._spec_stash_slots[_stash_j] = (
+                            state_indices_tensor_p[i].to(torch.int64))
+                        _stash_rows.append(i)
+                        _stash_j += 1
+
                     # Computing conv
                     qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
                     qk_packed3_p[start_i:end_i] = qk_packed3_cur
@@ -1301,14 +1404,90 @@ class CCA(MambaBase, CustomOp):
                         prev_hs[_sit_write_p] = _vals_p
                     else:
                         prev_hs[_sit_write_p[_wv_p]] = _vals_p[_wv_p]
+                if _stash_here:
+                    self._spec_stash_eager_rows = _stash_rows
+                    self._spec_stash_eager_seq = CCA._tidar_step_seq
 
         _fused_decode_active = False
         if has_decode:
+            use_capture_decode = False
+            if self._use_capture_vectorized:
+                from vllm.distributed.parallel_state import (
+                    is_in_graph_capture_context,
+                )
+                use_capture_decode = is_in_graph_capture_context()
+
             # Generation
-            if _CCA_TRITON_FUSION_ENABLED:
+            if use_capture_decode:
+                decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+                safe_decode_indices = torch.where(
+                    decode_is_pad,
+                    torch.zeros_like(state_indices_tensor_d),
+                    state_indices_tensor_d,
+                )
+
+                qk_packed0_d = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    qk_packed0_d.new_zeros(()),
+                    qk_packed0_d,
+                )
+                hs_d = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    hs_d.new_zeros(()),
+                    hs_d,
+                )
+
+                qk_cached = conv_states[safe_decode_indices]
+                qk_cached = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_cached.new_zeros(()),
+                    qk_cached,
+                )
+                qk_cached_for_compute = qk_cached
+                if qk_cached_for_compute.dtype != qk_packed0_d.dtype:
+                    qk_cached_for_compute = qk_cached_for_compute.to(
+                        qk_packed0_d.dtype)
+                qk_packed2_d = torch.cat(
+                    [qk_cached_for_compute, qk_packed0_d.unsqueeze(-1)],
+                    dim=-1)
+                qk_packed3_d = self._conv_qk_decode(qk_packed2_d).squeeze(-1)
+                qk_packed3_d = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    qk_packed3_d.new_zeros(()),
+                    qk_packed3_d,
+                )
+                qk_packed3_output_list.insert(0, qk_packed3_d)
+
+                new_qk_cache = qk_cached.roll(shifts=-1, dims=-1)
+                new_qk_cache[..., -1] = qk_packed0_d.to(new_qk_cache.dtype)
+                new_qk_cache = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    new_qk_cache.new_zeros(()),
+                    new_qk_cache,
+                )
+                conv_states[safe_decode_indices] = new_qk_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype)
+
+                hs2_d = prev_hs[safe_decode_indices].to(hs.dtype)
+                hs2_d = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    hs2_d.new_zeros(()),
+                    hs2_d,
+                )
+                hs2_output_list.insert(0, hs2_d)
+                new_prev_hs = hs_d.to(prev_hs.dtype)
+                new_prev_hs = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    new_prev_hs.new_zeros(()),
+                    new_prev_hs,
+                )
+                prev_hs[safe_decode_indices] = new_prev_hs.to(
+                    device=prev_hs.device, dtype=prev_hs.dtype)
+            elif _CCA_TRITON_FUSION_ENABLED:
                 hs2_d, decode_is_pad = fused_pad_gather_scatter(
                     state_indices_tensor_d, hs_d, prev_hs,
                 )
+                hs2_output_list.insert(0, hs2_d)
             else:
                 decode_is_pad = ((state_indices_tensor_d == PAD_SLOT_ID) | (state_indices_tensor_d < 0) | (state_indices_tensor_d >= prev_hs.shape[0]))  # ccaoob-fix(JZ): treat <0 / >=num_slots as pad -> avoids forward_triton illegal-mem (Xid31)
                 safe_decode_indices = torch.where(
@@ -1329,10 +1508,10 @@ class CCA(MambaBase, CustomOp):
                 )
                 prev_hs[state_indices_tensor_d] = hs_d.to(
                     device=prev_hs.device, dtype=prev_hs.dtype)
-            hs2_output_list.insert(0, hs2_d)
+                hs2_output_list.insert(0, hs2_d)
 
             use_decode_fused = False
-            if cca_decode_fused_available():
+            if not use_capture_decode and cca_decode_fused_available():
                 # ── Fused decode path ──
                 # Single kernel: depthwise conv1d update + grouped conv + qk_mean
                 #                + L2 norm + scale + temperature
@@ -1385,7 +1564,7 @@ class CCA(MambaBase, CustomOp):
                     _fused_key_d   = fused_out[:, self.latent_q_dim:]   # [B, kh*dh]
                     _fused_decode_active = True
 
-            if not use_decode_fused:
+            if not use_capture_decode and not use_decode_fused:
                 # ── Original unfused decode path ──
                 dim, _, kernel_width = self.conv_qk[0].weight.shape
                 weights = self.conv_qk[0].weight.reshape(dim, kernel_width).contiguous()

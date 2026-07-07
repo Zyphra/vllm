@@ -42,7 +42,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
 
-from .interfaces import HasInnerState, IsHybrid
+from .interfaces import HasInnerState, IsHybrid, MixtureOfExperts
 from .utils import (make_empty_intermediate_tensors_factory, maybe_prefix)
 from vllm.transformers_utils.configs import SMoEConfig
 
@@ -607,6 +607,8 @@ class SMoEBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        parallel_config = get_current_vllm_config().parallel_config
+
         def _custom_routing_fn(hidden_states, gating_output, topk, renormalize):
             # Routing results are packed into gating_output by forward():
             # columns [:topk] = weights (float), columns [topk:] = ids (float-cast)
@@ -625,6 +627,9 @@ class SMoEBlock(nn.Module):
             activation="silu",
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            enable_eplb=parallel_config.enable_eplb,
+            num_redundant_experts=(
+                parallel_config.eplb_config.num_redundant_experts),
         )
 
     def forward(
@@ -878,7 +883,7 @@ class SMoEModel(nn.Module):
         return hidden_states
 
 
-class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
+class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
 
     @classmethod
     def get_mamba_state_dtype_from_config(
@@ -979,6 +984,24 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         self.model = SMoEModel(vllm_config=vllm_config,
                                prefix=maybe_prefix(prefix, "model"))
+        self.expert_weights = []
+        self.moe_layers = []
+        example_moe: Optional[FusedMoE] = None
+        for layer in self.model.layers:
+            if isinstance(layer, SMoEDecoderMLPLayer):
+                example_moe = layer.smoe_block.experts
+                self.moe_layers.append(example_moe)
+        if example_moe is None:
+            raise RuntimeError("No SMoE MLP layer found in model.layers.")
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_logical_experts = example_moe.logical_num_experts
+        self.num_physical_experts = example_moe.global_num_experts
+        self.num_local_physical_experts = example_moe.local_num_experts
+        self.num_routed_experts = example_moe.logical_num_experts
+        self.num_redundant_experts = (
+            self.num_physical_experts - self.num_logical_experts)
+        self.num_expert_groups = 1
+        self.num_shared_experts = 0
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
@@ -1044,6 +1067,21 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_local_physical_experts = num_local_physical_experts
+        self.num_redundant_experts = (
+            num_physical_experts - self.num_logical_experts)
+        for moe in self.moe_layers:
+            moe.global_num_experts = num_physical_experts
+            moe.local_num_experts = num_local_physical_experts
+            moe.update_expert_map()
 
     def forward(
         self,

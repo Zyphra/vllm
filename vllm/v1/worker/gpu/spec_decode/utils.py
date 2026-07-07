@@ -19,11 +19,14 @@ class DraftTokensHandler:
         self.num_draft_tokens: int = 0
 
     def set_draft_tokens(
-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
+        self,
+        input_batch: InputBatch,
+        draft_tokens: torch.Tensor,
+        copy_all: bool = False,
     ) -> None:
         self.req_ids = input_batch.req_ids
         self.num_draft_tokens = draft_tokens.shape[1]
-        if not input_batch.has_structured_output_reqs:
+        if not copy_all and not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
             self.draft_tokens_np = None

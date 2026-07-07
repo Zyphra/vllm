@@ -1059,20 +1059,24 @@ class TiDARProposer(EagleProposer):
         query_start_loc_cpu = torch.arange(0, n_plus * query_len,
                                            query_len, dtype=torch.int32)
 
-        # seq_lens: live_prefix_len + query_len per req, clamped to
-        # max_model_len. After an intra-block rejection the verifier forward
-        # has advanced metadata through the full draft block, but the live
-        # continuation is only accepted_prefix plus the recovered token. Mirror
-        # Eagle's rollback here so the next TiDAR draft reads
-        # prefix + accepted_prefix, then consumes next_token_ids[req].
+        # seq_lens: start from the live post-rejection sequence, not the
+        # verifier's full K+1 window. Otherwise the draft masks can attend to
+        # rejected suffix KV that was written by the verifier pass.
         base_seq_lens = common_attn_metadata.seq_lens
         base_seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         if num_rejected_tokens_gpu is not None:
-            rejected = num_rejected_tokens_gpu.to(dtype=base_seq_lens.dtype)
-            base_seq_lens = base_seq_lens - rejected
-            rejected_cpu = num_rejected_tokens_gpu.detach().cpu().to(
-                dtype=base_seq_lens_cpu.dtype)
-            base_seq_lens_cpu = base_seq_lens_cpu - rejected_cpu
+            rejected = num_rejected_tokens_gpu.to(
+                device=base_seq_lens.device,
+                dtype=base_seq_lens.dtype,
+                non_blocking=True,
+            )
+            base_seq_lens = (base_seq_lens - rejected).clamp_min(0)
+            rejected_cpu = num_rejected_tokens_gpu.to(
+                device="cpu",
+                dtype=base_seq_lens_cpu.dtype,
+            )
+            base_seq_lens_cpu = (
+                base_seq_lens_cpu - rejected_cpu).clamp_min(0)
 
         new_seq = torch.clamp(base_seq_lens + query_len,
                               max=self.max_model_len).to(torch.int32)
@@ -1492,9 +1496,4 @@ class TiDARProposer(EagleProposer):
     def validate_same_kv_cache_group(self,
                                      kv_cache_config: KVCacheConfig) -> None:
         super().validate_same_kv_cache_group(kv_cache_config)
-
-
-
-
-
 

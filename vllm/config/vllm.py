@@ -617,16 +617,21 @@ class VllmConfig:
 
         if self.scheduler_config.async_scheduling:
             # Async scheduling explicitly enabled, hard fail any incompatibilities.
-            # Currently, async scheduling only support eagle speculative
-            # decoding.
+            # Currently, async scheduling supports EAGLE/MTP/draft-model
+            # speculative decoding, plus TiDAR on the V2 GPU runner.
             if self.speculative_config is not None:
                 if (
                     self.speculative_config.method not in get_args(EagleModelTypes)
                     and self.speculative_config.method != "draft_model"
+                    and not (
+                        envs.VLLM_USE_V2_MODEL_RUNNER
+                        and self.speculative_config.use_tidar()
+                    )
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
-                        "with EAGLE/MTP/Draft Model kind of speculative decoding."
+                        "with EAGLE/MTP/Draft Model speculative decoding, "
+                        "or TiDAR on the V2 GPU runner."
                     )
                 if self.speculative_config.disable_padded_drafter_batch:
                     raise ValueError(
@@ -649,6 +654,10 @@ class VllmConfig:
             if (
                 self.speculative_config is not None
                 and self.speculative_config.method not in get_args(EagleModelTypes)
+                and not (
+                    envs.VLLM_USE_V2_MODEL_RUNNER
+                    and self.speculative_config.use_tidar()
+                )
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -1230,6 +1239,30 @@ class VllmConfig:
             max_num_tokens = self.scheduler_config.max_num_batched_tokens
             max_cudagraph_capture_size = min(max_num_tokens, max_cudagraph_capture_size)
 
+            _tidar_active = (
+                self.speculative_config is not None
+                and self.speculative_config.use_tidar()
+                and self.speculative_config.num_speculative_tokens is not None
+            )
+            _tidar_tf_capture = (
+                _tidar_active
+                and envs.VLLM_USE_V2_MODEL_RUNNER
+                and os.environ.get("VLLM_TIDAR_TWO_FORWARD", "0") == "1"
+            )
+            _tidar_sf_capture = (
+                _tidar_active
+                and not envs.VLLM_USE_V2_MODEL_RUNNER
+                and os.environ.get("VLLM_TIDAR_TWO_FORWARD", "0") != "1"
+            )
+            if _tidar_tf_capture:
+                _K_plus_1 = (
+                    self.speculative_config.num_speculative_tokens + 1)
+                _needed = _K_plus_1 * self.scheduler_config.max_num_seqs
+                max_cudagraph_capture_size = max(
+                    max_cudagraph_capture_size,
+                    min(_needed, max_num_tokens),
+                )
+
             # === TiDAR Block 8a: bump cap for SF inflated shape =======
             # The default decode_query_len = 1 + K = K+1 = 17 only sizes
             # the cap for TF verify. SF's combined-forward inflates to
@@ -1238,14 +1271,12 @@ class VllmConfig:
             # back to eager and FULL_DECODE_ONLY doesn't capture anything
             # useful for SF.
             if (
-                self.speculative_config is not None
-                and self.speculative_config.use_tidar()
-                and self.speculative_config.num_speculative_tokens is not None
+                _tidar_active
+                and _tidar_sf_capture
             ):
                 _K_plus_1 = (
                     self.speculative_config.num_speculative_tokens + 1)
-                import os as _os
-                _sf_levels_env = _os.environ.get(
+                _sf_levels_env = os.environ.get(
                     "VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
                 if _sf_levels_env.strip():
                     _P = len([
@@ -1270,14 +1301,12 @@ class VllmConfig:
             # === TiDAR Block 8: SF capture-shape override =============
             # If TiDAR is active and the user hasn't manually set
             # cudagraph_capture_sizes, populate it with multiples of K+1
-            # (TF verify shape) AND sf_per_req (SF combined-forward shape).
-            # Default stride-8 misses K+1=17 and SF shape, causing acceptance
-            # collapse or NaN-padded logits. See docs/diffusion_vllm_handoff.md
-            # and project_sf_kp1_layout_required memory.
+            # (TF verify shape) and, for old-runner SF, sf_per_req
+            # (combined-forward shape). Default stride-8 misses K+1=17 and
+            # SF shape, causing acceptance collapse or NaN-padded logits.
+            # See docs/TIDAR_AMD_HANDOFF.md.
             if (
-                self.speculative_config is not None
-                and self.speculative_config.use_tidar()
-                and self.speculative_config.num_speculative_tokens is not None
+                _tidar_active
                 and self.compilation_config.cudagraph_capture_sizes is None
             ):
                 K_plus_1 = (
@@ -1288,33 +1317,42 @@ class VllmConfig:
                     b * K_plus_1 for b in range(1, max_b + 1)
                     if b * K_plus_1 <= cap
                 ]
-                # SF single-forward shape: per-req length is
-                # K(1+P)+1 where P = number of pre-draft proposals.
-                # Read P from env (matches the proposer); default 3.
-                import os as _os
-                _sf_levels_env = _os.environ.get(
-                    "VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
-                if _sf_levels_env.strip():
-                    _P = len([
-                        x for x in _sf_levels_env.split(",") if x.strip()
-                    ])
-                else:
-                    _P = 3
-                K = K_plus_1 - 1
-                sf_per_req = K_plus_1 + _P * K_plus_1
-                sf_sizes = [
-                    b * sf_per_req for b in range(1, max_b + 1)
-                    if b * sf_per_req <= cap
+                sf_per_req = 0
+                _P = 0
+                sf_sizes: list[int] = []
+                if _tidar_sf_capture:
+                    # SF single-forward shape: per-req length is
+                    # (P + 1) * (K + 1), where P is the number of
+                    # pre-draft proposals.
+                    # Read P from env (matches the proposer); default 3.
+                    _sf_levels_env = os.environ.get(
+                        "VLLM_TIDAR_PROPOSAL_ACC_LEVELS", "")
+                    if _sf_levels_env.strip():
+                        _P = len([
+                            x for x in _sf_levels_env.split(",") if x.strip()
+                        ])
+                    else:
+                        _P = 3
+                    sf_per_req = K_plus_1 + _P * K_plus_1
+                    sf_sizes = [
+                        b * sf_per_req for b in range(1, max_b + 1)
+                        if b * sf_per_req <= cap
+                    ]
+                small_grid = [
+                    size for size in (1, 2, 4, 8, 16)
+                    if size <= max_b and size <= cap
                 ]
-                small_grid = [1, 2, 4, 8]
+                if max_b <= cap and max_b not in small_grid:
+                    small_grid.append(max_b)
                 explicit = sorted(
                     set(small_grid) | set(spec_sizes) | set(sf_sizes))
                 logger.info(
                     "TiDAR detected: setting cudagraph_capture_sizes "
                     "to explicit list %s (K+1=%d up to b=%d; "
-                    "sf_per_req=%d P=%d up to cap=%d). Plus {1,2,4,8} "
-                    "for AR/non-spec-decode.",
-                    explicit, K_plus_1, max_b, sf_per_req, _P, cap)
+                    "sf_capture=%s sf_per_req=%d P=%d up to cap=%d). "
+                    "Plus AR sizes %s for non-spec-decode.",
+                    explicit, K_plus_1, max_b, _tidar_sf_capture,
+                    sf_per_req, _P, cap, small_grid)
                 self.compilation_config.cudagraph_capture_sizes = explicit
                 # TiDAR captured replay needs copy_inputs=True: the
                 # lazy scratch-block allocator and per-step

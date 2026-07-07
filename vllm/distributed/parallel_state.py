@@ -1144,11 +1144,16 @@ def get_ep_group() -> GroupCoordinator:
 
 
 _PCP: GroupCoordinator | None = None
+_GRAPH_CAPTURE_DEPTH = 0
 
 
 def get_pcp_group() -> GroupCoordinator:
     assert _PCP is not None, "prefill context parallel group is not initialized"
     return _PCP
+
+
+def is_in_graph_capture_context() -> bool:
+    return _GRAPH_CAPTURE_DEPTH > 0
 
 
 @contextmanager
@@ -1166,9 +1171,14 @@ def graph_capture(device: torch.device):
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
+    global _GRAPH_CAPTURE_DEPTH
     context = GraphCaptureContext(torch.cuda.Stream(device=device))
-    with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
-        yield context
+    _GRAPH_CAPTURE_DEPTH += 1
+    try:
+        with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+            yield context
+    finally:
+        _GRAPH_CAPTURE_DEPTH -= 1
 
 
 logger = init_logger(__name__)
