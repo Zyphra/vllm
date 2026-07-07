@@ -117,15 +117,26 @@ _VLLM_TIDAR_SMOE_MOE_OP = (
     in ("1", "true", "yes"))
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
-    """LM-head projection that returns fp32 logits via explicit upcast."""
+    """LM-head projection that returns fp32 logits via out_dtype.
+
+    On CUDA/Hopper, keep bf16 inputs/weights and request fp32 accumulation from
+    torch.mm; explicitly upcasting the full vocab matrix per call is a large
+    TiDAR TF bottleneck. ROCm/older torch falls back to a cached fp32 transpose.
+    """
 
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
-        # Match minimal_fp32: explicitly upcast both operands and keep logits
-        # accumulation in fp32.
-        out = torch.mm(x.to(torch.float32),
-                       layer.weight.t().to(torch.float32))
+        try:
+            out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
+        except (TypeError, RuntimeError):
+            _cached = getattr(layer, "_fp32_weight_t_cache", None)
+            if (_cached is None
+                    or _cached.data_ptr() == 0
+                    or _cached.dtype != torch.float32):
+                _cached = layer.weight.t().to(torch.float32).contiguous()
+                layer._fp32_weight_t_cache = _cached
+            out = torch.mm(x.to(torch.float32), _cached)
         if bias is not None:
             out = out + bias.to(torch.float32)
         return out

@@ -157,6 +157,18 @@ Fresh b64 rerun on GPU0 confirmed the fixed cap path
   `54-306 tok/s`. Next optimization should target low-active-request tail /
   refill behavior or report steady-state/windowed tput for serving-style
   comparisons.
+- Rebase regression found and fixed on 2026-07-06/07: `tidar_v024` had
+  accidentally restored the slow fp32 LM-head helper, which upcast the full
+  262k-vocab weight matrix on every `compute_logits` call. Clean H100 b64 long
+  run before the fix was only `2340.4 tok/s`, corrected accept `5.860`, with
+  `Running=64, Waiting>0` windows averaging `2847.9 tok/s`. Restoring the
+  Hopper path (`torch.mm(..., out_dtype=torch.float32)`, cached fp32-transpose
+  fallback for ROCm/older torch) raised the same run to `3336.4 tok/s`,
+  corrected accept `5.620`, and `Running=64, Waiting>0` average `4274.9 tok/s`
+  (`max=5823.8`). This matches the high V2 tree's saturated-window behavior
+  (`4357.4 tok/s` average) and explains why the first rebased b64 result looked
+  close to b16. The remaining difference vs `3494.2`/`3760.6` is now tail/run
+  variance plus runner-family differences, not the b64 graph cap or acceptance.
 
 NVIDIA V2 probe logs:
 
@@ -177,6 +189,8 @@ NVIDIA V2 probe logs:
 - `/data/home/jinzhao/nv_v2_tidar_logs/repro3804/20260706_191036_old_v016_family_tf64_m10k_gpu6.log`
 - `/data/home/jinzhao/nv_v2_tidar_logs/repro3804/20260706_191036_v2_tf64_m10k_fp_gpu7.log`
 - `/data/home/jinzhao/nv_v2_tidar_logs/repro3804/20260706_195137_v2_tf64_m10k_fp_logstats_gpu7.log`
+- `/data/home/jinzhao/nv_v2_tidar_logs/v024_clean/20260706_224333_v024_clean_v2_tf_b64_m10k_n150_fp_logstats_gpu7.log`
+- `/data/home/jinzhao/nv_v2_tidar_logs/v024_clean/20260706_225718_v024_clean_v2_tf_b64_m10k_n150_fp32fast_logstats_gpu7.log`
 
 ### Progression on b8/MT512
 
@@ -343,7 +357,7 @@ Key implementation choices:
 
 1. **Debug M6.6:** captured DP+EP+EPLB concurrency. Focus on captured main graph + EPLB expert rearrangement/state, since eager EPLB concurrency passes and disabling drafter graphs did not help.
 2. **Use the corrected acceptance probe for any future TF tput claims.** The b16/MT256 corrected probe now reports active-request accept around `5.5-5.6`; the old legacy denominator should only be used for comparison with old logs.
-3. **Rerun AMD b64 after the V2 TF graph-cap fix, and use a saturated/windowed benchmark for NVIDIA b64.** The old AMD b64 run capped graphs at `510` tokens and missed the true `1088`-token b64 TiDAR shapes. On NVIDIA the cap is fixed, but short V2 b64 aggregates are drain-tail dominated; compare against `3803.7 tok/s` with a long MT10000-style run or a steady-state throughput window.
+3. **Rerun AMD b64 after the V2 TF graph-cap and fp32-LM-head fixes, and use a saturated/windowed benchmark for NVIDIA b64.** The old AMD b64 run capped graphs at `510` tokens and missed the true `1088`-token b64 TiDAR shapes. On NVIDIA the cap is fixed and the rebased branch now uses the fast `out_dtype=torch.float32` LM-head path, but short V2 b64 aggregates are drain-tail dominated; compare against `3803.7 tok/s` with a long MT10000-style run or a steady-state throughput window.
 4. **Refine DP pause/resume** so EPLB does not need `VLLM_TIDAR_V2_DP_KEEPALIVE=1` busy-spin while idle.
 5. **Decide whether to submit the v0.24 OOB PR** from `docs/tidar_amd_handoff/`; it is independent and already validated.
 6. **Longer-term cleanup:** either keep the pragmatic V2 `TiDARSpeculator` route or fold it into a v0.24-style `TiDARSMoEModelState(MambaHybridModelState)` during a larger upstream sync.
