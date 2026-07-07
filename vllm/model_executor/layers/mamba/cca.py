@@ -294,6 +294,111 @@ class CCA(MambaBase, CustomOp):
             out = out + b1.view(1, g, d, 1)
         return out.reshape(x.shape[0], g * d, out.shape[-1])
 
+    def _select_prefill_initial_state_indices(
+        self,
+        state_indices_tensor: torch.Tensor,
+        block_idx_last_computed_token: torch.Tensor | None,
+        num_decodes: int,
+    ) -> torch.Tensor:
+        if state_indices_tensor.dim() <= 1:
+            return state_indices_tensor
+        if self._is_mamba_cache_all():
+            assert block_idx_last_computed_token is not None
+            return self._gather_state_indices(
+                state_indices_tensor,
+                block_idx_last_computed_token[num_decodes:],
+            )
+        return state_indices_tensor[:, 0]
+
+    def _select_prefill_output_state_indices(
+        self,
+        state_indices_tensor: torch.Tensor,
+        block_idx_last_scheduled_token: torch.Tensor | None,
+        num_decodes: int,
+    ) -> torch.Tensor:
+        if state_indices_tensor.dim() <= 1:
+            return state_indices_tensor
+        if self._is_mamba_cache_all():
+            assert block_idx_last_scheduled_token is not None
+            return self._gather_state_indices(
+                state_indices_tensor,
+                block_idx_last_scheduled_token[num_decodes:],
+            )
+        return state_indices_tensor[:, 0]
+
+    def _is_mamba_cache_all(self) -> bool:
+        return (
+            self.cache_config is not None
+            and self.cache_config.mamba_cache_mode == "all"
+        )
+
+    @staticmethod
+    def _gather_state_indices(
+        state_indices_tensor: torch.Tensor,
+        block_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        block_indices = block_indices[:state_indices_tensor.shape[0]]
+        return state_indices_tensor.gather(
+            1, block_indices.unsqueeze(1)).squeeze(1)
+
+    def _write_prefill_boundary_states(
+        self,
+        conv_states: torch.Tensor,
+        recurrent_states: torch.Tensor,
+        state_indices_tensor: torch.Tensor,
+        seq_idx: int,
+        qk_source: torch.Tensor,
+        delayed_v_state_cur: torch.Tensor,
+        num_computed_tokens: torch.Tensor,
+    ) -> None:
+        if not self._is_mamba_cache_all() or state_indices_tensor.dim() <= 1:
+            return
+        assert self.cache_config is not None
+        block_size = self.cache_config.mamba_block_size
+        assert block_size is not None
+
+        num_computed = int(num_computed_tokens.item())
+        num_scheduled = delayed_v_state_cur.shape[0]
+        first_block_idx = num_computed // block_size
+        last_block_idx = (num_computed + num_scheduled) // block_size - 1
+        for block_idx in range(first_block_idx, last_block_idx + 1):
+            relative_end = (block_idx + 1) * block_size - 1 - num_computed
+            source_end = self.total_padding + relative_end
+            source_start = source_end + 1 - self.total_padding
+            state_index = state_indices_tensor[seq_idx, block_idx]
+            conv_states[state_index] = qk_source[
+                :, :, source_start:source_end + 1
+            ].to(device=conv_states.device, dtype=conv_states.dtype)
+            recurrent_states[state_index] = delayed_v_state_cur[
+                relative_end, 0, :
+            ].to(device=recurrent_states.device, dtype=recurrent_states.dtype)
+
+    def _select_decode_input_state_indices(
+        self,
+        state_indices_tensor: torch.Tensor,
+        block_idx_last_computed_token: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if state_indices_tensor.dim() <= 1:
+            return state_indices_tensor
+        if self._is_mamba_cache_all():
+            assert block_idx_last_computed_token is not None
+            return self._gather_state_indices(
+                state_indices_tensor, block_idx_last_computed_token)
+        return state_indices_tensor[:, 0]
+
+    def _select_decode_output_state_indices(
+        self,
+        state_indices_tensor: torch.Tensor,
+        block_idx_last_scheduled_token: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if state_indices_tensor.dim() <= 1:
+            return state_indices_tensor
+        if self._is_mamba_cache_all():
+            assert block_idx_last_scheduled_token is not None
+            return self._gather_state_indices(
+                state_indices_tensor, block_idx_last_scheduled_token)
+        return state_indices_tensor[:, 0]
+
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -310,10 +415,40 @@ class CCA(MambaBase, CustomOp):
             recurrent_states = self.kv_cache[1]
             state_indices_tensor_p = attn_metadata.state_indices_tensor_p
             state_indices_tensor_d = attn_metadata.state_indices_tensor_d
-            if state_indices_tensor_d is not None and state_indices_tensor_d.dim() > 1:
-                state_indices_tensor_d = state_indices_tensor_d[:, 0]
+            num_decode_reqs = attn_metadata.num_decodes
+            block_idx_last_computed_token = attn_metadata.block_idx_last_computed_token
+            block_idx_last_scheduled_token = (
+                attn_metadata.block_idx_last_scheduled_token
+            )
+            prefill_initial_state_indices = (
+                self._select_prefill_initial_state_indices(
+                    state_indices_tensor_p,
+                    block_idx_last_computed_token,
+                    num_decode_reqs,
+                )
+                if state_indices_tensor_p is not None else None
+            )
+            prefill_output_state_indices = (
+                self._select_prefill_output_state_indices(
+                    state_indices_tensor_p,
+                    block_idx_last_scheduled_token,
+                    num_decode_reqs,
+                )
+                if state_indices_tensor_p is not None else None
+            )
+            decode_input_state_indices = (
+                self._select_decode_input_state_indices(
+                    state_indices_tensor_d, block_idx_last_computed_token)
+                if state_indices_tensor_d is not None else None
+            )
+            decode_output_state_indices = (
+                self._select_decode_output_state_indices(
+                    state_indices_tensor_d, block_idx_last_scheduled_token)
+                if state_indices_tensor_d is not None else None
+            )
             has_initial_states_p = attn_metadata.has_initial_states_p
             query_start_loc_p = attn_metadata.query_start_loc_p
+            num_computed_tokens_p = attn_metadata.num_computed_tokens_p
 
         if attn_metadata is None:
             # V1 profile run
@@ -381,7 +516,8 @@ class CCA(MambaBase, CustomOp):
         )
         decode_is_pad: torch.Tensor | None = None
         if has_prefill:
-            assert state_indices_tensor_p is not None
+            assert prefill_initial_state_indices is not None
+            assert prefill_output_state_indices is not None
             assert has_initial_states_p is not None
             assert query_start_loc_p is not None
             # Prefill
@@ -393,15 +529,17 @@ class CCA(MambaBase, CustomOp):
                 qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]  # [S_cur, B, H]
                 delayed_v_state_cur = delayed_v_state_p[start_i:end_i]
                 qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)  # [1, H, S_cur]
+                initial_state_index = prefill_initial_state_indices[i]
+                output_state_index = prefill_output_state_indices[i]
 
                 if has_initial_states_p[i]:
                     value_delayed_cached = recurrent_states[
-                        state_indices_tensor_p[i]].unsqueeze(0).unsqueeze(0)
+                        initial_state_index].unsqueeze(0).unsqueeze(0)
                     if value_delayed_cached.dtype != value_delayed.dtype:
                         value_delayed_cached = value_delayed_cached.to(
                             value_delayed.dtype)
                     qk_packed0_cached = conv_states[
-                        state_indices_tensor_p[i]
+                        initial_state_index
                     ].unsqueeze(0)  # [1, H, total_padding]
                     if qk_packed0_cached.dtype != qk_packed1_cur.dtype:
                         qk_packed0_cached = qk_packed0_cached.to(qk_packed1_cur.dtype)
@@ -416,11 +554,25 @@ class CCA(MambaBase, CustomOp):
                 value_delayed_prefill[start_i:end_i] = torch.cat(
                     [value_delayed_cached, delayed_v_state_cur[:-1]], dim=0)
 
+                if (
+                    num_computed_tokens_p is not None
+                    and state_indices_tensor_p is not None
+                ):
+                    self._write_prefill_boundary_states(
+                        conv_states,
+                        recurrent_states,
+                        state_indices_tensor_p,
+                        i,
+                        qk_packed2_cur,
+                        delayed_v_state_cur,
+                        num_computed_tokens_p[i],
+                    )
+
                 conv_states_cur = nn.functional.pad(
                     qk_packed2_cur,
                     (self.total_padding - qk_packed2_cur.shape[-1], 0),
                 )
-                conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(
+                conv_states[output_state_index] = conv_states_cur.to(
                     device=conv_states.device, dtype=conv_states.dtype
                 )
 
@@ -430,24 +582,30 @@ class CCA(MambaBase, CustomOp):
                 ).permute(2, 0, 1)  # [S, B, E]
                 qk_packed3_prefill[start_i:end_i] = qk_packed3_cur
 
-            recurrent_states[state_indices_tensor_p] = delayed_v_state_p[
+            recurrent_states[prefill_output_state_indices] = delayed_v_state_p[
                 query_start_loc_p[1:] - 1, 0, :].to(
                     device=recurrent_states.device,
                     dtype=recurrent_states.dtype)
 
         if has_decode:
-            assert state_indices_tensor_d is not None
+            assert decode_input_state_indices is not None
+            assert decode_output_state_indices is not None
             # Generation
             # In generation B and S are actually the same in meaning
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
-            decode_is_pad = state_indices_tensor_d == PAD_SLOT_ID
+            decode_is_pad = decode_input_state_indices == PAD_SLOT_ID
             # block_id=0 reserved
             # Zvllm/vllm/v1/core/block_pool.py
-            safe_decode_indices = torch.where(
+            safe_decode_input_indices = torch.where(
                 decode_is_pad,
-                torch.zeros_like(state_indices_tensor_d),
-                state_indices_tensor_d,
+                torch.zeros_like(decode_input_state_indices),
+                decode_input_state_indices,
+            )
+            safe_decode_output_indices = torch.where(
+                decode_is_pad,
+                torch.zeros_like(decode_output_state_indices),
+                decode_output_state_indices,
             )
             qk_packed0_d = torch.where(
                 decode_is_pad.view(-1, 1, 1),
@@ -461,7 +619,7 @@ class CCA(MambaBase, CustomOp):
             )
 
             qk_packed0_cached = conv_states[
-                safe_decode_indices
+                safe_decode_input_indices
             ]  # [S, H, total_padding]
             qk_packed0_cached = torch.where(
                 decode_is_pad.view(-1, 1, 1),
@@ -491,11 +649,12 @@ class CCA(MambaBase, CustomOp):
                 new_qk_packed0_cache.new_zeros(()),
                 new_qk_packed0_cache,
             )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
+            conv_states[safe_decode_output_indices] = new_qk_packed0_cache.to(
                 device=conv_states.device, dtype=conv_states.dtype
             )
 
-            value_delayed_decode = recurrent_states[safe_decode_indices].unsqueeze(1)
+            value_delayed_decode = recurrent_states[
+                safe_decode_input_indices].unsqueeze(1)
             value_delayed_decode = torch.where(
                 decode_is_pad.view(-1, 1, 1),
                 value_delayed_decode.new_zeros(()),
@@ -511,7 +670,7 @@ class CCA(MambaBase, CustomOp):
                 new_recurrent_state.new_zeros(()),
                 new_recurrent_state,
             )
-            recurrent_states[safe_decode_indices] = new_recurrent_state.to(
+            recurrent_states[safe_decode_output_indices] = new_recurrent_state.to(
                 device=recurrent_states.device,
                 dtype=recurrent_states.dtype)
 
