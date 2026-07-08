@@ -1519,9 +1519,32 @@ class DPEngineCoreProc(EngineCoreProc):
                     self.execute_dummy_batch()
 
             # 3) All-reduce operation to determine global unfinished reqs.
-            self.engines_running = self._has_global_unfinished_reqs(
-                local_unfinished_reqs
+            # Extended to also agree on "all DP ranks paused": when the
+            # external RLHF weight sync pauses the scheduler (mode="keep"),
+            # the loop must stop issuing DP collectives (dummy batches +
+            # finish-sync) or they interleave/deadlock with the param-sync
+            # NCCL broadcast running on the worker thread. The park decision
+            # rides the same all-reduce, so entry is DP-consistent; exit is
+            # local (resume is delivered to every rank's input queue).
+            self.engines_running, _dp_all_paused = (
+                self._has_global_unfinished_reqs_and_all_paused(
+                    local_unfinished_reqs
+                )
             )
+            if _dp_all_paused:
+                logger.info(
+                    "DP rank %d parking engine loop (scheduler paused for "
+                    "weight sync).", self.dp_rank,
+                )
+                import time as _time_park
+                while self._scheduler_paused:
+                    # Service control messages (resume / utility RPCs) only;
+                    # no engine steps, no collectives.
+                    self._process_input_queue()
+                    _time_park.sleep(0.005)
+                logger.info("DP rank %d unparked (scheduler resumed).",
+                            self.dp_rank)
+                continue
 
             if not self.engines_running:
                 if not self.has_coordinator or self.force_dp_keepalive:
@@ -1559,6 +1582,22 @@ class DPEngineCoreProc(EngineCoreProc):
                 # Increment wave count and reset step counter.
                 self.current_wave += 1
                 self.step_counter = 0
+
+    def _has_global_unfinished_reqs_and_all_paused(
+        self, local_unfinished: bool
+    ) -> tuple[bool, bool]:
+        # Combined finish-sync + pause agreement in ONE collective (see
+        # run_busy_loop park comment). all_paused == no rank reported
+        # not-paused.
+        self.step_counter += 1
+        import torch as _t_park
+        t = _t_park.tensor(
+            [1 if local_unfinished else 0,
+             0 if self._scheduler_paused else 1],
+            dtype=_t_park.int32, device="cpu")
+        _t_park.distributed.all_reduce(
+            t, op=_t_park.distributed.ReduceOp.MAX, group=self.dp_group)
+        return bool(int(t[0].item())), int(t[1].item()) == 0
 
     def _has_global_unfinished_reqs(self, local_unfinished: bool) -> bool:
         # DP model/dummy collectives can be reached from different local code
