@@ -118,6 +118,9 @@ class RejectionSampler(nn.Module):
 
         bonus_logits_indices = metadata.bonus_logits_indices
         target_logits_indices = metadata.target_logits_indices
+        needs_logprobs = sampling_metadata.max_num_logprobs is not None
+        return_ar_logprobs = needs_logprobs and _env_flag(
+            "VLLM_TIDAR_RETURN_AR_LOGPROBS")
 
         # When indexing with a tensor (bonus_logits_indices), PyTorch
         # creates a new tensor with separate storage from the original
@@ -125,22 +128,24 @@ class RejectionSampler(nn.Module):
         # won't affect the original logits tensor.
         assert logits is not None
         bonus_logits = logits[bonus_logits_indices]
-        # Preserve raw AR bonus logits for VLLM_TIDAR_RETURN_AR_LOGPROBS.
-        # The sampler override may return post-sampling/temperature-processed
-        # logits when VERL's post-sampling logprob patch is installed.
-        raw_bonus_logits = bonus_logits.to(torch.float32).clone()
+        raw_bonus_logits = None
+        if return_ar_logprobs:
+            # Preserve raw AR bonus logits for VLLM_TIDAR_RETURN_AR_LOGPROBS.
+            # The sampler override may return post-sampling/temperature-processed
+            # logits when VERL's post-sampling logprob patch is installed.
+            raw_bonus_logits = bonus_logits.to(torch.float32).clone()
         bonus_sampler_output = self.sampler(
             logits=bonus_logits,
             sampling_metadata=replace(
                 sampling_metadata,
-                max_num_logprobs=-1,
+                max_num_logprobs=-1 if needs_logprobs else None,
             ),
             predict_bonus_token=True,
             # Override the logprobs mode to return logits because they are
             # needed later to compute the accepted token logprobs.
             logprobs_mode_override="processed_logits"
-            if self.is_processed_logprobs_mode
-            else "raw_logits",
+            if needs_logprobs and self.is_processed_logprobs_mode
+            else ("raw_logits" if needs_logprobs else None),
         )
         bonus_token_ids = bonus_sampler_output.sampled_token_ids
 
@@ -180,8 +185,7 @@ class RejectionSampler(nn.Module):
         )
 
         logprobs_tensors = None
-        if sampling_metadata.max_num_logprobs is not None:
-            return_ar_logprobs = _env_flag("VLLM_TIDAR_RETURN_AR_LOGPROBS")
+        if needs_logprobs:
             if return_ar_logprobs and not getattr(
                 self, "_tidar_return_ar_logprobs_logged", False
             ):
@@ -193,6 +197,7 @@ class RejectionSampler(nn.Module):
                 )
                 self._tidar_return_ar_logprobs_logged = True
             if return_ar_logprobs:
+                assert raw_bonus_logits is not None
                 ar_target_logits, ar_bonus_logits = self._get_ar_logprob_logits(
                     raw_target_logits,
                     raw_bonus_logits,
@@ -202,6 +207,7 @@ class RejectionSampler(nn.Module):
                 target_logprob_logits = ar_target_logits
                 bonus_logprob_logits = ar_bonus_logits
             else:
+                assert bonus_sampler_output.logprobs_tensors is not None
                 target_logprob_logits = (
                     raw_target_logits
                     if not self.is_processed_logprobs_mode

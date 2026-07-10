@@ -398,6 +398,49 @@ rerun best `2699.349`, accept `6.552`. The b64 log confirms cap/capture sizes in
 `/shared/home/jinzhao/tfscope/amd_long_v016/20260707_062913_cnode-107_gpu1_v2_tf_fp_long_iter12600_b1_b8_b16_b64_mt2000.log`,
 `/shared/home/jinzhao/tfscope/amd_long_v016/20260707_065110_cnode-107_gpu1_v2_tf_fp_long_iter12600_b64_mt2000_rerun.log`.
 
+2026-07-07 same-checkpoint AMD/NVIDIA profile follow-up: reran the long sweep with
+`iter_0012600` on both platforms and matched the real NVIDIA config: AIME25
+thinking-off, `MT=2000`, warmup 64, K=16, target/draft temp `0.0`, prompt-token IDs,
+ignore-EOS, `FULL_AND_PIECEWISE`, `n_sample=10`, `num_prompts=bsz`,
+`max_num_seqs=bsz`, and `num_input_sequences=bsz*10`. NVIDIA H100 (`FLASH_ATTN` v3)
+measured b1 `148.951 tok/s`, acc `4.978`; b8 `1029.468`, acc `5.590`; b16
+`1656.976`, acc `5.735`; b64 `2127.865`, acc `5.881`. AMD MI300X
+(`ROCM_AITER_FA`, TF-paged, no-splits, warmed image `tidar-v024-built:iter12600-aiterwarm`)
+measured b1 `100.010 tok/s`, acc `5.208`; b8 `510.885`, acc `5.471`; b16
+`990.631`, acc `5.986`; b64 `1682.274`, acc `5.886`. This supersedes the earlier
+AMD-only `n_sample=1` sweep for parity: AMD acceptance is now roughly matched, but
+throughput is lower. Matched b16 profile (`n_sample=1`, `MT=512`) shows why:
+NVIDIA full-shape target/draft/reject is `20.067/17.579/0.989 ms`; AMD is
+`28.821/26.314/1.175 ms`. The gap is mainly target/draft forward latency on
+`ROCM_AITER_FA`, not rejection-sampler logic. Logs:
+`/data/home/jinzhao/nv_v2_tidar_logs/iter12600_matched/`,
+`/data/home/jinzhao/nv_v2_tidar_logs/iter12600_profile/20260707_014246_nv_gpu6_iter12600_fp_profile_b16_mt512.log`,
+`/shared/home/jinzhao/tfscope/amd_iter12600_matched/20260707_075944_*_warmimg.log`,
+`/shared/home/jinzhao/tfscope/amd_iter12600_profile/20260707_081033_amd_cnode107_gpu4_iter12600_fp_profile_b16_mt512_warmimg.log`.
+
+2026-07-07 checkpoint-control + AR-baseline follow-up: exact same NVIDIA V2 TF
+long script/config, paired by batch on the same H100 GPU, shows `iter_0012000`
+has higher TiDAR accept than `iter_0012600`: b1 `188.467 tok/s`, acc `6.339`
+vs `157.188`, acc `4.978`; b8 `1139.612`, acc `6.623` vs `984.326`, acc
+`5.554`; b16 `1846.769`, acc `6.475` vs `1685.288`, acc `5.628`; b64
+`2280.917`, acc `6.556` vs `2098.162`, acc `5.799`. This confirms the older
+v0.16 handoff's higher accept is mostly checkpoint/workload, not a V2 rejection
+sampler regression. Follow-up tokenizer check: loaded `AutoTokenizer.chat_template`
+differs only by the leading BOS (`iter_0012000` prepends `{{ bos_token }}`,
+`iter_0012600` does not), but this benchmark path used already-templated
+AIME25 `prompt_token_ids` with `add_special_tokens=False`; all 30 prompt token
+sequences are identical across checkpoints. Forced-BOS retest on both H100 and
+MI300X changed `0/30` prompts and logged `leading_bos_count=1`; `iter_0012600`
+accept stayed in the same band (NVIDIA b1/b8/b16/b64 `4.978/5.479/5.642/5.774`,
+AMD `5.208/5.622/5.887/5.902`), so missing BOS is not the accept gap here.
+Captured AR baselines on `iter_0012600` (`n_sample=1`,
+`MT=2000`, V2 async, `FULL_AND_PIECEWISE`, no spec) measured NVIDIA H100
+`82.649/552.746/1035.511/3420.864 tok/s` for b1/b8/b16/b64 and AMD MI300X
+`53.369/419.094/774.441/2622.038 tok/s`. Logs:
+`/data/home/jinzhao/nv_v2_tidar_logs/iter12000_vs_12600_backtoback_20260707_030645/`,
+`/data/home/jinzhao/nv_v2_tidar_logs/ar_v2_iter12600_captured_20260707_034419/`,
+`/shared/home/jinzhao/tfscope/amd_ar_v2_iter12600_captured_20260707_091143/`.
+
 Conclusion after M5: the implementation is past the perf/correctness gate for this
 Path-B slice. Remaining pre-commit work is review cleanup of the broader diff, a decision
 on whether to document/accept the strict eager-vs-captured numeric boundary, and EP/EPLB
@@ -585,6 +628,6 @@ deliberately disabled.
 
 - Does SMoE-AR run on the fork's V2 runner today? Yes — M1 landed 2026-07-01.
 - Is TiDAR's SF/TF proposer portable to the V2 spec-decode interface as cleanly as EAGLE? Yes for TiDAR TF: sync/eager, async/eager, and captured verify+drafter graph paths run. The performance gate is passed at b8/MT512 (`553.839 tok/s` latest; first M4 pass was `405.651 tok/s`).
-- Why can the latest short V2 accept numbers look lower than the v0.16 6-7 handoff table? Some of it is workload/accounting: v0.16 used `iter_0012000`, AIME thinking-off, `MT=2000`, and metric windows; the current V2 probes use `iter_0012600`, shorter MT, and previously used a denominator that undercounted after early finishes. Target/draft temps are both `0.0`; rerun with the corrected active-request metric before treating the gap as a kernel regression. If AMD accept collapses to ~1.0 with incoherent text, check that ROCm logs show `Using TiDAR TF paged attention in ROCm AITER-FA` for draft and verify.
+- Why can the latest short V2 accept numbers look lower than the v0.16 6-7 handoff table? Mostly checkpoint/workload/accounting: v0.16 used `iter_0012000`, AIME thinking-off, `MT=2000`, and metric windows; current parity probes use `iter_0012600`, and the old denominator undercounted once requests finished early. The back-to-back H100 control above confirms `iter_0012000` accepts about `0.75-1.36` more tokens than `iter_0012600` under the exact same current V2 TF script. Target/draft temps are both `0.0`. If AMD accept collapses to ~1.0 with incoherent text, check that ROCm logs show `Using TiDAR TF paged attention in ROCm AITER-FA` for draft and verify.
 - Does the V2 runner's async path compose with the CCA stash + mamba state updates? Yes. Sync/async hashes matched on eager and captured plain AR. Perf is modest on plain AR: eager b8 +4.6%, captured b8 +9.7%. Captured graph construction and replay now work on the vectorized CCA path after the AITER `max_query_len` metadata fix; fused CCA capture is still unsafe.
 - EP/EPLB (DeepEP/allgather-reducescatter all2all) behavior on the V2 runner on MI300X. M6 showed DP+EP eager/captured server init and request handling work with AgRs all2all and expert sharding after the V2 TiDAR DP draft-fold/dummy-draft fixes. M6.5 showed DP+EP+EPLB eager post-idle smoke works with `VLLM_TIDAR_V2_DP_KEEPALIVE=1`, but that workaround busy-spins dummy batches while idle. M6.6 showed captured EPLB boots and sequential requests pass, but concurrent captured requests crash with an AITER MoE GPU memory access fault at the `(304,32,...)` shape; eager EPLB concurrency passes, and disabling TiDAR drafter graph capture does not fix the captured crash.

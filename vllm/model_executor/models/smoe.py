@@ -116,29 +116,52 @@ _VLLM_TIDAR_SMOE_MOE_OP = (
     os.environ.get("VLLM_TIDAR_SMOE_MOE_OP", "0").lower()
     in ("1", "true", "yes"))
 
-class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
-    """LM-head projection that returns fp32 logits via out_dtype.
+_VLLM_SMOE_ROCM_BF16_LM_HEAD = (
+    os.environ.get("VLLM_SMOE_ROCM_BF16_LM_HEAD", "0").lower()
+    in ("1", "true", "yes"))
 
-    On CUDA/Hopper, keep bf16 inputs/weights and request fp32 accumulation from
-    torch.mm; explicitly upcasting the full vocab matrix per call is a large
-    TiDAR TF bottleneck. ROCm/older torch falls back to a cached fp32 transpose.
+
+class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
+    """High-precision LM-head projection with a ROCm BF16 fast path.
+
+    Keep bf16 inputs/weights and request FP32 output from ``torch.mm``. Current
+    torch 2.10/ROCm 7.2 supports this mixed-output path; older builds fall back
+    to a cached FP32 weight transpose.
+    ``VLLM_SMOE_ROCM_BF16_LM_HEAD=1`` enables a native BF16 projection for
+    profiling. It is opt-in because BF16 output rounding can change greedy
+    tokens and reduce TiDAR acceptance. The V2 sampler promotes target logits
+    to FP32 before processing.
     """
 
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
-        try:
-            out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
-        except (TypeError, RuntimeError):
-            _cached = getattr(layer, "_fp32_weight_t_cache", None)
-            if (_cached is None
-                    or _cached.data_ptr() == 0
-                    or _cached.dtype != torch.float32):
-                _cached = layer.weight.t().to(torch.float32).contiguous()
-                layer._fp32_weight_t_cache = _cached
-            out = torch.mm(x.to(torch.float32), _cached)
+
+        if torch.version.hip is not None and _VLLM_SMOE_ROCM_BF16_LM_HEAD:
+            if layer.weight.dtype == torch.bfloat16:
+                weight_t = layer.weight.t()
+            else:
+                weight_t = getattr(layer, "_bf16_weight_t_cache", None)
+                if (weight_t is None
+                        or weight_t.data_ptr() == 0
+                        or weight_t.dtype != torch.bfloat16):
+                    weight_t = layer.weight.t().to(
+                        torch.bfloat16).contiguous()
+                    layer._bf16_weight_t_cache = weight_t
+            out = torch.mm(x.to(torch.bfloat16), weight_t)
+        else:
+            try:
+                out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
+            except (TypeError, RuntimeError):
+                _cached = getattr(layer, "_fp32_weight_t_cache", None)
+                if (_cached is None
+                        or _cached.data_ptr() == 0
+                        or _cached.dtype != torch.float32):
+                    _cached = layer.weight.t().to(torch.float32).contiguous()
+                    layer._fp32_weight_t_cache = _cached
+                out = torch.mm(x.to(torch.float32), _cached)
         if bias is not None:
-            out = out + bias.to(torch.float32)
+            out = out + bias.to(out.dtype)
         return out
 
 

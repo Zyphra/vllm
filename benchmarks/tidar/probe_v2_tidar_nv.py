@@ -23,6 +23,7 @@ import torch
 from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
+from vllm.model_executor.models import smoe as smoe_model
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
 from vllm.v1.worker.gpu.spec_decode import tidar as tidar_v2
 
@@ -323,6 +324,7 @@ _ORIG_EXECUTE_MODEL = v2_model_runner.GPUModelRunner.execute_model
 _ORIG_SAMPLE = v2_model_runner.GPUModelRunner.sample
 _ORIG_SAMPLE_TOKENS = v2_model_runner.GPUModelRunner.sample_tokens
 _ORIG_PROPOSE_DRAFT = v2_model_runner.GPUModelRunner.propose_draft
+_ORIG_SMOE_LM_HEAD_APPLY = smoe_model._FP32EmbeddingMethod.apply
 
 
 def _counted_propose(self: tidar_v2.TiDARSpeculator, *args: Any,
@@ -371,6 +373,28 @@ def _profiled_tidar_run_model(self: tidar_v2.TiDARSpeculator, *args: Any,
 
 
 tidar_v2.TiDARSpeculator.run_model = _profiled_tidar_run_model
+
+
+def _profiled_smoe_lm_head_apply(
+    self: smoe_model._FP32EmbeddingMethod,
+    layer: Any,
+    x: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    meta = None
+    if PROFILE_STATS.enabled:
+        meta = {
+            "rows": int(x.shape[0]),
+            "hidden": int(x.shape[-1]),
+            "input_dtype": str(x.dtype),
+            "weight_dtype": str(layer.weight.dtype),
+        }
+    return PROFILE_STATS.timed_call(
+        "smoe_lm_head", _ORIG_SMOE_LM_HEAD_APPLY, self, layer, x, bias,
+        meta=meta)
+
+
+smoe_model._FP32EmbeddingMethod.apply = _profiled_smoe_lm_head_apply
 
 
 def _profiled_execute_model(self: v2_model_runner.GPUModelRunner,
@@ -468,12 +492,20 @@ def select_prompts(prompts: list[str], batch: int, offset: int) -> list[str]:
 def encode_prompts(
     prompts: list[str],
     checkpoint: str,
+    force_bos: bool = False,
 ) -> tuple[list[dict[str, list[int]]], dict[str, Any]]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-    prompt_inputs = [
-        {"prompt_token_ids": tokenizer.encode(p, add_special_tokens=False)}
-        for p in prompts
-    ]
+    prompt_inputs = []
+    for prompt in prompts:
+        token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        if force_bos:
+            bos_id = tokenizer.bos_token_id
+            if bos_id is None:
+                raise ValueError("--force-bos requires a tokenizer BOS token")
+            while token_ids and token_ids[0] == bos_id:
+                token_ids.pop(0)
+            token_ids.insert(0, bos_id)
+        prompt_inputs.append({"prompt_token_ids": token_ids})
     first_ids = prompt_inputs[0]["prompt_token_ids"] if prompt_inputs else []
     bos_id = tokenizer.bos_token_id
     leading_bos_count = sum(1 for token_id in first_ids[:4] if token_id == bos_id)
@@ -593,6 +625,9 @@ def parse_args() -> argparse.Namespace:
                             "PATCH_PROBE_ENABLE_LOG_STATS") == "1")
     parser.add_argument("--prompt-token-ids", action="store_true",
                         default=os.environ.get("PATCH_PROBE_PROMPT_TOKEN_IDS") == "1")
+    parser.add_argument("--force-bos", action="store_true",
+                        default=os.environ.get("PATCH_PROBE_FORCE_BOS") == "1",
+                        help="Prepend exactly one BOS to prompt token IDs.")
     parser.add_argument("--ignore-eos", action="store_true",
                         default=os.environ.get("PATCH_PROBE_IGNORE_EOS") == "1")
     return parser.parse_args()
@@ -609,8 +644,11 @@ def main() -> None:
     base_prompts = select_prompts(all_prompts, num_prompts, args.offset)
     selected_prompts = base_prompts * args.n_sample
     if args.prompt_token_ids:
-        prompts, tokenization = encode_prompts(selected_prompts, args.ckpt)
+        prompts, tokenization = encode_prompts(
+            selected_prompts, args.ckpt, force_bos=args.force_bos)
     else:
+        if args.force_bos:
+            raise ValueError("--force-bos requires --prompt-token-ids")
         prompts = selected_prompts
         tokenization = None
 
@@ -624,6 +662,7 @@ def main() -> None:
         "num_input_sequences": len(prompts),
         "num_dataset_prompts": len(all_prompts),
         "prompt_token_ids": args.prompt_token_ids,
+        "force_bos": args.force_bos,
         "tokenization": tokenization,
         "max_tokens": args.max_tokens,
         "ignore_eos": args.ignore_eos,

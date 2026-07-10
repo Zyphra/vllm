@@ -45,6 +45,9 @@ _CCA_FUSED_ENABLED = os.environ.get(
 _CCA_TRITON_FUSION_ENABLED = os.environ.get(
     "VLLM_CCA_TRITON_FUSION_ENABLED", "0").lower() in ("1", "true", "yes")
 
+_CCA_AMD_CONV_UNFOLD_ENABLED = os.environ.get(
+    "VLLM_CCA_AMD_CONV_UNFOLD", "0").lower() in ("1", "true", "yes")
+
 _CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
     "CCA_DIM_PRESERVE_CONV", "0").lower() in ("1", "true", "yes")
 
@@ -422,10 +425,12 @@ class CCA(MambaBase, CustomOp):
         qk_packed2_p = torch.cat([qk_cached, qk_packed1_p], dim=-1)
 
         # Conv: [P, H_conv, total_padding + S] -> [P, H_conv, S]
-        # Use _conv_qk_apply (cuDNN F.conv1d, fp32) — faster than the
-        # manual unfold+einsum in _conv_qk_decode at SF shapes. Same
-        # math (both are fp32 two-stage depthwise + grouped conv).
-        qk_packed3_p = self._conv_qk_apply(qk_packed2_p)
+        # Both paths perform the same FP32 two-stage convolution. Keep cuDNN
+        # as the default; the unfold path is useful for ROCm shape tuning.
+        if _CCA_AMD_CONV_UNFOLD_ENABLED:
+            qk_packed3_p = self._conv_qk_decode(qk_packed2_p)
+        else:
+            qk_packed3_p = self._conv_qk_apply(qk_packed2_p)
         qk_packed3_prefill.copy_(
             qk_packed3_p.permute(0, 2, 1).contiguous()
             .reshape(qk_packed3_prefill.shape))

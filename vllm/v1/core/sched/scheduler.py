@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -101,6 +102,22 @@ class Scheduler(SchedulerInterface):
         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
+        speculative_config = vllm_config.speculative_config
+        self.tidar_decode_first_refill = (
+            os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL", "0") == "1"
+            and speculative_config is not None
+            and speculative_config.use_tidar()
+        )
+        self.tidar_decode_first_refill_min_running = int(
+            os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING", "1")
+        )
+        if self.tidar_decode_first_refill:
+            logger.info(
+                "TiDAR decode-first refill scheduling is enabled; waiting "
+                "prefills will not be mixed into scheduled decode steps "
+                "with at least %d running requests.",
+                self.tidar_decode_first_refill_min_running,
+            )
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
             and self.kv_events_config.enable_kv_cache_events
@@ -536,7 +553,21 @@ class Scheduler(SchedulerInterface):
         skipped_waiting_requests = create_request_queue(self.policy)
 
         # Next, schedule the WAITING requests.
-        if not preempted_reqs:
+        tidar_decode_running_reqs = (
+            sum(
+                req.num_output_tokens > 0
+                or req.num_output_placeholders > 0
+                or bool(req.spec_token_ids)
+                for req in scheduled_running_reqs
+            )
+            if self.tidar_decode_first_refill
+            else 0
+        )
+        skip_waiting_for_tidar_decode = (
+            tidar_decode_running_reqs
+            >= self.tidar_decode_first_refill_min_running
+        )
+        if not preempted_reqs and not skip_waiting_for_tidar_decode:
             while self.waiting and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
                     break
