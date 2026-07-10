@@ -554,7 +554,7 @@ Local repo:
 Checkpoint:
 
 ```bash
-/shared/home/henry/checkpoints/hf/smoediffusion_128k_64node/iter_0012600
+https://huggingface.co/Zyphra-staging/smoediffusion_128k-hf_iter_0012600
 ```
 
 Docker image:

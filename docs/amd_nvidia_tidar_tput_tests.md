@@ -18,7 +18,7 @@ forwards, especially at high batch.
 
 | Setting | Value |
 |---|---|
-| Checkpoint | `smoediffusion_128k_64node/iter_0012600` |
+| Checkpoint | `Zyphra-staging/smoediffusion_128k-hf_iter_0012600` |
 | Dataset | `benchmarks/tidar/aime25_zpo_texts.json` (AIME25 thinking-off) |
 | Prompt path | token IDs, `add_special_tokens=False`, force exactly one BOS |
 | Expected first IDs | `[2, 105, 9731, 107]`, `leading_bos_count=1` |
@@ -150,7 +150,15 @@ Profile logs:
 
 ## AMD Reproducer
 
-The repo now contains both probes and a matched runner:
+Clone the branch with the V2 TiDAR TF runner and reproducer scripts:
+
+```bash
+git clone --branch jinzhao/tidar_v024 \
+    https://github.com/Zyphra/vllm-smoe-amd.git
+cd vllm-smoe-amd
+```
+
+The repo contains both probes and a matched runner:
 
 ```text
 benchmarks/tidar/probe_v2_ar.py
@@ -159,13 +167,22 @@ benchmarks/tidar/run_iter12600_tput.sh
 benchmarks/tidar/aime25_zpo_texts.json
 ```
 
+Download the shared checkpoint from Hugging Face:
+
+```bash
+python3 -m pip install -q huggingface_hub
+export CKPT=/shared/home/$USER/checkpoints/smoediffusion_128k-hf_iter_0012600
+huggingface-cli download Zyphra-staging/smoediffusion_128k-hf_iter_0012600 \
+    --local-dir "$CKPT"
+```
+
 On an AMD node, build the repo in the standard ROCm image, then run:
 
 ```bash
 cd /work
 pip install -q --no-build-isolation -e .
 
-export CKPT=/shared/home/henry/checkpoints/hf/smoediffusion_128k_64node/iter_0012600
+export CKPT=${CKPT:-/shared/home/$USER/checkpoints/smoediffusion_128k-hf_iter_0012600}
 export DATA=benchmarks/tidar/aime25_zpo_texts.json
 export BACKEND=ROCM_AITER_FA
 export GPU=1
