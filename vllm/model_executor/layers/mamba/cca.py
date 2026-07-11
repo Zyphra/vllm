@@ -666,6 +666,10 @@ class CCA(MambaBase, CustomOp):
             state_indices_tensor = attn_metadata.state_indices_tensor
             has_initial_states_p = attn_metadata.has_initial_states_p
             query_start_loc_p = attn_metadata.query_start_loc_p
+            query_start_loc_p_cpu = getattr(
+                attn_metadata, "query_start_loc_p_cpu", None)
+            has_initial_states_p_cpu = getattr(
+                attn_metadata, "has_initial_states_p_cpu", None)
 
         if attn_metadata is None:
             # V1 profile run
@@ -757,6 +761,14 @@ class CCA(MambaBase, CustomOp):
             [num_decodes, num_prefills],
             dim=0,
         )
+        # ccaoob-fix2(JZ): clamp prefill slot indices into valid range before
+        # they're used as gather/scatter offsets into prev_hs/conv_states in
+        # the cold-prefill loop below. Mirrors the already-validated decode-
+        # side OOB guard (93fbc00f) for the same class of bug on the prefill
+        # write path (cca.py forward_triton/forward_cuda illegal-mem, Xid31).
+        if num_prefills > 0:
+            state_indices_tensor_p = state_indices_tensor_p.clamp(
+                0, prev_hs.shape[0] - 1)
 
         # TODO: allocate memory for output tensors
         qk_packed3_output_list = []
@@ -770,13 +782,30 @@ class CCA(MambaBase, CustomOp):
             # Prefill
             hs2 = torch.zeros((num_prefill_tokens, self.hidden_size), device=hs.device, dtype=hs.dtype)
             qk_packed3_p = torch.zeros((num_prefill_tokens, self.in_out_ch), device=hs.device, dtype=hs.dtype)
-            for i in range(len(query_start_loc_p) - 1):
-                start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
+            # ccaoob-fix(JZ): use host-side qsl/has_init lists (single bulk
+            # .tolist() sync, like _stash_spec_candidates_rowwise) instead of
+            # per-iteration GPU tensor indexing. query_start_loc_p is a
+            # persistent buffer refreshed in-place (non_blocking=True) every
+            # step; indexing it element-by-element inside this Python loop
+            # forces a sync per index and can race the async scheduler's
+            # prep of the NEXT step's buffer contents, corrupting start_i/
+            # end_i -> forward_triton illegal-mem (Xid31)-style crash on
+            # long/variable-length cold prefill (e.g. lcb_v6).
+            if query_start_loc_p_cpu is not None:
+                _qsl = [int(x) for x in query_start_loc_p_cpu.tolist()]
+            else:
+                _qsl = [int(x) for x in query_start_loc_p.tolist()]
+            if has_initial_states_p_cpu is not None:
+                _has_init = [bool(x) for x in has_initial_states_p_cpu.tolist()]
+            else:
+                _has_init = [bool(x) for x in has_initial_states_p.tolist()]
+            for i in range(len(_qsl) - 1):
+                start_i, end_i = _qsl[i], _qsl[i + 1]
                 hs2_cur = hs_p[start_i:end_i]  # [S_cur, H]
                 qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                 qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
-                
-                if has_initial_states_p[i]:
+
+                if _has_init[i]:
                     hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                     hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
                     qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]
@@ -930,6 +959,10 @@ class CCA(MambaBase, CustomOp):
             state_indices_tensor = attn_metadata.state_indices_tensor
             has_initial_states_p = attn_metadata.has_initial_states_p
             query_start_loc_p = attn_metadata.query_start_loc_p
+            query_start_loc_p_cpu = getattr(
+                attn_metadata, "query_start_loc_p_cpu", None)
+            has_initial_states_p_cpu = getattr(
+                attn_metadata, "has_initial_states_p_cpu", None)
             state_indices_tensor_write = (
                 attn_metadata.state_indices_tensor_write)
             drafter_pass = attn_metadata.drafter_pass
@@ -1029,6 +1062,14 @@ class CCA(MambaBase, CustomOp):
             [num_decodes, num_prefills],
             dim=0,
         )
+        # ccaoob-fix2(JZ): clamp prefill slot indices into valid range before
+        # they're used as gather/scatter offsets into prev_hs/conv_states in
+        # the cold-prefill loop below. Mirrors the already-validated decode-
+        # side OOB guard (93fbc00f) for the same class of bug on the prefill
+        # write path (cca.py forward_triton illegal-mem, Xid31).
+        if num_prefills > 0:
+            state_indices_tensor_p = state_indices_tensor_p.clamp(
+                0, prev_hs.shape[0] - 1)
 
         # TiDAR drafter pass: writes go to scratch (state_indices_tensor_write)
         # NOT the AR slot (state_indices_tensor). Without this split the Python
@@ -1044,6 +1085,10 @@ class CCA(MambaBase, CustomOp):
                     [num_decodes, num_prefills],
                     dim=0,
                 ))
+            if num_prefills > 0:
+                state_indices_tensor_write_p = (
+                    state_indices_tensor_write_p.clamp(
+                        0, prev_hs.shape[0] - 1))
 
         # TODO: allocate memory for output tensors
         qk_packed3_output_list = []
@@ -1256,13 +1301,25 @@ class CCA(MambaBase, CustomOp):
                 _sit_write_p = (state_indices_tensor_write_p
                                 if state_indices_tensor_write_p is not None
                                 else state_indices_tensor_p)
-                for i in range(len(query_start_loc_p) - 1):
-                    start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
+                # ccaoob-fix(JZ): use host-side qsl/has_init lists (single
+                # bulk .tolist() sync, like _stash_spec_candidates_rowwise)
+                # instead of per-iteration GPU tensor indexing. See matching
+                # comment in forward_cuda's prefill loop.
+                if query_start_loc_p_cpu is not None:
+                    _qsl = [int(x) for x in query_start_loc_p_cpu.tolist()]
+                else:
+                    _qsl = [int(x) for x in query_start_loc_p.tolist()]
+                if has_initial_states_p_cpu is not None:
+                    _has_init = [bool(x) for x in has_initial_states_p_cpu.tolist()]
+                else:
+                    _has_init = [bool(x) for x in has_initial_states_p.tolist()]
+                for i in range(len(_qsl) - 1):
+                    start_i, end_i = _qsl[i], _qsl[i + 1]
                     hs2_cur = hs_p[start_i:end_i]  # [S_cur, H]
                     qk_packed0_cur = qk_packed0_p[start_i:end_i]  # [S_cur, E]
                     qk_packed1_cur = qk_packed0_cur.T.unsqueeze(0)  # [1, E, S_cur]
 
-                    if has_initial_states_p[i]:
+                    if _has_init[i]:
                         hs2_cached = prev_hs[state_indices_tensor_p[i]].to(hs.dtype).unsqueeze(0)  # [1, H]
                         hs2_cur = torch.cat([hs2_cached, hs2_cur[:-1]], dim=0)  # [S_cur, H]
                         qk_packed0_cached = conv_states[state_indices_tensor_p[i]].to(qk_packed0.dtype).unsqueeze(0)  # [1, E, total_padding]

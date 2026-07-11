@@ -800,7 +800,7 @@ class TiDARProposer(EagleProposer):
 
     def _dspark_sample_drafts(self, hidden: torch.Tensor,
                               batch_size: int,
-                              mask_positions: Optional[torch.Tensor] = None,
+                              global_start: Optional[torch.Tensor] = None,
                               prev_token: Optional[torch.Tensor] = None,
                               ) -> torch.Tensor:
         """DSpark draft: untied head + sequential Markov logit bias.
@@ -844,27 +844,30 @@ class TiDARProposer(EagleProposer):
         tokens = torch.empty(B, K, dtype=torch.long, device=U.device)
         probs = (None if T == 0.0 else torch.empty(
             B, K, V, dtype=torch.float32, device=U.device))
-        # Reset the Markov `prev` on the TRUE global block grid when we know
-        # each mask's global position; else fall back to the draft-local grid.
-        # At a non-boundary draft position 0, the correct prev is the last
-        # committed token (matches training: prev = token at global g-1).
-        # VLLM_DSPARK_GLOBAL_RESET=0 forces the local fallback (A/B).
-        use_global = (mask_positions is not None and prev_token is not None
+        # Markov `prev` reset must follow the TRUE (global) block grid, not
+        # the draft-local index: TiDAR commits a variable number of tokens
+        # per step, so the K mask positions start at an arbitrary global
+        # offset. Reset prev->0 exactly where global_pos % block_len == 0
+        # (block start), else chain from the previous token. At draft
+        # position 0 of a non-boundary window, the correct prev is the last
+        # committed token (prev_token), matching how the head was trained
+        # (prev = token at global g-1 within a block). Env
+        # VLLM_DSPARK_GLOBAL_RESET=0 restores the old local reset for A/B.
+        use_global = (global_start is not None and prev_token is not None
                       and os.environ.get("VLLM_DSPARK_GLOBAL_RESET", "1") != "0")
         if use_global:
             prev = prev_token.to(torch.long).clone()
+            gstart = global_start.to(torch.long)
         else:
             prev = torch.zeros(B, dtype=torch.long, device=U.device)
         for k in range(K):
             if use_global:
-                at_boundary = (mask_positions[:, k] % block_len == 0)
+                at_boundary = ((gstart + k) % block_len == 0)
                 prev = torch.where(at_boundary,
                                    torch.zeros_like(prev), prev)
             elif k > 0 and k % block_len == 0:
                 prev.zero_()
             bias = torch.matmul(w1.index_select(0, prev), w2)  # [B, V]
-            if os.environ.get("VLLM_DSPARK_NO_MARKOV", "0") == "1":
-                bias = torch.zeros_like(bias)   # ablation: base head only
             U[:, k].add_(bias)          # keep biased logits for the stash
             logits_k = U[:, k].to(torch.float32)
             if T == 0.0:
@@ -1193,22 +1196,6 @@ class TiDARProposer(EagleProposer):
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
 
-        # DSpark: capture the K mask tokens' TRUE global positions and the
-        # committed token preceding each block, for the Markov reset. The
-        # block grid follows global position (% block_len == 0), not the
-        # draft-local index -- TiDAR commits a variable number of tokens per
-        # step, so the mask window rarely starts on a block boundary.
-        # draft_input_ids/draft_positions are flat [B*(K+1)] in
-        # [next_token, mask x K] layout; mask k = slot k+1.
-        self._dspark_mask_positions = None
-        self._dspark_prev_token = None
-        if self._dspark_active():
-            _kp1 = self.num_speculative_tokens + 1
-            self._dspark_mask_positions = (
-                draft_positions.view(-1, _kp1)[:, 1:_kp1].contiguous())
-            self._dspark_prev_token = (
-                draft_input_ids.view(-1, _kp1)[:, 0].contiguous())
-
         attn_metadata = self.attn_metadata_builder.build_for_drafting(
             common_attn_metadata=draft_common_attn_metadata,
             draft_index=0,
@@ -1426,10 +1413,16 @@ class TiDARProposer(EagleProposer):
         if self._dspark_active():
             # DSpark: untied draft head + Markov bias, sequential within
             # the block. Stashes last_draft_probs/logits internally.
+            # Global position of each request's first mask token, and the
+            # committed token immediately preceding it, for the Markov reset.
+            # _build_draft_inputs: base = target_positions[last]+1 (next_token
+            # slot); mask k lands at base+1+k, so mask-0 global = base+1 =
+            # target_positions[last]+2. prev_token = next_token_ids (the
+            # committed token at the slot before mask 0).
+            _g0 = (target_positions[last_token_indices].to(torch.long) + 2)
             draft_token_ids = self._dspark_sample_drafts(
                 draft_hidden_states, batch_size_local,
-                mask_positions=self._dspark_mask_positions,
-                prev_token=self._dspark_prev_token)
+                global_start=_g0, prev_token=next_token_ids)
             return draft_token_ids.view(
                 -1, self.num_speculative_tokens).to(torch.int32)
 

@@ -299,8 +299,17 @@ class DefaultModelLoader(BaseModelLoader):
         # that have loaded weights tracking currently.
         if model_config.quantization is None and loaded_weights is not None:
             weights_not_loaded = weights_to_load - loaded_weights
-            if weights_not_loaded:
+            import os as _os_tol
+            _tolerated = set(
+                w for w in _os_tol.environ.get(
+                    "VLLM_TOLERATE_MISSING_WEIGHTS", "").split(",") if w)
+            _unexpected = weights_not_loaded - _tolerated
+            if _unexpected:
                 raise ValueError(
                     "Following weights were not initialized from "
-                    f"checkpoint: {weights_not_loaded}"
+                    f"checkpoint: {_unexpected}"
                 )
+            if weights_not_loaded:
+                print(f"[default_loader] tolerating missing weights per "
+                      f"VLLM_TOLERATE_MISSING_WEIGHTS: {weights_not_loaded}",
+                      flush=True)
