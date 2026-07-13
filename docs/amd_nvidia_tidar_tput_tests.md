@@ -96,6 +96,13 @@ controlled trace below shows that this is model-level numerical sensitivity,
 not rejection-sampler corruption. Raw TF tok/s combines device time with the
 acceptance shown in the table; use step latency for a kernel-only comparison.
 
+This is not caused by consuming a different global RNG stream. Every replicated
+request receives seed 0, and the V2 Gumbel sampler derives noise from the
+request seed and absolute token position. A fixed batch/config is deterministic,
+but changing B changes GEMM M, attention split count, and reduction order. Tiny
+BF16 differences can eventually cross an argmax or Gumbel boundary; after that
+the autoregressive trajectories and their mean acceptance differ.
+
 Source logs:
 
 - NVIDIA TF and b1-b32 AR: `/data/home/jinzhao/nv_v2_tidar_logs/mt10k_cca_fix_20260713_r2/`
@@ -450,13 +457,21 @@ the modes separately to cover b1-b64 without using GPU 0:
 
 ```bash
 CKPT="$CKPT" BATCHES="1 8 16 32 64" RUN_AR=1 RUN_TF=0 \
-    MAX_TOKENS=10000 CCA_BATCH_INVARIANT=1 \
+    MAX_TOKENS=10000 CCA_BATCH_INVARIANT=1 IGNORE_EOS=1 \
     sbatch benchmarks/tidar/slurm_lockstep_steady.sh
 
 CKPT="$CKPT" BATCHES="1 8 16 32 64" RUN_AR=0 RUN_TF=1 \
     MAX_TOKENS=10000 CCA_BATCH_INVARIANT=1 TF_PAGED_NO_SPLITS=0 \
+    IGNORE_EOS=1 \
     sbatch benchmarks/tidar/slurm_lockstep_steady.sh
 ```
+
+Set `IGNORE_EOS=0` to measure natural completion and acceptance; the wrappers
+then omit `--ignore-eos`. That is a different workload from the 10k stress
+table: `MAX_TOKENS=10000` becomes only a cap, requests may finish much earlier,
+and a varied-prompt batch will drain unless the benchmark continuously refills
+it. Report natural-EOS acceptance separately from fixed-length lockstep
+throughput.
 
 For a direct single-GPU AMD TF run, build the branch in the container and use:
 
