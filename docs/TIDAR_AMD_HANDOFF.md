@@ -10,6 +10,17 @@ The old production TiDAR TF path on AMD was correct after the AITER-FA causal-ma
 
 Path B is not "stock vLLM 0.24"; it is a v0.24-style adoption inside the v0.16-based fork. v0.24/DiffusionGemma helped by showing the clean architecture: V2 runner + spec-decode data path + model-state-style per-request state + async/cudagraph-friendly execution.
 
+2026-07-13 natural-EOS update: matched `iter_0012600`, single-BOS,
+temperature-0.6, K=16 runs finish at roughly 686-776 output tokens. MI300X TF
+is `3.47x/3.10x/3.42x/2.97x/2.14x` faster than MI300X AR at
+b1/b8/b16/b32/b64. At b64, AMD/NVIDIA throughput is `0.77x` for both AR and TF,
+and TF/AR is `2.14x` AMD versus `2.16x` H100. Replicated requests in each row
+exit together, so these rates have no finite-batch tail drain. Acceptance is
+`6.80-7.41` on AMD and `6.50-8.07` on H100. The old H100 MT512 acceptance
+invariance is real, but natural-EOS TF diverges after token 512; plain AR also
+changes output length across batch shapes. Full rates, lengths, configs, and
+logs are in `docs/amd_nvidia_tidar_tput_tests.md`.
+
 2026-07-13 MT10000 lockstep update: matched `iter_0012600`, single-BOS,
 temperature-0.6, K=16 runs now cover the full 10k context while excluding tail
 drain. H100 AR/TF at b1/b8/b16/b32/b64 is

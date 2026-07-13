@@ -13,10 +13,17 @@ V2 GPU runner, async scheduling, target and draft cudagraph replay,
 `ROCM_AITER_FA`, AITER unquantized MoE, CCA recurrent-state handling, and
 prefix rejection.
 
-The main result is the drain-controlled 10k-output lockstep table below. It
-keeps the full batch active and times complete device iterations, avoiding the
-request-tail drain that distorted older fixed-output tests while exercising
-the full long-context decode path. Under this workload:
+The natural-EOS result below is the closest matched throughput comparison for
+this prompt. Every repeated request in a row exits together, so it has no
+finite-batch tail drain. MI300X TF is `3.47x`, `3.10x`, `3.42x`, `2.97x`, and
+`2.14x` faster than MI300X AR at b1/b8/b16/b32/b64. At b64, AMD/NVIDIA is
+`0.77x` for both AR and TF, and the TF/AR speedups are nearly identical
+(`2.14x` AMD versus `2.16x` NVIDIA).
+
+The drain-controlled 10k-output lockstep table is the complementary
+long-context stress result. It keeps the full batch active and times complete
+device iterations, avoiding request-tail drain while exercising prefixes far
+beyond the natural EOS at roughly 700 tokens. Under that workload:
 
 - Adaptive split-K restores AMD TF speedups of `2.15x`, `2.09x`, `1.81x`, and
   `1.07x` at b8/b16/b32/b64. The forced no-splits control made those rows look
@@ -56,6 +63,52 @@ through progressively smaller graph shapes. Those results are retained in the
 appendix because they describe finite offline batches, but they should not be
 used as the device-throughput ceiling. The 10k no-splits control had a separate
 long-prefix attention bottleneck; adaptive split-K removes most of it.
+
+## Natural-EOS AMD/NVIDIA Result
+
+This run enables EOS and leaves `max_tokens=10000` only as a safety cap. It
+replicates one AIME25 prompt and seed across every request in a row. All
+requests within each row produce the same length and exit together, so there
+is no progressively shrinking tail batch. Device-event rates exclude startup
+and prefill.
+
+Both platforms use `iter_0012600`, exactly one forced BOS, target temperature
+`0.6`, argmax draft, K=16, V2 async scheduling, exact graph capture, and
+`FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3 and MI300X uses
+`ROCM_AITER_FA`, AITER unquantized MoE, and the batch-invariant CCA
+convolution. AMD TF uses adaptive paged-attention split-K at b8-b64; b1 reports
+the faster no-splits result.
+
+| bsz | NVIDIA AR (len) | NVIDIA TF / acc (len) | TF/AR | AMD AR (len) | AMD TF / acc (len) | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `80.733` (686) | `216.386` / `7.711` (686) | `2.68x` | `55.203` (687) | `191.585` / `7.408` (718) | `3.47x` | `0.68x` | `0.89x` |
+| 8 | `612.671` (721) | `1435.108` / `6.505` (693) | `2.34x` | `453.177` (724) | `1404.922` / `6.901` (687) | `3.10x` | `0.74x` | `0.98x` |
+| 16 | `1221.915` (772) | `3108.160` / `7.798` (686) | `2.54x` | `792.916` (777) | `2711.642` / `6.804` (693) | `3.42x` | `0.65x` | `0.87x` |
+| 32 | `2337.489` (747) | `6071.548` / `8.070` (686) | `2.60x` | `1614.817` (770) | `4796.072` / `7.010` (722) | `2.97x` | `0.69x` | `0.79x` |
+| 64 | `4508.023` (693) | `9731.729` / `7.977` (686) | `2.16x` | `3491.091` (693) | `7464.847` / `7.118` (776) | `2.14x` | `0.77x` | `0.77x` |
+
+All rates are device-event output tok/s, lengths are output tokens per request,
+and acceptance includes the bonus token. The b1 AMD adaptive-split control was
+`178.582 tok/s`, acceptance `5.953`, and length 749; no-splits is better for
+this short-prefix workload.
+
+The earlier H100 MT512 run really was batch-invariant at acceptance `7.514`
+through b64. Natural EOS shows that this invariance does not persist forever:
+b1/b16/b32/b64 TF end at 686 tokens with acceptance `7.711-8.070`, while b8
+diverges after token 512 and ends at 693 with acceptance `6.505`. Plain AR also
+changes output length across batch sizes on both platforms. Therefore the
+longer-run variation is not specific to TiDAR rejection sampling; small
+batch-shape-dependent model differences are amplified by autoregressive
+sampling. TF/AR ratios compare two natural sampled trajectories, not identical
+token streams.
+
+Source logs:
+
+- NVIDIA TF: `/data/home/jinzhao/nv_v2_tidar_logs/eos_iter12600_20260713/`
+- NVIDIA AR: `/data/home/jinzhao/nv_v2_tidar_logs/eos_ar_iter12600_20260713/`
+- AMD adaptive TF: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271217/`
+- AMD b1 no-splits TF: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271218/`
+- AMD AR: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271222/`
 
 ## Drain-Controlled AMD/NVIDIA Result
 
