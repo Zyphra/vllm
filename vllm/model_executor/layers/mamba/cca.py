@@ -33,6 +33,7 @@ from vllm.v1.attention.backends.cca_attn import (
 from vllm.model_executor.layers.mamba.ops import (
     run_causal_conv1d_update, grouped_conv1d_decode,
     cca_decode_fused_available, cca_decode_fused,
+    cca_conv1d_batch_invariant,
     cca_prefill_fused,
     cca_prefill_fused_hip_available, cca_prefill_fused_hip,
     fused_pad_gather_scatter,
@@ -47,6 +48,9 @@ _CCA_TRITON_FUSION_ENABLED = os.environ.get(
 
 _CCA_AMD_CONV_UNFOLD_ENABLED = os.environ.get(
     "VLLM_CCA_AMD_CONV_UNFOLD", "0").lower() in ("1", "true", "yes")
+
+_CCA_BATCH_INVARIANT_CONV_ENABLED = os.environ.get(
+    "VLLM_CCA_BATCH_INVARIANT_CONV", "0").lower() in ("1", "true", "yes")
 
 _CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
     "CCA_DIM_PRESERVE_CONV", "0").lower() in ("1", "true", "yes")
@@ -263,6 +267,15 @@ class CCA(MambaBase, CustomOp):
                 )
 
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
+        if _CCA_BATCH_INVARIANT_CONV_ENABLED:
+            return cca_conv1d_batch_invariant(
+                x,
+                self.conv_qk[0].weight,
+                self.conv_qk[0].bias,
+                self.conv_qk[1].weight,
+                self.conv_qk[1].bias,
+                self.num_k_heads + self.num_q_heads,
+            )
         x_fp32 = x.to(torch.float32)
 
         versions = tuple(

@@ -1,6 +1,6 @@
 # TiDAR-on-AMD Handoff
 
-_Last updated: 2026-07-12. Owner: jinzhao. Scope: TiDAR two-forward (TF) decode on MI300X for the 80B SMoE/Zaya checkpoint._
+_Last updated: 2026-07-13. Owner: jinzhao. Scope: TiDAR two-forward (TF) decode on MI300X for the 80B SMoE/Zaya checkpoint._
 
 ## 1. Current state
 
@@ -9,6 +9,20 @@ The old production TiDAR TF path on AMD was correct after the AITER-FA causal-ma
 **Production-comparable headline:** **553.839 tok/s** on MI300X at b8/MT512, `ROCM_AITER_FA`, V2 async, `FULL_AND_PIECEWISE`, K=16. This is **3.13x** over the old 177 tok/s production baseline.
 
 Path B is not "stock vLLM 0.24"; it is a v0.24-style adoption inside the v0.16-based fork. v0.24/DiffusionGemma helped by showing the clean architecture: V2 runner + spec-decode data path + model-state-style per-request state + async/cudagraph-friendly execution.
+
+2026-07-13 batch-shape diagnostic update: raw b1/b64 layer hashes identify
+ROCm unquantized dense GEMMs as the first acceptance-trajectory divergence and
+CCA convolution as the second; AITER MoE is not causal. A new opt-in
+fixed-reduction CCA path (`VLLM_CCA_BATCH_INVARIANT_CONV=1`) is exact across
+b1/b64 and cudagraph replay. In a matched MI300X full-model A/B it lowers the
+b64 step from `65.25` to `60.20 ms` and raises steady TF from `5139.7` to
+`5571.2 tok/s` (`+8.4%`) with unchanged acceptance and final token hash. Making
+all dense projections fixed-reduction as well gives identical outputs at all
+80 layers and an identical complete acceptance trajectory, but the diagnostic
+dense kernel is too slow. Default/forced hipBLASLt, rocBLAS, and disabled
+rocBLAS atomics produce the same isolated dense mismatch; the remaining
+numerical need is a fast fixed-reduction BF16 GEMM. Reproducers and full tables
+are in `docs/amd_nvidia_tidar_tput_tests.md`.
 
 2026-07-07 AMD/NVIDIA parity update: low AMD TF acceptance was traced to runs that missed the TiDAR TF paged AITER attention path and fell back to generic ROCm AITER extend attention. The branch now defaults that route on for TiDAR TF; older trees should set `VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1` explicitly. A same-checkpoint `iter_0012600` long sweep now shows AMD acceptance is roughly on par with NVIDIA, while AMD throughput is lower because the target/draft forwards are slower on `ROCM_AITER_FA`.
 

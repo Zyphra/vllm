@@ -988,6 +988,216 @@ def _cca_prefill_grouped_conv1d_kernel(
     tl.store(out_ptr + i_t * stride_out_t + i_g * D + c_out, acc, mask=None)
 
 
+@triton.jit
+def _cca_batch_invariant_dw_conv1d_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    C: tl.constexpr,
+    T_OUT: tl.constexpr,
+    NT: tl.constexpr,
+    K: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_c: tl.constexpr,
+    stride_x_t: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    stride_out_c: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_NT: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+):
+    pid_nt_block = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    nt = pid_nt_block * BLOCK_NT + tl.arange(0, BLOCK_NT)
+    n = nt // T_OUT
+    t = nt % T_OUT
+    c = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    mask = (nt[:, None] < NT) & (c[None, :] < C)
+
+    if HAS_BIAS:
+        bias = tl.load(
+            bias_ptr + c, mask=c < C, other=0.0).to(tl.float32)
+        acc = tl.broadcast_to(bias[None, :], (BLOCK_NT, BLOCK_C))
+    else:
+        acc = tl.zeros((BLOCK_NT, BLOCK_C), dtype=tl.float32)
+    for k in range(K):
+        value = tl.load(
+            x_ptr + n[:, None] * stride_x_n + c[None, :] * stride_x_c
+            + (t[:, None] + k) * stride_x_t,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        weight = tl.load(
+            weight_ptr + c * K + k,
+            mask=c < C,
+            other=0.0,
+        ).to(tl.float32)
+        acc += value * weight[None, :]
+    tl.store(
+        out_ptr + n[:, None] * stride_out_n
+        + c[None, :] * stride_out_c + t[:, None] * stride_out_t,
+        acc,
+        mask=mask,
+    )
+
+
+@triton.jit
+def _cca_batch_invariant_grouped_conv1d_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    D: tl.constexpr,
+    T_OUT: tl.constexpr,
+    NT: tl.constexpr,
+    K: tl.constexpr,
+    stride_x_n: tl.constexpr,
+    stride_x_c: tl.constexpr,
+    stride_x_t: tl.constexpr,
+    stride_out_n: tl.constexpr,
+    stride_out_c: tl.constexpr,
+    stride_out_t: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_NT: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_nt_block = tl.program_id(0)
+    group = tl.program_id(1)
+    nt = pid_nt_block * BLOCK_NT + tl.arange(0, BLOCK_NT)
+    n = nt // T_OUT
+    t = nt % T_OUT
+    out_ch = tl.arange(0, BLOCK_D)
+    reduction = tl.arange(0, BLOCK_K)
+    in_ch = reduction // K
+    tap = reduction % K
+    nt_mask = nt < NT
+    out_mask = out_ch < D
+    reduction_mask = reduction < D * K
+
+    weight_group_base = group * D * D * K
+    input_group_base = group * D
+    values = tl.load(
+        x_ptr + n[:, None] * stride_x_n
+        + (input_group_base + in_ch[None, :]) * stride_x_c
+        + (t[:, None] + tap[None, :]) * stride_x_t,
+        mask=nt_mask[:, None] & reduction_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    weight_offsets = (
+        weight_group_base + out_ch[:, None] * D * K
+        + reduction[None, :]
+    )
+    weights = tl.load(
+        weight_ptr + weight_offsets,
+        mask=out_mask[:, None] & reduction_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    acc = tl.dot(values, tl.trans(weights), input_precision="ieee")
+
+    if HAS_BIAS:
+        bias = tl.load(
+            bias_ptr + group * D + out_ch,
+            mask=out_mask,
+            other=0.0,
+        ).to(tl.float32)
+        acc += bias[None, :]
+    tl.store(
+        out_ptr + n[:, None] * stride_out_n
+        + (input_group_base + out_ch[None, :]) * stride_out_c
+        + t[:, None] * stride_out_t,
+        acc,
+        mask=nt_mask[:, None] & out_mask[None, :],
+    )
+
+
+def cca_conv1d_batch_invariant(
+    x: torch.Tensor,
+    dw_weight: torch.Tensor,
+    dw_bias: torch.Tensor | None,
+    gw_weight: torch.Tensor,
+    gw_bias: torch.Tensor | None,
+    groups: int,
+) -> torch.Tensor:
+    """Two-stage CCA conv with a reduction tree independent of batch size."""
+    if x.ndim != 3:
+        raise ValueError(f"Expected [N, C, T] input, got {tuple(x.shape)}")
+    n, channels, t_in = x.shape
+    k0 = dw_weight.shape[-1]
+    k1 = gw_weight.shape[-1]
+    if channels % groups != 0:
+        raise ValueError(f"CCA channels {channels} not divisible by {groups=}")
+    t_mid = t_in - k0 + 1
+    t_out = t_mid - k1 + 1
+    if t_out < 1:
+        raise ValueError(
+            f"CCA input length {t_in} is shorter than kernels {k0}, {k1}")
+
+    x = x.contiguous()
+    dw_weight = dw_weight.reshape(channels, k0).contiguous()
+    head_dim = channels // groups
+    gw_weight = gw_weight.reshape(
+        groups, head_dim, head_dim, k1).contiguous()
+    mid = torch.empty(
+        (n, channels, t_mid), device=x.device, dtype=torch.float32)
+    out = torch.empty(
+        (n, channels, t_out), device=x.device, dtype=torch.float32)
+
+    block_nt_dw = 4
+    block_c = 64
+    _cca_batch_invariant_dw_conv1d_kernel[
+        (triton.cdiv(n * t_mid, block_nt_dw),
+         triton.cdiv(channels, block_c))
+    ](
+        x,
+        dw_weight,
+        dw_bias,
+        mid,
+        C=channels,
+        T_OUT=t_mid,
+        NT=n * t_mid,
+        K=k0,
+        stride_x_n=x.stride(0),
+        stride_x_c=x.stride(1),
+        stride_x_t=x.stride(2),
+        stride_out_n=mid.stride(0),
+        stride_out_c=mid.stride(1),
+        stride_out_t=mid.stride(2),
+        HAS_BIAS=dw_bias is not None,
+        BLOCK_NT=block_nt_dw,
+        BLOCK_C=block_c,
+    )
+
+    block_nt_gw = 16
+    block_d = triton.next_power_of_2(head_dim)
+    block_k = triton.next_power_of_2(head_dim * k1)
+    _cca_batch_invariant_grouped_conv1d_kernel[
+        (triton.cdiv(n * t_out, block_nt_gw), groups)
+    ](
+        mid,
+        gw_weight,
+        gw_bias,
+        out,
+        D=head_dim,
+        T_OUT=t_out,
+        NT=n * t_out,
+        K=k1,
+        stride_x_n=mid.stride(0),
+        stride_x_c=mid.stride(1),
+        stride_x_t=mid.stride(2),
+        stride_out_n=out.stride(0),
+        stride_out_c=out.stride(1),
+        stride_out_t=out.stride(2),
+        HAS_BIAS=gw_bias is not None,
+        BLOCK_NT=block_nt_gw,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+    )
+    return out
+
+
 def cca_prefill_fused(
     hs_p,                # [T, H]
     qk_packed0_p,        # [T, E]

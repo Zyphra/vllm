@@ -45,13 +45,22 @@ run_one() {
     local backend=$5
     local layer_hash=${PATCH_PROBE_LAYER_HASH:-0}
     local trace_max_events=${PATCH_PROBE_TRACE_MAX_EVENTS:-8}
+    local optional_env=()
+    if [[ -n "${TORCH_BLAS_PREFER_HIPBLASLT:-}" ]]; then
+        optional_env+=(
+            -e "TORCH_BLAS_PREFER_HIPBLASLT=$TORCH_BLAS_PREFER_HIPBLASLT")
+    fi
+    if [[ -n "${ROCBLAS_DEFAULT_ATOMICS_MODE:-}" ]]; then
+        optional_env+=(
+            -e "ROCBLAS_DEFAULT_ATOMICS_MODE=$ROCBLAS_DEFAULT_ATOMICS_MODE")
+    fi
     local aiter_mha=0
     if [[ "$backend" == "ROCM_AITER_FA" ]]; then
         aiter_mha=1
     fi
     local log="$LOGROOT/${label}_b${batch}.log"
 
-    docker exec \
+    docker exec "${optional_env[@]}" \
         -e HIP_VISIBLE_DEVICES="$GPU" -e CUDA_VISIBLE_DEVICES="$GPU" \
         -e VLLM_USE_V2_MODEL_RUNNER=1 \
         -e VLLM_ENABLE_V1_MULTIPROCESSING=0 \
@@ -60,6 +69,7 @@ run_one() {
         -e VLLM_CCA_TRITON=1 \
         -e VLLM_CCA_TRITON_FUSION_ENABLED=0 \
         -e VLLM_CCA_AMD_CONV_UNFOLD="$cca_unfold" \
+        -e VLLM_CCA_BATCH_INVARIANT_CONV="${VLLM_CCA_BATCH_INVARIANT_CONV:-0}" \
         -e VLLM_TIDAR_ROUTER_PAD=1 \
         -e VLLM_TIDAR_BATCH_INVARIANT_O_PROJ="${VLLM_TIDAR_BATCH_INVARIANT_O_PROJ:-0}" \
         -e VLLM_TIDAR_BATCH_INVARIANT_DENSE="${VLLM_TIDAR_BATCH_INVARIANT_DENSE:-0}" \
@@ -158,6 +168,72 @@ if [[ "$ONLY" == "invariant_dense_cca_unfold" ]]; then
         VLLM_TIDAR_BATCH_INVARIANT_DENSE=1 PATCH_PROBE_LAYER_HASH=1 \
             PATCH_PROBE_TRACE_MAX_EVENTS=1 \
             run_one invariant_dense_cca_unfold "$batch" 1 1 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "invariant_dense_cca_fixed" || "$ONLY" == "next" ]]; then
+    for batch in 1 64; do
+        VLLM_TIDAR_BATCH_INVARIANT_DENSE=1 \
+            VLLM_CCA_BATCH_INVARIANT_CONV=1 PATCH_PROBE_LAYER_HASH=1 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one invariant_dense_cca_fixed "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "cca_fixed" || "$ONLY" == "next" ]]; then
+    for batch in 1 64; do
+        VLLM_CCA_BATCH_INVARIANT_CONV=1 PATCH_PROBE_LAYER_HASH=1 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one cca_fixed "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "rocblas" || "$ONLY" == "rocblas_ab" ]]; then
+    for batch in 1 64; do
+        TORCH_BLAS_PREFER_HIPBLASLT=0 PATCH_PROBE_LAYER_HASH=1 \
+            VLLM_CCA_BATCH_INVARIANT_CONV=0 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one rocblas "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "rocblas_cca_fixed" || "$ONLY" == "rocblas_ab" ]]; then
+    for batch in 1 64; do
+        TORCH_BLAS_PREFER_HIPBLASLT=0 PATCH_PROBE_LAYER_HASH=1 \
+            VLLM_CCA_BATCH_INVARIANT_CONV=1 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one rocblas_cca_fixed "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "no_atomics" || "$ONLY" == "no_atomics_ab" ]]; then
+    for batch in 1 64; do
+        ROCBLAS_DEFAULT_ATOMICS_MODE=0 PATCH_PROBE_LAYER_HASH=1 \
+            VLLM_CCA_BATCH_INVARIANT_CONV=0 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one no_atomics "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "no_atomics_cca_fixed" || "$ONLY" == "no_atomics_ab" ]]; then
+    for batch in 1 64; do
+        ROCBLAS_DEFAULT_ATOMICS_MODE=0 PATCH_PROBE_LAYER_HASH=1 \
+            VLLM_CCA_BATCH_INVARIANT_CONV=1 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one no_atomics_cca_fixed "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "rocblas_no_atomics" \
+        || "$ONLY" == "rocblas_no_atomics_ab" ]]; then
+    for batch in 1 64; do
+        TORCH_BLAS_PREFER_HIPBLASLT=0 ROCBLAS_DEFAULT_ATOMICS_MODE=0 \
+            PATCH_PROBE_LAYER_HASH=1 VLLM_CCA_BATCH_INVARIANT_CONV=0 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one rocblas_no_atomics "$batch" 1 0 ROCM_AITER_FA
+    done
+fi
+if [[ "$ONLY" == "rocblas_no_atomics_cca_fixed" \
+        || "$ONLY" == "rocblas_no_atomics_ab" ]]; then
+    for batch in 1 64; do
+        TORCH_BLAS_PREFER_HIPBLASLT=0 ROCBLAS_DEFAULT_ATOMICS_MODE=0 \
+            PATCH_PROBE_LAYER_HASH=1 VLLM_CCA_BATCH_INVARIANT_CONV=1 \
+            PATCH_PROBE_TRACE_MAX_EVENTS=1 \
+            run_one rocblas_no_atomics_cca_fixed \
+                "$batch" 1 0 ROCM_AITER_FA
     done
 fi
 

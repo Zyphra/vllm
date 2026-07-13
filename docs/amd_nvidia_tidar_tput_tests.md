@@ -1,6 +1,6 @@
 # TiDAR TF on AMD: Throughput Gap and Reproducer
 
-_Last updated: 2026-07-12. Audience: AMD and vLLM performance engineers._
+_Last updated: 2026-07-13. Audience: AMD and vLLM performance engineers._
 
 Repository: [Zyphra/vllm-smoe-amd](https://github.com/Zyphra/vllm-smoe-amd),
 branch `jinzhao/tidar_v024`. Checkpoint:
@@ -33,7 +33,13 @@ drain that distorted the older fixed-output tests. Under this workload:
 - A raw-byte b1/b64 trace localizes AMD's acceptance-shape variation to
   unquantized dense GEMMs. The first difference is the attention output
   projection, after byte-identical CCA and AITER attention outputs. AITER MoE
-  and CCA convolution are not the initial source.
+  is not the initial source; CCA convolution is a second source.
+- An opt-in fixed-reduction CCA kernel removes that second source and improves
+  matched MI300X b64 steady TF from `5139.7` to `5571.2 tok/s` (`+8.4%`) while
+  reducing its step from `65.25` to `60.20 ms`. Making all dense projections
+  fixed-reduction as well produces byte-identical b1/b64 layer outputs and the
+  same complete acceptance trajectory, but that diagnostic dense kernel is too
+  slow for production.
 
 The older aggregate fixed-output tests made AMD TF look slower than AMD AR at
 high batch because requests completed at different rates and the batch drained
@@ -106,6 +112,7 @@ The initial AMD A/B results are:
 | ROCm skinny GEMM disabled | `0/16` | `0/16` | `13/16` | Does not restore invariance |
 | Fixed-reduction `o_proj` | `0/16` | `0/16` | `10/16` | Layers 0-1 become exact |
 | Fixed-reduction all dense linears | `0/16` | `0/16` | `10/16` | First mismatch moves to layer-2 CCA conv |
+| Fixed-reduction dense + fixed-reduction CCA | `16/16` | `16/16` | `16/16` | All 80 layer outputs and the full acceptance trajectory match |
 
 Layer-boundary hashes identify the first responsible operation. In layer 0,
 the normalized input, CCA QKV, and AITER attention output before `o_proj` are
@@ -129,21 +136,46 @@ layer 0, AITER MoE, the layer-2 Q/K and hidden caches, Q/K projections, and
 value projections exact. The first remaining difference is then the default
 CCA convolution (`14/16` exact rows), followed by layer-2 QKV (`15/16`). This
 establishes the order: ROCm dense GEMMs are the first source and CCA convolution
-is a second source; AITER MoE is not causal for the numerical divergence. The
-all-dense diagnostic is not a performance fix: versus the instrumented
-non-invariant control, step time grows from about `36.5` to `54.4 ms` at b1
-and from `64.9` to `82.5 ms` at b64.
+is a second source; AITER MoE is not causal for the numerical divergence.
 
-The fully controlled all-dense plus alternate-CCA-convolution pair remains to
-be run when a full Slurm node is available. A partial-GPU allocation cannot be
-scheduled on this cluster, and direct containers are reaped outside Slurm.
+The new fixed-reduction CCA implementation completes the controlled pair. With
+all dense projections and CCA fixed, every one of the first proposal's 80
+layer outputs, all 16 draft hidden/logit/token rows, and the complete 27-step
+acceptance trajectory are byte-identical between b1 and b64. The final token
+hashes remain unchanged. This proves that dense GEMM and CCA reduction geometry
+fully explain the observed model-level batch-shape divergence in this test.
 
-The practical priority is a fast, fixed-reduction ROCm BF16 dense GEMM for the
-SMoE projection shapes. The diagnostic implementation is opt-in through
-`VLLM_TIDAR_BATCH_INVARIANT_O_PROJ=1`; it proves causality but is not yet the
-recommended production setting. AITER MoE remains a throughput target, just
-not the cause of the b1/b64 numerical divergence. CCA needs a fixed-reduction
-implementation after the dense projections are made invariant.
+The all-dense diagnostic is not a performance fix. Its fixed-reduction Triton
+GEMM raises b1/b64 steps to `53.40/76.95 ms`. The CCA implementation is useful
+independently: it is enabled with `VLLM_CCA_BATCH_INVARIANT_CONV=1`, is exact
+across b1/b64 and cudagraph replay, and is faster than the existing library
+convolution on MI300X (`0.052/0.052 ms` versus `0.094/0.125 ms` in the isolated
+b1/b64 probe).
+
+Matched full-model steady-state results are:
+
+| MI300X variant | b1 acc / step / tok/s | b64 acc / step / tok/s | b1/b64 trajectory |
+|---|---:|---:|---|
+| rocBLAS control + default CCA | `5.24 / 36.31 ms / 144.3` | `5.24 / 65.25 ms / 5139.7` | Different |
+| rocBLAS control + fixed CCA | `6.55 / 35.74 ms / 183.2` | `5.24 / 60.20 ms / 5571.2` | Dense-dependent |
+| Fixed dense + fixed CCA | `5.038 / 53.40 ms / 94.4` | `5.038 / 76.95 ms / 4190.7` | Exact |
+
+The production-relevant fixed-CCA A/B lowers b64 step latency by `7.7%` and
+raises accepted throughput by `8.4%`; acceptance and the final b64 token hash
+are unchanged. At b1 the trajectory changes because dense GEMM is still
+M-dependent, so compare step latency (`-1.6%`) rather than attributing the
+larger accepted-throughput change entirely to the CCA kernel.
+
+The practical numerical priority is now a fast, fixed-reduction ROCm BF16
+dense GEMM for the SMoE projection shapes. The diagnostic implementation is
+opt-in through `VLLM_TIDAR_BATCH_INVARIANT_O_PROJ=1`; it proves causality but is
+not a production setting. An isolated `M=17` versus `M=1088` probe finds only
+3 of 34,816 BF16 outputs different, but default hipBLASLt, forced hipBLASLt,
+rocBLAS, and rocBLAS with atomics disabled all produce the same hashes and
+latency. Backend or atomics environment switches therefore do not solve it.
+AITER MoE remains a throughput target, just not the cause of the b1/b64
+numerical divergence. The fixed CCA path is ready for AMD review and broader
+validation before becoming the default.
 
 Diagnostic logs:
 
@@ -155,14 +187,17 @@ Diagnostic logs:
 - AMD fixed-`o_proj` and state trace: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_267096/`
 - AMD fixed-`o_proj` plus CCA unfold: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_266125/`
 - AMD fixed-reduction all-dense control: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_268004/`
+- AMD fixed dense + fixed CCA full-model A/B: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_270138/`
+- AMD CCA and dense-GEMM microprobes: `/shared/home/jinzhao/tfscope/slurm-tidar-cca-probe-270153.log`
 
-Reproduce the baseline, all-dense localization, and remaining controlled CCA
-A/B with:
+Reproduce the full-model controls and isolated kernels with:
 
 ```bash
 ONLY=core sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
 ONLY=invariant_dense sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
-ONLY=invariant_dense_cca_unfold sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+ONLY=cca_fixed sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+ONLY=invariant_dense_cca_fixed sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+sbatch benchmarks/tidar/slurm_cca_kernel_probe.sh
 ```
 
 ## Actual Remaining Gap
@@ -224,10 +259,10 @@ The highest-value work is inside the model graphs at the exact TiDAR shapes:
    `ReplicatedLinear` shapes, starting with attention `o_proj`
    (`K=1024`, `N=2048`, `M=17/136/272/544/1088`). It should retain the H100's
    b1/b64 numerical trajectory without giving up the current BLAS throughput.
-2. Provide a fixed-reduction CCA convolution. With all dense projections made
-   invariant, layer-2 input and recurrent caches are byte-identical and the
-   default convolution becomes the first mismatch (`14/16` rows exact). Run
-   the all-dense plus alternate-convolution control when a full node is free.
+2. Review, tune, and help land the new fixed-reduction Triton CCA convolution.
+   It closes the CCA divergence, is cudagraph-stable, and improves matched b64
+   TF by `8.4%` on MI300X. Broader prompt, prefill, dtype, and shape validation
+   is needed before enabling it by default.
 3. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
    `M=544/1088/2176`, paying attention to low per-expert row counts. Current
    logs select the generic two-stage default rather than a tuned row. This is
