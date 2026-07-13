@@ -2072,15 +2072,23 @@ def moe_align_block_size(
     num_tokens_post_pad: torch.Tensor,
     expert_map: torch.Tensor | None = None,
 ) -> None:
-    torch.ops._moe_C.moe_align_block_size(
+    op = torch.ops._moe_C.moe_align_block_size.default
+    args = (
         topk_ids,
         num_experts,
         block_size,
         sorted_token_ids,
         experts_ids,
         num_tokens_post_pad,
-        expert_map,
     )
+    if len(op._schema.arguments) == len(args):
+        if expert_map is not None:
+            raise RuntimeError(
+                "The loaded _moe_C extension does not support expert_map"
+            )
+        op(*args)
+    else:
+        op(*args, expert_map)
 
 
 def batched_moe_align_block_size(
