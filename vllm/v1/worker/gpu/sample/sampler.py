@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -110,6 +112,46 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        simple_sampling = (
+            os.environ.get("VLLM_DISABLE_SIMPLE_SAMPLER_FAST_PATH", "0") != "1"
+            and not np.any(self.logit_bias_state.use_logit_bias[idx_mapping_np])
+            and not np.any(self.penalties_state.use_penalty[idx_mapping_np])
+            and not self.sampling_states.do_min_p(idx_mapping_np)
+            and not self.sampling_states.do_top_k(idx_mapping_np)
+            and not self.sampling_states.do_top_p(idx_mapping_np)
+            and self.sampling_states.max_num_logprobs(idx_mapping_np)
+            == NO_LOGPROBS
+        )
+        if simple_sampling:
+            use_fp32_gumbel = os.environ.get(
+                "VLLM_SIMPLE_SAMPLER_FP32_GUMBEL", "0") == "1"
+            if use_fp32_gumbel:
+                sampled = gumbel_sample(
+                    logits,
+                    idx_mapping,
+                    self.sampling_states.temperature.gpu,
+                    self.sampling_states.seeds.gpu,
+                    pos,
+                    apply_temperature=True,
+                    use_fp64_noise=False,
+                )
+                return sampled, logits
+
+            if logits.dtype != torch.float32:
+                logits = torch.empty_like(
+                    logits, dtype=torch.float32).copy_(logits)
+            apply_temperature(
+                logits, idx_mapping, self.sampling_states.temperature.gpu)
+            sampled = gumbel_sample(
+                logits,
+                idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                apply_temperature=False,
+            )
+            return sampled, logits
+
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
 

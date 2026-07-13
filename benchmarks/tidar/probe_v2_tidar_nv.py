@@ -25,6 +25,7 @@ from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 from vllm.model_executor.models import smoe as smoe_model
 from vllm.v1.worker.gpu import model_runner as v2_model_runner
+from vllm.v1.worker.gpu.sample import sampler as gpu_sampler
 from vllm.v1.worker.gpu.spec_decode import tidar as tidar_v2
 
 
@@ -41,16 +42,28 @@ class AcceptStats:
         self._sampled_sum: torch.Tensor | None = None
         self._active_reqs: torch.Tensor | None = None
         self._zero_sampled: torch.Tensor | None = None
+        self._shape_calls: Counter[int] = Counter()
+        self._shape_sampled_sum: dict[int, torch.Tensor] = {}
+        self._shape_active_reqs: dict[int, torch.Tensor] = {}
+        self._shape_zero_sampled: dict[int, torch.Tensor] = {}
 
     def reset(self) -> None:
         self.propose_calls = 0
         self.count_errors = 0
         self.max_active_reqs = 0
+        self._shape_calls.clear()
         if self._sampled_sum is not None:
             with torch.inference_mode():
                 self._sampled_sum.zero_()
                 self._active_reqs.zero_()
                 self._zero_sampled.zero_()
+                for counters in (
+                    self._shape_sampled_sum,
+                    self._shape_active_reqs,
+                    self._shape_zero_sampled,
+                ):
+                    for counter in counters.values():
+                        counter.zero_()
 
     def _ensure_device(self, device: torch.device) -> None:
         if self._device == device and self._sampled_sum is not None:
@@ -59,6 +72,20 @@ class AcceptStats:
         self._sampled_sum = torch.zeros((), dtype=torch.int64, device=device)
         self._active_reqs = torch.zeros((), dtype=torch.int64, device=device)
         self._zero_sampled = torch.zeros((), dtype=torch.int64, device=device)
+        self._shape_sampled_sum.clear()
+        self._shape_active_reqs.clear()
+        self._shape_zero_sampled.clear()
+
+    def _ensure_shape(self, active_reqs: int) -> None:
+        if active_reqs in self._shape_sampled_sum:
+            return
+        assert self._device is not None
+        self._shape_sampled_sum[active_reqs] = torch.zeros(
+            (), dtype=torch.int64, device=self._device)
+        self._shape_active_reqs[active_reqs] = torch.zeros(
+            (), dtype=torch.int64, device=self._device)
+        self._shape_zero_sampled[active_reqs] = torch.zeros(
+            (), dtype=torch.int64, device=self._device)
 
     def observe(self, num_sampled: torch.Tensor, active_reqs: int) -> None:
         self.propose_calls += 1
@@ -70,11 +97,20 @@ class AcceptStats:
 
         vals = num_sampled[:active_reqs].to(torch.int64)
         active = vals > 0
-        self._sampled_sum.add_(vals.masked_select(active).sum())
-        self._active_reqs.add_(active.sum())
-        self._zero_sampled.add_((~active).sum())
+        sampled_step = vals.masked_select(active).sum()
+        active_step = active.sum()
+        zero_step = (~active).sum()
+        self._sampled_sum.add_(sampled_step)
+        self._active_reqs.add_(active_step)
+        self._zero_sampled.add_(zero_step)
 
-    def snapshot(self) -> dict[str, int | float | None]:
+        self._ensure_shape(active_reqs)
+        self._shape_calls[active_reqs] += 1
+        self._shape_sampled_sum[active_reqs].add_(sampled_step)
+        self._shape_active_reqs[active_reqs].add_(active_step)
+        self._shape_zero_sampled[active_reqs].add_(zero_step)
+
+    def snapshot(self) -> dict[str, Any]:
         if self._sampled_sum is None or self._active_reqs is None:
             sampled_sum = 0
             active_reqs = 0
@@ -84,6 +120,19 @@ class AcceptStats:
             active_reqs = int(self._active_reqs.item())
             zero_sampled = int(self._zero_sampled.item())
         mean_accept = sampled_sum / active_reqs if active_reqs else None
+        accept_by_active_reqs = {}
+        for reqs in sorted(self._shape_calls, reverse=True):
+            shape_sampled = int(self._shape_sampled_sum[reqs].item())
+            shape_active = int(self._shape_active_reqs[reqs].item())
+            shape_zero = int(self._shape_zero_sampled[reqs].item())
+            accept_by_active_reqs[str(reqs)] = {
+                "calls": self._shape_calls[reqs],
+                "active_reqs": shape_active,
+                "sampled_sum": shape_sampled,
+                "zero_sampled": shape_zero,
+                "mean_accept_len": (
+                    shape_sampled / shape_active if shape_active else None),
+            }
         return {
             "propose_calls": self.propose_calls,
             "active_reqs": active_reqs,
@@ -92,10 +141,95 @@ class AcceptStats:
             "max_active_reqs": self.max_active_reqs,
             "count_errors": self.count_errors,
             "mean_accept_len": mean_accept,
+            "accept_by_active_reqs": accept_by_active_reqs,
         }
 
 
 ACCEPT_STATS = AcceptStats()
+
+
+class SteadyStateStats:
+    """Measure complete full-batch target/sample/draft iterations."""
+
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("PATCH_PROBE_STEADY", "0") == "1"
+        self.batch = int(os.environ.get("PATCH_PROBE_STEADY_BATCH", "0"))
+        self.tokens_per_req = int(os.environ.get(
+            "PATCH_PROBE_STEADY_TOKENS_PER_REQ", "17"))
+        self.reset()
+
+    def reset(self) -> None:
+        self.calls = 0
+        self.host_ns = 0
+        self._pending = False
+        self._host_start_ns = 0
+        self._start_event: torch.cuda.Event | None = None
+        self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        self._sampled_sum: torch.Tensor | None = None
+
+    def begin(self, scheduler_output: Any) -> None:
+        self._pending = False
+        if not self.enabled or self.batch <= 0:
+            return
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        is_spec = bool(scheduler_output.scheduled_spec_decode_tokens)
+        if (num_reqs != self.batch
+                or num_tokens != self.batch * self.tokens_per_req
+                or not is_spec):
+            return
+        self._pending = True
+        self._host_start_ns = time.perf_counter_ns()
+        self._start_event = torch.cuda.Event(enable_timing=True)
+        self._start_event.record()
+
+    def observe_sample(self, num_sampled: torch.Tensor) -> None:
+        if not self._pending:
+            return
+        if self._sampled_sum is None:
+            self._sampled_sum = torch.zeros(
+                (), dtype=torch.int64, device=num_sampled.device)
+        self._sampled_sum.add_(num_sampled[:self.batch].to(torch.int64).sum())
+
+    def finish(self) -> None:
+        if not self._pending:
+            return
+        assert self._start_event is not None
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._events.append((self._start_event, end_event))
+        self.calls += 1
+        self.host_ns += time.perf_counter_ns() - self._host_start_ns
+        self._pending = False
+        self._start_event = None
+
+    def snapshot(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        torch.cuda.synchronize()
+        device_ms = sum(start.elapsed_time(end) for start, end in self._events)
+        sampled_sum = (
+            int(self._sampled_sum.item()) if self._sampled_sum is not None else 0)
+        return {
+            "batch": self.batch,
+            "tokens_per_req": self.tokens_per_req,
+            "calls": self.calls,
+            "sampled_sum": sampled_sum,
+            "mean_accept_len": (
+                sampled_sum / (self.calls * self.batch) if self.calls else None),
+            "device_ms_total": device_ms,
+            "device_ms_mean": device_ms / self.calls if self.calls else None,
+            "device_throughput_tok_s": (
+                sampled_sum / (device_ms / 1000) if device_ms else None),
+            "host_ms_total": self.host_ns / 1e6,
+            "host_ms_mean": (
+                self.host_ns / 1e6 / self.calls if self.calls else None),
+            "host_throughput_tok_s": (
+                sampled_sum / (self.host_ns / 1e9) if self.host_ns else None),
+        }
+
+
+STEADY_STATS = SteadyStateStats()
 
 
 class ProfileStats:
@@ -325,6 +459,22 @@ _ORIG_SAMPLE = v2_model_runner.GPUModelRunner.sample
 _ORIG_SAMPLE_TOKENS = v2_model_runner.GPUModelRunner.sample_tokens
 _ORIG_PROPOSE_DRAFT = v2_model_runner.GPUModelRunner.propose_draft
 _ORIG_SMOE_LM_HEAD_APPLY = smoe_model._FP32EmbeddingMethod.apply
+_ORIG_GUMBEL_SAMPLE = gpu_sampler.gumbel_sample
+_ORIG_REJECTION_SAMPLE = v2_model_runner.rejection_sample
+
+
+def _profiled_gumbel_sample(*args: Any, **kwargs: Any) -> torch.Tensor:
+    return PROFILE_STATS.timed_call(
+        "gumbel_sample", _ORIG_GUMBEL_SAMPLE, *args, **kwargs)
+
+
+def _profiled_rejection_sample(*args: Any, **kwargs: Any) -> Any:
+    return PROFILE_STATS.timed_call(
+        "prefix_rejection", _ORIG_REJECTION_SAMPLE, *args, **kwargs)
+
+
+gpu_sampler.gumbel_sample = _profiled_gumbel_sample
+v2_model_runner.rejection_sample = _profiled_rejection_sample
 
 
 def _counted_propose(self: tidar_v2.TiDARSpeculator, *args: Any,
@@ -400,6 +550,7 @@ smoe_model._FP32EmbeddingMethod.apply = _profiled_smoe_lm_head_apply
 def _profiled_execute_model(self: v2_model_runner.GPUModelRunner,
                             scheduler_output: Any, *args: Any,
                             **kwargs: Any) -> Any:
+    STEADY_STATS.begin(scheduler_output)
     meta = None
     if PROFILE_STATS.enabled:
         meta = {
@@ -426,6 +577,7 @@ def _profiled_sample(self: v2_model_runner.GPUModelRunner, hidden_states: torch.
         input_batch, grammar_output, meta=meta)
     try:
         sampler_output, num_sampled, num_rejected = result
+        STEADY_STATS.observe_sample(num_sampled)
         TRACE_STATS.observe_sample(
             input_batch, sampler_output.sampled_token_ids, num_sampled,
             num_rejected)
@@ -436,8 +588,11 @@ def _profiled_sample(self: v2_model_runner.GPUModelRunner, hidden_states: torch.
 
 def _profiled_sample_tokens(self: v2_model_runner.GPUModelRunner,
                             grammar_output: Any) -> Any:
-    return PROFILE_STATS.timed_call(
-        "sample_tokens_total", _ORIG_SAMPLE_TOKENS, self, grammar_output)
+    try:
+        return PROFILE_STATS.timed_call(
+            "sample_tokens_total", _ORIG_SAMPLE_TOKENS, self, grammar_output)
+    finally:
+        STEADY_STATS.finish()
 
 
 def _profiled_propose_draft(self: v2_model_runner.GPUModelRunner,
@@ -493,6 +648,7 @@ def encode_prompts(
     prompts: list[str],
     checkpoint: str,
     force_bos: bool = False,
+    prompt_token_limit: int = 0,
 ) -> tuple[list[dict[str, list[int]]], dict[str, Any]]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     prompt_inputs = []
@@ -505,6 +661,8 @@ def encode_prompts(
             while token_ids and token_ids[0] == bos_id:
                 token_ids.pop(0)
             token_ids.insert(0, bos_id)
+        if prompt_token_limit > 0:
+            token_ids = token_ids[:prompt_token_limit]
         prompt_inputs.append({"prompt_token_ids": token_ids})
     first_ids = prompt_inputs[0]["prompt_token_ids"] if prompt_inputs else []
     bos_id = tokenizer.bos_token_id
@@ -543,6 +701,7 @@ def percentile(sorted_lens: Sequence[int], pct: float) -> int:
 
 def run_once(llm: LLM, prompts: list[str], sampling: SamplingParams) -> dict[str, Any]:
     ACCEPT_STATS.reset()
+    STEADY_STATS.reset()
     PROFILE_STATS.reset()
     TRACE_STATS.reset(active=True)
     torch.cuda.synchronize()
@@ -570,6 +729,7 @@ def run_once(llm: LLM, prompts: list[str], sampling: SamplingParams) -> dict[str
         "len_p90": percentile(lens_sorted, 0.90),
         "len_max": max(lens) if lens else 0,
         "token_hash": token_hash(outputs),
+        "steady_state": STEADY_STATS.snapshot(),
         "profile": PROFILE_STATS.snapshot(),
         "sample_text": outputs[0].outputs[0].text[:240] if outputs else "",
     }
@@ -628,6 +788,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-bos", action="store_true",
                         default=os.environ.get("PATCH_PROBE_FORCE_BOS") == "1",
                         help="Prepend exactly one BOS to prompt token IDs.")
+    parser.add_argument("--prompt-token-limit", type=int, default=0)
     parser.add_argument("--ignore-eos", action="store_true",
                         default=os.environ.get("PATCH_PROBE_IGNORE_EOS") == "1")
     return parser.parse_args()
@@ -645,7 +806,8 @@ def main() -> None:
     selected_prompts = base_prompts * args.n_sample
     if args.prompt_token_ids:
         prompts, tokenization = encode_prompts(
-            selected_prompts, args.ckpt, force_bos=args.force_bos)
+            selected_prompts, args.ckpt, force_bos=args.force_bos,
+            prompt_token_limit=args.prompt_token_limit)
     else:
         if args.force_bos:
             raise ValueError("--force-bos requires --prompt-token-ids")
@@ -663,6 +825,7 @@ def main() -> None:
         "num_dataset_prompts": len(all_prompts),
         "prompt_token_ids": args.prompt_token_ids,
         "force_bos": args.force_bos,
+        "prompt_token_limit": args.prompt_token_limit,
         "tokenization": tokenization,
         "max_tokens": args.max_tokens,
         "ignore_eos": args.ignore_eos,
@@ -706,9 +869,25 @@ def main() -> None:
         },
     }
     if not args.enforce_eager:
-        llm_kwargs["compilation_config"] = {
+        compilation_config: dict[str, Any] = {
             "cudagraph_mode": args.cudagraph_mode,
         }
+        if os.environ.get("PATCH_PROBE_EXACT_CUDAGRAPH_BATCH", "0") == "1":
+            query_len = args.num_spec_tokens + 1
+            exact_sizes = {
+                1,
+                2,
+                4,
+                8,
+                16,
+                max_num_seqs,
+                max_num_seqs * query_len,
+            }
+            compilation_config["cudagraph_capture_sizes"] = sorted(
+                size for size in exact_sizes
+                if size <= max_num_batched_tokens)
+            compilation_config["cudagraph_copy_inputs"] = True
+        llm_kwargs["compilation_config"] = compilation_config
 
     print("PATCH_PROBE_LOAD_START", flush=True)
     llm = LLM(**llm_kwargs)

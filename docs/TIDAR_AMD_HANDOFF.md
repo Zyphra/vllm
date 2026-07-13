@@ -1,6 +1,6 @@
 # TiDAR-on-AMD Handoff
 
-_Last updated: 2026-07-10. Owner: jinzhao. Scope: TiDAR two-forward (TF) decode on MI300X for the 80B SMoE/Zaya checkpoint._
+_Last updated: 2026-07-12. Owner: jinzhao. Scope: TiDAR two-forward (TF) decode on MI300X for the 80B SMoE/Zaya checkpoint._
 
 ## 1. Current state
 
@@ -52,6 +52,81 @@ Keep all of those alternatives off. The next useful kernel work is a tuned
 AITER unquantized-MoE configuration for the TiDAR shapes or a TiDAR-aware HIP
 CCA uniform-K+1 kernel that preserves candidate-state stashing and separate
 draft writes.
+
+2026-07-12 steady-state measurement update: fixed full-batch H100 engine
+iterations, timed from target-forward start through sampling, CCA commit, and
+draft completion, reach `209/1091/2184/5270 tok/s` at b1/b8/b16/b64. These are
+`2.53x/1.96x/1.94x/1.59x` over matched AR. The corresponding finite-batch
+aggregate TF rates are `198/883/1594/2670 tok/s`; request-completion skew and
+tail drain therefore account for about half of the b64 loss. Host-clock and
+CUDA-event rates agree within `0.1%`, so the residual full-batch scaling loss is
+device-side. See `docs/amd_nvidia_tidar_tput_tests.md` for method, table, and
+logs. Future serving comparisons should use fixed full-batch iterations or
+continuous refill, with finite-batch aggregate completion reported separately.
+
+2026-07-12 cross-platform no-drain update: a replicated-prompt, fixed-iteration
+run keeps every request in lockstep and excludes prefill, startup, tail drain,
+and the final partial TF iteration. At b1/b8/b16/b64, H100 AR is
+`86/647/1298/4817 tok/s` and TF is `240/1813/3362/9247 tok/s`
+(`2.79/2.80/2.59/1.92x`). MI300X AR is `56/455/815/3483 tok/s` and TF is
+`170/1144/2556/6067 tok/s` (`3.01/2.52/3.14/1.74x`). Thus AMD TF is healthy
+and faster than AR at every batch when drain is removed; the earlier
+finite-batch slowdown is mostly drain plus sampled-trajectory variation. At
+b64, AMD TF's `67.409 ms` device step is `1.30x` H100's `52.005 ms`, comparable
+to AMD AR's `1.38x` step-latency gap. Full config, acceptance, logs, and the
+Slurm reproducer are in `docs/amd_nvidia_tidar_tput_tests.md`.
+
+2026-07-12 b64 bottleneck update: matched b32/b64 event profiles on H100 and
+MI300X attribute about 70% of TF-step growth to the two `M=17B` backbone
+graphs and about 20% to target sampling. H100 grows `40.327 -> 51.820 ms` and
+MI300X grows `53.192 -> 67.092 ms`; prefix rejection remains below `0.011 ms`.
+A graph-node H100 Nsight trace finds FusedMoE at `16.3%`, named CCA
+convolution/layout kernels at about `16%` (above `20%` with adjacent
+copies/concatenations), the two vocabulary GEMMs at `6.1%`, temperature plus
+Gumbel at `6.4%`, and attention at about `1.9%`. The b64 TF/AR ratio falls
+because AR remains at `M=B` and its step latency is nearly flat, while TF runs
+two `M=17B` passes whose activation work grows with batch. On AMD, nearly all
+of the extra b64 gap is target/draft model time; Gumbel is faster than H100.
+Prioritize exact-shape low-row AITER MoE tuning, ROCm CCA fusion, and the
+FP32-output vocabulary GEMMs. Full tables and logs are in the focused
+throughput document.
+
+The same no-drain setup at b32 reaches H100 AR/TF
+`2479/6202 tok/s` (`2.50x`, accept `7.514`) and MI300X AR/TF
+`1580/3579 tok/s` (`2.26x`, accept `5.885`). The b128 V2 TF memory-access fault
+was fixed in `gpu/block_table.py`: gather and slot-mapping now pass each cache
+group's typed tensor directly to Triton instead of dereferencing addresses from
+a device-side `uint64` pointer array. H100 b128 reaches `8379 tok/s`,
+`82.427 ms`, accept `5.396` (`0.98x` its `8512` AR); MI300X reaches
+`6385 tok/s`, `108.640 ms`, accept `5.420` (`1.12x` its `5688` AR). The nearly
+matched acceptance makes this a clean device comparison: AMD/H100 TF is
+`0.76x`, and the AMD step is `1.32x` slower, close to the b64 `1.30x` gap. A
+b64 H100 regression is within `0.2%` of the old path.
+
+2026-07-12 H100 saturation update: a fixed-full-batch, identical-prompt sweep
+holds acceptance at `6.4524` and maps TF batch to model GEMM rows with
+`M=17B`. Steady TF reaches `7.70k/9.28k/10.97k/11.56k/12.14k/12.60k/12.99k`
+tok/s at b64/b96/b160/b192/b224/b320/b448. The practical knee is b224-b320:
+b224 is `93.5%` and b320 is `97.0%` of the b448 ceiling. This is end-to-end
+throughput saturation, not the exact mathematical AI asymptote; a representative
+2048-square BF16 GEMM is at `84%` of asymptotic AI at b320 and `88%` at b448,
+while top-1 MoE expert GEMMs see approximately `M/16`. The shared block-table
+pointer fix now validates b128; b256 has not been rerun with the fix. b544
+reaches replay but hits a separate Triton illegal-memory-access. Full details
+and logs are in `docs/amd_nvidia_tidar_tput_tests.md`.
+
+2026-07-12 H100 optimization update: two exact working-tree changes improve
+the synchronized steady-state ceiling without changing token hashes or
+acceptance. The simple V2 sampler path reuses SMoE's existing FP32 logits
+instead of allocating/copying another FP32 tensor; CCA caches versioned FP32
+convolution parameters rather than converting them in every layer and pass.
+Together they raise b64 from `7695` to `8025 tok/s` (`+4.3%`) and b320 from
+`12600` to `13018 tok/s` (`+3.3%`). Nsight shows the remaining b320 cost is
+CCA copies/layout/convolution (`>35%`), vocabulary GEMMs (`20.3%`), and exact
+temperature/Gumbel sampling (`22.4%`); fused MoE is only `2.2%` and attention
+about `0.2%`. FP32 Gumbel and CCA Triton fusion were faster but changed
+acceptance and remain off by default. See the focused throughput document for
+the full A/B table, rejected experiments, and logs.
 
 ## 2. TF throughput numbers
 

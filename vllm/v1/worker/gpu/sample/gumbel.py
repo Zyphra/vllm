@@ -64,6 +64,7 @@ def _gumbel_sample_kernel(
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
+    USE_FP64_NOISE: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -86,7 +87,9 @@ def _gumbel_sample_kernel(
         gumbel_seed = tl.randint(seed, pos)
 
         # Generate gumbel noise.
-        r = tl.rand(gumbel_seed, block).to(tl.float64)
+        r = tl.rand(gumbel_seed, block)
+        if USE_FP64_NOISE:
+            r = r.to(tl.float64)
         gumbel_noise = -tl.log(-tl.log(r + 1e-20) + 1e-20)
         gumbel_noise = gumbel_noise.to(tl.float32)
 
@@ -113,9 +116,10 @@ def gumbel_sample(
     seed: torch.Tensor,  # [num_reqs]
     pos: torch.Tensor,  # [num_reqs]
     apply_temperature: bool,
+    use_fp64_noise: bool = True,
 ) -> torch.Tensor:
     num_reqs, vocab_size = logits.shape
-    BLOCK_SIZE = 1024
+    BLOCK_SIZE = 1024 if use_fp64_noise else 2048
     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
     local_argmax = torch.empty(
         num_reqs,
@@ -143,6 +147,7 @@ def gumbel_sample(
         vocab_size,
         BLOCK_SIZE=BLOCK_SIZE,
         APPLY_TEMPERATURE=apply_temperature,
+        USE_FP64_NOISE=use_fp64_noise,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)

@@ -148,10 +148,15 @@ class CCA(MambaBase, CustomOp):
         )
 
         self._gw_weight_T = None
+        self._conv_qk_fp32_cache: list[
+            tuple[torch.Tensor, torch.Tensor | None]] | None = None
+        self._conv_qk_fp32_versions: tuple[int, ...] | None = None
         self.refresh_runtime_weight_views()
 
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
+        self._temp_fp32_cache: torch.Tensor | None = None
+        self._temp_fp32_key: tuple[int, int] | None = None
 
         if _CCA_DIM_PRESERVE_CONV_ENABLED:
             self._decode_conv = self.conv_qk_dim_preserve
@@ -241,11 +246,37 @@ class CCA(MambaBase, CustomOp):
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.to(torch.float32)
 
-        def _conv1d_fp32(module: nn.Conv1d, inp: torch.Tensor) -> torch.Tensor:
-            bias = None if module.bias is None else module.bias.to(torch.float32)
+        versions = tuple(
+            value
+            for module in self.conv_qk
+            for value in (
+                module.weight.data_ptr(),
+                module.weight._version,
+                -1 if module.bias is None else module.bias.data_ptr(),
+                -1 if module.bias is None else module.bias._version,
+            )
+        )
+        if (self._conv_qk_fp32_cache is None
+                or self._conv_qk_fp32_versions != versions):
+            self._conv_qk_fp32_cache = [
+                (
+                    module.weight.detach().to(torch.float32).contiguous(),
+                    None if module.bias is None else
+                    module.bias.detach().to(torch.float32).contiguous(),
+                )
+                for module in self.conv_qk
+            ]
+            self._conv_qk_fp32_versions = versions
+
+        def _conv1d_fp32(
+            module: nn.Conv1d,
+            params: tuple[torch.Tensor, torch.Tensor | None],
+            inp: torch.Tensor,
+        ) -> torch.Tensor:
+            weight, bias = params
             return F.conv1d(
                 inp,
-                module.weight.to(torch.float32),
+                weight,
                 bias,
                 stride=module.stride,
                 padding=module.padding,
@@ -253,7 +284,13 @@ class CCA(MambaBase, CustomOp):
                 groups=module.groups,
             )
 
-        return _conv1d_fp32(self.conv_qk[1], _conv1d_fp32(self.conv_qk[0], x_fp32))
+        assert self._conv_qk_fp32_cache is not None
+        return _conv1d_fp32(
+            self.conv_qk[1],
+            self._conv_qk_fp32_cache[1],
+            _conv1d_fp32(
+                self.conv_qk[0], self._conv_qk_fp32_cache[0], x_fp32),
+        )
 
     @torch.no_grad()
     def refresh_runtime_weight_views(self) -> None:
@@ -273,6 +310,8 @@ class CCA(MambaBase, CustomOp):
             else self.conv_qk[1].bias.reshape(groups, -1).contiguous()
         )
         self._gw_weight_T = None
+        self._conv_qk_fp32_cache = None
+        self._conv_qk_fp32_versions = None
 
     def _rms_normalize_qk(
         self,
@@ -291,7 +330,12 @@ class CCA(MambaBase, CustomOp):
 
         key_fp32 = key.to(torch.float32)
         k_norm = key_fp32.norm(p=2, dim=-1, keepdim=True)
-        temp = self.temp.to(torch.float32).view(1, self.num_k_heads, 1)
+        temp_key = (self.temp.data_ptr(), self.temp._version)
+        if self._temp_fp32_cache is None or self._temp_fp32_key != temp_key:
+            self._temp_fp32_cache = (
+                self.temp.detach().to(torch.float32).contiguous())
+            self._temp_fp32_key = temp_key
+        temp = self._temp_fp32_cache.view(1, self.num_k_heads, 1)
         if self.config.clamp_temp:
             temp = torch.exp(torch.clamp(temp, 1e-7, 2.0))
         key_out = (

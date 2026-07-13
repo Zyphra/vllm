@@ -8,6 +8,7 @@ GPU=${GPU:-1}
 BATCHES=${BATCHES:-"1 8 16 64"}
 MAX_TOKENS=${MAX_TOKENS:-2000}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-12000}
+GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
 WARMUP_TOKENS=${WARMUP_TOKENS:-64}
 TARGET_TEMP=${TARGET_TEMP:-0.0}
 DRAFT_TEMP=${DRAFT_TEMP:-0.0}
@@ -50,7 +51,8 @@ run_ar() {
         --warmup-tokens "$WARMUP_TOKENS" --repeats 1 \
         --seed "$SEED" \
         --target-temp "$TARGET_TEMP" --max-model-len "$MAX_MODEL_LEN" \
-        --max-num-batched-tokens 8192 --gpu-memory-utilization 0.85 \
+        --max-num-batched-tokens 8192 \
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --backend "$BACKEND" --cudagraph-mode FULL_AND_PIECEWISE \
         --prompt-token-ids --force-bos --ignore-eos 2>&1 | tee "$log"
 }
@@ -72,7 +74,7 @@ run_tf() {
         --target-temp "$TARGET_TEMP" --draft-temp "$DRAFT_TEMP" \
         --num-spec-tokens 16 \
         --max-model-len "$MAX_MODEL_LEN" --max-num-batched-tokens 8192 \
-        --gpu-memory-utilization 0.85 \
+        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
         --backend "$BACKEND" --cudagraph-mode FULL_AND_PIECEWISE \
         --prompt-token-ids --force-bos --ignore-eos \
         2>&1 | tee "$log"

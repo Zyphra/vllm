@@ -16,6 +16,76 @@ import torch
 from transformers import AutoTokenizer
 
 from vllm import LLM, SamplingParams
+from vllm.v1.worker.gpu import model_runner as v2_model_runner
+
+
+class SteadyStateStats:
+    """Measure complete full-batch AR decode iterations on the GPU."""
+
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("PATCH_PROBE_STEADY", "0") == "1"
+        self.batch = int(os.environ.get("PATCH_PROBE_STEADY_BATCH", "0"))
+        self.reset()
+
+    def reset(self) -> None:
+        self.calls = 0
+        self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+    def begin(self, scheduler_output: Any) -> torch.cuda.Event | None:
+        if not self.enabled or self.batch <= 0:
+            return None
+        num_reqs = len(scheduler_output.num_scheduled_tokens)
+        num_tokens = int(scheduler_output.total_num_scheduled_tokens)
+        is_spec = bool(scheduler_output.scheduled_spec_decode_tokens)
+        if num_reqs != self.batch or num_tokens != self.batch or is_spec:
+            return None
+        start = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return start
+
+    def finish(self, start: torch.cuda.Event | None) -> None:
+        if start is None:
+            return
+        end = torch.cuda.Event(enable_timing=True)
+        end.record()
+        self._events.append((start, end))
+        self.calls += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        if not self.enabled:
+            return {}
+        torch.cuda.synchronize()
+        device_ms = sum(start.elapsed_time(end) for start, end in self._events)
+        tokens = self.calls * self.batch
+        return {
+            "batch": self.batch,
+            "calls": self.calls,
+            "tokens": tokens,
+            "device_ms_total": device_ms,
+            "device_ms_mean": device_ms / self.calls if self.calls else None,
+            "device_throughput_tok_s": (
+                tokens / (device_ms / 1000) if device_ms else None),
+        }
+
+
+STEADY_STATS = SteadyStateStats()
+_ORIG_EXECUTE_MODEL = v2_model_runner.GPUModelRunner.execute_model
+
+
+def _steady_execute_model(
+    self: v2_model_runner.GPUModelRunner,
+    scheduler_output: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    start = STEADY_STATS.begin(scheduler_output)
+    try:
+        return _ORIG_EXECUTE_MODEL(self, scheduler_output, *args, **kwargs)
+    finally:
+        STEADY_STATS.finish(start)
+
+
+v2_model_runner.GPUModelRunner.execute_model = _steady_execute_model
 
 
 def load_prompt_texts(path: str) -> list[str]:
@@ -41,6 +111,7 @@ def encode_prompts(
     prompts: list[str],
     checkpoint: str,
     force_bos: bool,
+    prompt_token_limit: int,
 ) -> tuple[list[dict[str, list[int]]], dict[str, Any]]:
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     encoded = []
@@ -53,6 +124,8 @@ def encode_prompts(
             while token_ids and token_ids[0] == bos_id:
                 token_ids.pop(0)
             token_ids.insert(0, bos_id)
+        if prompt_token_limit > 0:
+            token_ids = token_ids[:prompt_token_limit]
         encoded.append({"prompt_token_ids": token_ids})
     first_ids = encoded[0]["prompt_token_ids"] if encoded else []
     bos_id = tokenizer.bos_token_id
@@ -111,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt-token-ids", action="store_true")
     parser.add_argument("--force-bos", action="store_true",
                         help="Prepend exactly one BOS to prompt token IDs.")
+    parser.add_argument("--prompt-token-limit", type=int, default=0)
     parser.add_argument("--ignore-eos", action="store_true")
     return parser.parse_args()
 
@@ -128,7 +202,8 @@ def main() -> None:
     tokenization = None
     if args.prompt_token_ids:
         prompts, tokenization = encode_prompts(
-            selected_prompts, args.ckpt, args.force_bos)
+            selected_prompts, args.ckpt, args.force_bos,
+            args.prompt_token_limit)
     else:
         prompts = selected_prompts
 
@@ -145,6 +220,7 @@ def main() -> None:
         "num_dataset_prompts": len(all_prompts),
         "prompt_token_ids": args.prompt_token_ids,
         "force_bos": args.force_bos,
+        "prompt_token_limit": args.prompt_token_limit,
         "tokenization": tokenization,
         "max_tokens": args.max_tokens,
         "ignore_eos": args.ignore_eos,
@@ -199,6 +275,7 @@ def main() -> None:
     )
     results = []
     for repeat_idx in range(args.repeats):
+        STEADY_STATS.reset()
         torch.cuda.synchronize()
         start = time.perf_counter()
         outputs = llm.generate(prompts, sampling, use_tqdm=False)
@@ -225,6 +302,7 @@ def main() -> None:
             "len_p90": percentile(lens_sorted, 0.90),
             "len_max": max(lens) if lens else 0,
             "token_hash": token_hash(outputs),
+            "steady_state": STEADY_STATS.snapshot(),
             "sample_text": outputs[0].outputs[0].text[:240]
             if outputs else "",
         }

@@ -1,6 +1,6 @@
 # TiDAR TF on AMD: Throughput Gap and Reproducer
 
-_Last updated: 2026-07-10. Audience: AMD and vLLM performance engineers._
+_Last updated: 2026-07-12. Audience: AMD and vLLM performance engineers._
 
 Repository: [Zyphra/vllm-smoe-amd](https://github.com/Zyphra/vllm-smoe-amd),
 branch `jinzhao/tidar_v024`. Checkpoint:
@@ -8,279 +8,250 @@ branch `jinzhao/tidar_v024`. Checkpoint:
 
 ## Executive Summary
 
-TiDAR two-forward (TF) is correct and fully operational on a single MI300X:
+TiDAR two-forward (TF) is correct and operational on one MI300X with the vLLM
+V2 GPU runner, async scheduling, target and draft cudagraph replay,
+`ROCM_AITER_FA`, AITER unquantized MoE, CCA recurrent-state handling, and
+prefix rejection.
 
-- vLLM V2 GPU runner with async scheduling
-- `FULL_AND_PIECEWISE` cudagraph replay for target and draft passes
-- `ROCM_AITER_FA` attention and AITER unquantized MoE
-- bidirectional draft attention and causal verify attention
-- correct CCA recurrent-state handling and rejection sampling
+The main result is the drain-controlled lockstep table below. It keeps the full
+batch active and times complete device iterations, avoiding the request-tail
+drain that distorted the older fixed-output tests. Under this workload:
 
-The open issue is performance, not acceptance. In the primary matched run, AMD
-AR reaches `0.70-0.81x` NVIDIA AR at b8-b64, but AMD TF reaches only
-`0.44-0.46x` NVIDIA TF. NVIDIA gets a `1.25-1.37x` TF/AR speedup at b8-b16;
-AMD gets `0.83x` and `0.76x`, respectively.
+- AMD TF is faster than AMD AR at every measured batch: `2.26-3.14x` through
+  b32 and `1.74x` at b64.
+- At b64, MI300X reaches `6067 tok/s` TF versus H100 `9247 tok/s`, or `0.66x`.
+  The paired AR ratio is `3483/4817 = 0.72x`.
+- The b64 TF device step is `67.4 ms` on MI300X versus `52.0 ms` on H100
+  (`1.30x` slower). The AR step is `18.4 ms` versus `13.3 ms` (`1.38x`
+  slower). Thus TF is not disproportionately slow on AMD once drain is removed.
+- At b128, after fixing the V2 block-table kernels, MI300X reaches `6385 tok/s`
+  (`1.12x` AR) and H100 reaches `8379 tok/s` (`0.98x` AR). Their acceptance is
+  nearly identical, and the AMD TF step remains `1.32x` slower than H100.
+- The remaining absolute AMD gap is concentrated in the two model backbones:
+  at b64 AMD adds `6.73 ms` to target and `7.02 ms` to draft relative to H100,
+  but only `0.73 ms` to all target sampling.
 
-A matched b16 profile localizes the gap inside the two model forwards. Relative
-to H100, the MI300X target pass is `44%` slower and its draft pass is `50%`
-slower, while rejection sampling differs by only `0.19 ms`. The best next work
-is therefore AITER MoE, AITER attention, and CCA kernel tuning at TiDAR's
-expanded graph shapes.
+The older aggregate fixed-output tests made AMD TF look slower than AMD AR at
+high batch because requests completed at different rates and the batch drained
+through progressively smaller graph shapes. Those results are retained in the
+appendix because they describe finite offline batches, but they should not be
+used as the device-throughput ceiling or as evidence of an AMD-only TF failure.
 
-## Branch Provenance and v0.24 Adoption
+## Drain-Controlled AMD/NVIDIA Result
 
-`jinzhao/tidar_v024` is based directly on `jinzhao/tidar_v016` at commit
-`12cb2e780`. The main V2 TiDAR implementation and graph-shape support landed in
-`6bbca0313`, followed by the fast LM-head restoration, AMD paged-attention
-default, scheduler/profiling refinements, and benchmark documentation.
+The matched lockstep workload replicates one AIME25 prompt and sampling state
+across every request (`num_prompts=1`, `n_sample=B`), forces exactly 512 output
+tokens, and ignores EOS. The probe reports only complete full-batch decode
+iterations after warmup. AR emits one token per request per iteration; TF
+reports accepted output tokens per complete target/sample/CCA/draft interval.
+Prefill, startup, partial final TF iterations, and all smaller tail shapes are
+excluded.
 
-Despite the branch name, this is not stock vLLM v0.24 and it was not rebased
-onto the upstream v0.24 source tree. It is a selective backport into the
-Zyphra v0.16-based fork. In practical terms, it cherry-picked the useful
-v0.24/DiffusionGemma architecture while preserving the fork's SMoE, CCA,
-AITER, EP, and TiDAR code. The capabilities were ported into branch-local code;
-they are not a set of preserved upstream cherry-pick commits.
+Both platforms use `iter_0012600`, exactly one forced BOS, target temperature
+`0.6`, argmax draft, K=16, V2 async scheduling, exact full-batch graph capture,
+and `FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3. MI300X uses
+`ROCM_AITER_FA`, AITER unquantized MoE, and TF paged no-splits attention.
 
-The starting fork already contained a fairly complete V2 GPU runner with
-`AsyncOutput`, EAGLE-style speculative decode, scheduler integration, and
-cudagraph management. What it lacked was hybrid Mamba/CCA support and TiDAR.
-A plain SMoE AR load initially failed because V2 assumed every KV-cache group
-was an `AttentionSpec`; the model also has `MambaSpec` CCA state groups.
+| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `85.995` | `240.175` / `7.514` | `2.79x` | `56.466` | `170.186` / `6.564` | `3.01x` | `0.66x` | `0.71x` |
+| 8 | `646.746` | `1813.426` / `7.514` | `2.80x` | `454.600` | `1143.828` / `6.633` | `2.52x` | `0.70x` | `0.63x` |
+| 16 | `1297.721` | `3362.292` / `7.514` | `2.59x` | `814.879` | `2555.903` / `7.408` | `3.14x` | `0.63x` | `0.76x` |
+| 32 | `2479.075` | `6201.975` / `7.514` | `2.50x` | `1580.296` | `3579.318` / `5.885` | `2.26x` | `0.64x` | `0.58x` |
+| 64 | `4816.921` | `9247.443` / `7.514` | `1.92x` | `3482.532` | `6067.079` / `6.390` | `1.74x` | `0.72x` | `0.66x` |
+| 128 | `8512.417` | `8379.099` / `5.396` | `0.98x` | `5687.594` | `6385.331` / `5.420` | `1.12x` | `0.67x` | `0.76x` |
 
-The v0.24/DiffusionGemma design informed these branch changes:
+All rates are device-event output tok/s. Acceptance includes TiDAR's normal
+bonus token. Every request remains active until the common completion boundary.
 
-| v0.24/DiffusionGemma capability | Adoption in `jinzhao/tidar_v024` |
-|---|---|
-| V2 async scheduling | Reuses the fork's V2 `AsyncOutput` path and permits TiDAR speculative decoding under the async gate. GPU outputs copy to host on a separate stream while request state is updated. |
-| Hybrid Mamba model state | Adds `MambaSpec` SSM/conv-cache reshaping and the hybrid attention/Mamba layout fix in `gpu/attn_utils.py`. TiDAR then adds stable request-keyed CCA slots and post-rejection state commit. |
-| V2 speculative-decode data path | Adds a V2-native self-draft `TiDARSpeculator` next to EAGLE and feeds its K draft IDs through the normal V2 scheduler and input expansion path. |
-| Causal and bidirectional attention | Preserves the important per-pass behavior: target verify is causal and draft is bidirectional. AMD uses the fork's TF paged AITER-FA helper and its causal flag. |
-| Cudagraph-friendly execution | Extends the V2 graph manager for exact uniform TiDAR verify shapes and gives the self-speculator its own persistent-buffer draft graphs. |
-| Custom acceptance | Reuses the V2 sampler plus its GPU Triton prefix-rejection kernel. The accepted count remains on device long enough to commit the correct CCA candidate state before async output completion. |
+H100 follows the same sampled trajectory through b64 and therefore has
+identical acceptance in those rows. At b128 its `M=2176` trajectory changes;
+H100 and MI300X then have nearly identical full-batch acceptance (`5.396`
+versus `5.420`). MI300X is shape-dependent at smaller batches as well. At b16
+the final output hash exactly matches H100, while AMD takes 71 TF steps and
+H100 takes 70 for the same 526 accepted tokens. This points to small
+shape-dependent proposal differences in model numerics, most likely AITER MoE
+or CCA, rather than rejection-sampler corruption. Raw TF tok/s combines device
+time with the acceptance shown in the table; use step latency for a kernel-only
+comparison.
 
-The full upstream dLLM framework was deliberately not copied. This branch has
-no `gpu/model_states/`, `MambaHybridModelState`, or `config/diffusion.py`.
-Instead of implementing a `TiDARSMoEModelState` with `prepare_attn`,
-`postprocess_state`, and `custom_sampler` hooks, it implements the equivalent
-minimum behavior in `gpu/attn_utils.py`, `gpu/model_runner.py`, CCA, and
-`gpu/spec_decode/tidar.py`. This was the smaller route to the performance prize
-without re-porting the entire Zyphra stack onto upstream v0.24.
+Source logs:
 
-The v0.24 per-sequence-causal unified-attention path is also not required by
-two-forward TiDAR. TF runs draft and verify as separate forwards, so an AITER-FA
-causal flag per pass is sufficient. Per-sequence causal attention remains
-relevant to the optional single-forward diffusion path, not this benchmark.
+- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/vp16_lockstep_steady_20260712_212216/`
+- NVIDIA b128 fixed: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b128_typed_blocktables_20260712/tf_b128.log`
+- AMD: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265603/`
+- AMD b32/b64 profiles: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265615/`
+- AMD b128 fixed: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265635/tf_b128.log`
 
-## Current TiDAR TF Implementation
+## Actual Remaining Gap
 
-TiDAR is a self-drafter: the same SMoE target model performs both forwards. For
-K=16, the steady-state V2 loop is:
+Matched b32 and b64 event profiles isolate the residual device gap. `Target`
+and `Draft` are backbone graph replays. `Target sample` includes the target
+vocabulary projection, temperature/Gumbel sampling, and prefix rejection.
+LM-head and Gumbel values are nested inside those totals.
 
-1. **Schedule and verify.** The scheduler supplies the K draft IDs produced by
-   the preceding iteration. The normal V2 main runner expands each request into
-   the proposal plus one target slot and runs the causal target forward.
-2. **Sample and reject.** The regular V2 sampler produces target tokens at the
-   K+1 verifier positions. A Triton kernel accepts the matching draft prefix;
-   on all-accept it emits the target's bonus token. `num_sampled` therefore
-   includes the normal `+1` token used by the acceptance metric.
-3. **Commit CCA state.** CCA stashes the candidate recurrent states created by
-   verify. The runner maps `num_sampled - 1` to the accepted candidate and
-   commits that SSM/conv state to the request's stable AR slot. Stable slots are
-   necessary because async scheduling can compact or reorder batch rows.
-4. **Self-draft.** `TiDARSpeculator` builds
-   `[last_sampled_token, mask, ..., mask]`, assigns K+1 consecutive positions,
-   and runs the same model with `causal=False`. The draft pass reads the
-   committed AR CCA state and writes separate scratch state. Logits from the K
-   mask positions produce the next draft IDs.
-5. **Propagate asynchronously.** Draft IDs are stored in V2 request state and
-   passed back to the scheduler for the next verify iteration. Sampled output
-   IDs and accepted counts are copied through `AsyncOutput` without imposing
-   the old synchronous per-step host barrier.
+| Platform | bsz | TF step | Target | Draft | Target sample | Target LM head | Draft LM head | Gumbel |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| H100 | 32 | `40.327 ms` | `18.177 ms` | `15.536 ms` | `2.803 ms` | `0.927 ms` | `0.876 ms` | `1.340 ms` |
+| H100 | 64 | `51.820 ms` | `22.426 ms` | `19.374 ms` | `5.289 ms` | `1.667 ms` | `1.612 ms` | `2.626 ms` |
+| MI300X | 32 | `53.192 ms` | `24.166 ms` | `21.600 ms` | `3.178 ms` | `1.498 ms` | `1.192 ms` | `1.266 ms` |
+| MI300X | 64 | `67.092 ms` | `29.153 ms` | `26.396 ms` | `6.019 ms` | `3.032 ms` | `2.191 ms` | `2.253 ms` |
 
-The production path uses `tidar_diff_temperature=0`, so draft IDs are argmax.
-The V2 prefix matcher is correct for this deterministic draft distribution.
-Non-zero draft temperature can generate draft probabilities in the speculator,
-but those probabilities are not yet wired into the V2 rejection kernel and
-remain experimental. Target sampling temperature, including the primary
-temperature-0.6 benchmark below, is supported.
+At b64, AMD versus H100 adds:
 
-Both forwards have the uniform expanded size `B * (K + 1) = 17B` in steady
-state. At b64 this is 1,088 tokens. Verify graphs replay through the V2
-`CudaGraphManager`; draft graphs are captured and replayed inside
-`TiDARSpeculator` using persistent input, position, block-table, and slot-mapping
-buffers. Unmatched or mixed shapes fall back to eager execution.
+| Component | AMD - H100 | AMD/H100 |
+|---|---:|---:|
+| Target backbone | `+6.727 ms` | `1.30x` |
+| Draft backbone | `+7.022 ms` | `1.36x` |
+| Entire target sample | `+0.730 ms` | `1.14x` |
+| Prefix rejection | about `+0.004 ms` | negligible |
 
-On AMD, the two attention modes must appear independently in the log:
+The two backbones account for nearly all of the absolute platform gap. AMD
+Gumbel is actually `0.37 ms` faster; rejection is not a useful optimization
+target.
+
+The b32-to-b64 latency growth has the same structure on both GPUs. Roughly 70%
+comes from target plus draft backbone growth and about 20% from full-vocabulary
+sampling. AR uses approximately `M=B`, while each TF backbone uses `M=17B` and
+TF runs it twice. Large-M arithmetic intensity approaching a limit does not
+make latency independent of M: FLOPs and activation traffic still grow with M.
+TF throughput continues to rise at b64, but AR scales faster because its
+small-M decode remains favorable for weight reuse and amortization.
+
+An H100 b64 Nsight trace gives the current operation mix: fused MoE is `16.3%`
+of GPU kernel time; named CCA convolution/layout is about `16%` and exceeds
+`20%` with adjacent copies and concatenations; vocabulary GEMMs are `6.1%`;
+temperature plus FP64 Gumbel are `6.4%`; FlashAttention is about `1.9%`.
+Top-1 E=16 MoE at b64 routes only about `1088/16 = 68` rows per expert, so the
+expert GEMMs remain in an inefficient small-M regime even though the aggregate
+TF row count is 1088.
+
+Profile logs:
+
+- H100 b32: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_lockstep_b32_profile_20260712_225215/tf_b32.log`
+- H100 b64: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_lockstep_b64_profile_20260712_225044/tf_b64.log`
+- H100 graph nodes: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b64_graphnodes_20260712/tf_b64_nodes.nsys-rep`
+- MI300X b32: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265615/tf_b32.log`
+- MI300X b64: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265614/tf_b64.log`
+
+## Specific AMD Help Requested
+
+The highest-value work is inside the model graphs at the exact TiDAR shapes:
+
+1. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
+   `M=544/1088/2176`, paying attention to low per-expert row counts. Current
+   logs select the generic two-stage default rather than a tuned row.
+2. Trace and reduce the ROCm CCA layout, copy, and convolution chain in target
+   and draft. Any replacement must preserve candidate-state stashing, stable
+   request slots, and separate draft scratch state.
+3. Tune the FP32-output vocabulary GEMM. At b64 the AMD target LM head is
+   `1.82x` H100 and the draft LM head is `1.36x` H100. A fused draft
+   LM-head-plus-argmax path is especially relevant because draft temperature is
+   zero.
+4. Use a ROCm kernel trace to verify the shares above. AITER attention is lower
+   priority from the H100 composition, and prefix rejection is already
+   negligible.
+5. Preserve acceptance and output behavior. Performance changes should be
+   compared using full-batch step time as well as accepted tok/s so numeric
+   trajectory changes are visible.
+
+Earlier AMD screening found no gain from Triton MoE, the alternate SMoE AITER
+op, removing router padding, CCA Triton fusion, or CCA unfold/einsum. Leave
+those variants off unless their implementations change.
+
+## b128 Block-Table Fix
+
+The original b128 fault was in the V2 block-table preparation path, not memory
+capacity or graph size. On H100, `CUDA_LAUNCH_BLOCKING=1` localized the first
+misaligned access to `_gather_block_tables_kernel` at `(2 cache groups, 128
+requests)`. Replacing only that gather exposed `_compute_slot_mappings_kernel`
+as the next failure. Both kernels loaded raw block-table addresses from a
+device-side `uint64` pointer array.
+
+`vllm/v1/worker/gpu/block_table.py` now launches once per cache group and
+passes the typed source, destination, and slot-mapping tensors directly to
+Triton. This removes pointer-to-pointer loads while remaining graph-capturable.
+The old combined launch saved one kernel launch, but the replacement changes
+b64 H100 TF from `9247` to `9230 tok/s` (`-0.2%`), within run variance.
+
+The fixed `M=2176` graph captures and runs on both platforms:
+
+| Platform | AR | TF / acc | TF/AR | TF step | Acceptance-normalized TF at acc 7.514 |
+|---|---:|---:|---:|---:|---:|
+| H100 | `8512.417` | `8379.099` / `5.396` | `0.98x` | `82.427 ms` | `11669 tok/s` |
+| MI300X | `5687.594` | `6385.331` / `5.420` | `1.12x` | `108.640 ms` | `8853 tok/s` |
+
+The normalized column is diagnostic, not a measured output rate. It removes
+the b128 trajectory change to show capacity at the b1-b64 reference acceptance.
+The measured AMD/H100 TF step ratio is `1.32x`, close to `1.30x` at b64; b128
+does not introduce a new AMD-specific scaling failure.
+
+Diagnostic logs:
+
+- `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b128_launchblocking_20260712.log`
+- `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b128_typed_blocktables_20260712/tf_b128.log`
+- `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b128_typed_blocktables_20260712/tf_b64_regression.log`
+- `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265635/tf_b128.log`
+
+## Branch and Implementation Context
+
+`jinzhao/tidar_v024` is based on the Zyphra v0.16 fork at `12cb2e780`. Despite
+the branch name, it is not stock upstream vLLM v0.24. It selectively ports the
+v0.24/DiffusionGemma architecture needed for the fork's existing SMoE, CCA,
+AITER, and TiDAR stack.
+
+The starting fork already had the V2 GPU runner, `AsyncOutput`, EAGLE-style
+speculative decode, scheduler integration, and cudagraph management. This
+branch adds hybrid Mamba/CCA cache-group support, stable request-keyed CCA
+state, post-rejection state commit, a V2-native self-draft `TiDARSpeculator`,
+exact TiDAR graph shapes, and per-pass causal selection. The complete upstream
+`gpu/model_states/` framework was not copied; equivalent minimum hooks live in
+`gpu/attn_utils.py`, `gpu/model_runner.py`, CCA, and `gpu/spec_decode/tidar.py`.
+
+For K=16, each steady TF iteration performs:
+
+1. A causal target verify over K draft IDs plus one target slot.
+2. Target sampling and prefix rejection, including the normal bonus token.
+3. Commit of the accepted target CCA candidate state to a stable request slot.
+4. A bidirectional self-draft over `[last_token, mask, ..., mask]` using the
+   committed state and separate scratch state.
+5. Async output propagation and scheduler handoff of the next K draft IDs.
+
+Both forwards have uniform size `B * (K + 1) = 17B`. The verify pass uses the
+V2 graph manager; `TiDARSpeculator` captures its own persistent-buffer draft
+graphs. Two-forward TiDAR does not need per-sequence-causal unified attention:
+target and draft are separate forwards, so the AITER-FA causal flag is selected
+per pass.
+
+On AMD, a correct run logs both:
 
 ```text
 Using TiDAR TF paged attention in ROCm AITER-FA (S=17, causal=True).
 Using TiDAR TF paged attention in ROCm AITER-FA (S=17, causal=False).
 ```
 
-The fallback TiDAR mask token is ID `4` when the checkpoint does not define one.
-This matches the old runner and was required for old/V2 greedy output parity.
-The old TiDAR implementation remains in `vllm/v1/spec_decode/tidar.py`; the new
-path is selected with `VLLM_USE_V2_MODEL_RUNNER=1` and lives under
-`vllm/v1/worker/gpu/`.
-
-The single-GPU path described here is the validated throughput target. DP+EP
-has passed eager and captured smoke without EPLB, and eager DP+EP+EPLB has also
-passed. Concurrent DP+EP+EPLB with main-graph capture still has an independent
-AITER MoE memory fault; it is not part of the single-GPU throughput gap below.
-
-For historical context, the old AMD runner reached `177 tok/s` at b8/MT512.
-The V2 async and captured path reached `553.839 tok/s` on the same broad
-production shape, a `3.13x` improvement. That milestone removed the original
-host-overhead bottleneck; the tables below isolate the remaining AMD device-side
-gap with matched AMD/NVIDIA workloads.
-
-## Primary Matched Result
-
-This is the collaborator-facing comparison: checkpoint `iter_0012600`, AIME25
-thinking-off prompts, exactly one BOS, MT4000, target temperature `0.6`, argmax
-draft, K=16, ignore EOS, one request per active sequence, and no refill.
-NVIDIA b1/b8 are three-seed medians; NVIDIA b16/b64 and all AMD rows are seed 0.
-
-The public checkpoint already has the metadata used by both platforms:
-`residual_in_fp32=false` and `mamba_cache_dtype=float32`.
-
-Both AR and TF use V2 async scheduling and `FULL_AND_PIECEWISE`. H100 uses
-`FLASH_ATTN` v3. MI300X uses `ROCM_AITER_FA`, AITER unquantized MoE, and the TF
-paged no-splits path. The AR baseline uses the same platform backend as TF.
-
-Throughput is output tokens/second. Acceptance uses the corrected active-request
-denominator and includes TiDAR's normal `+1` sampled token.
-
-| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | `82.258` | `132.427` / `4.619` | `1.61x` | `60.702` | `60.753` / `4.209` | `1.00x` | `0.74x` | `0.46x` |
-| 8 | `542.912` | `680.086` / `5.317` | `1.25x` | `377.326` | `314.923` / `5.422` | `0.83x` | `0.70x` | `0.46x` |
-| 16 | `975.975` | `1333.164` / `5.263` | `1.37x` | `773.367` | `587.371` / `5.444` | `0.76x` | `0.79x` | `0.44x` |
-| 64 | `3141.139` | `4043.730` / `5.942` | `1.29x` | `2532.184` | `1788.693` / `5.002` | `0.71x` | `0.81x` | `0.44x` |
-
-The b8 and b16 rows are the clearest evidence. Acceptance is essentially equal
-across platforms, but AMD turns TF into a slowdown while NVIDIA gets a material
-speedup. The b64 AMD graph includes the full 1,088-token TiDAR shape, so this is
-not the old cudagraph-cap failure.
-
-The probes do not apply a chat template. They tokenize with
-`add_special_tokens=False`, remove duplicate leading BOS IDs, and force exactly
-one BOS. This avoids a known template difference between checkpoint revisions.
-
-Source logs:
-
-- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_iter12000meta_mt4k_t06_d0_n1_vp16_20260709_190123/`
-- AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_iter12000meta_mt4k_t06_d0_n1_c17_20260710_010137/`
-
-## Greedy Diagnostic
-
-The MT5000 greedy run shows the same high-batch conclusion under a second
-sampling configuration. Both platforms use target/draft temperature `0.0`,
-warmup 64, ignore EOS, seed 0, and `n_sample=1`.
-
-| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | `79.723` | `207.554` / `7.562` | `2.60x` | `53.828` | `62.296` / `4.703` | `1.16x` | `0.68x` | `0.30x` |
-| 8 | `539.015` | `972.872` / `6.136` | `1.80x` | `382.078` | `375.808` / `6.746` | `0.98x` | `0.71x` | `0.39x` |
-| 16 | `968.246` | `1603.001` / `6.802` | `1.66x` | `772.428` | `661.769` / `8.325` | `0.86x` | `0.80x` | `0.41x` |
-| 64 | `3093.504` | `3482.665` / `6.936` | `1.13x` | `2509.826` | `2102.265` / `8.250` | `0.84x` | `0.81x` | `0.60x` |
-
-AMD acceptance is higher than NVIDIA at b8-b64, yet AMD TF remains slower than
-AMD AR. This rules out rejection quality as the cause of the high-batch gap.
-The b1 acceptance difference is a single-prompt trajectory effect and is not a
-useful platform-level acceptance comparison.
-
-Source logs:
-
-- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_forcebos_mt5k_n1_vp16_20260709_175900/`
-- AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_forcebos_mt5k_n1_c17_20260710_002037/`
-
-All runs reached exactly 5,000 output tokens per request with no probe errors.
-Each b64 mode generated 320,000 output tokens.
-
-## Profile Evidence
-
-This matched b16/MT512 profile uses the same checkpoint, prompt-token path,
-K=16, `n_sample=1`, and platform-specific production attention backend:
-
-| Platform and backend | Throughput / acc | Target forward | Draft forward | Reject sampler |
-|---|---:|---:|---:|---:|
-| H100, `FLASH_ATTN` v3 | `1394.609` / `6.307` | `20.067 ms` | `17.579 ms` | `0.989 ms` |
-| MI300X, `ROCM_AITER_FA` | `1197.474` / `5.796` | `28.821 ms` | `26.314 ms` | `1.175 ms` |
-
-The target plus draft model time is `37.646 ms` on H100 and `55.135 ms` on
-MI300X, a `46%` increase. Rejection sampling adds only `0.186 ms` to the AMD/NV
-difference. Optimize inside the captured model graphs before changing the
-sampler or acceptance algorithm.
-
-Profile logs:
-
-- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_profile/20260707_014246_nv_gpu6_iter12600_fp_profile_b16_mt512.log`
-- AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_profile/20260707_081033_amd_cnode107_gpu4_iter12600_fp_profile_b16_mt512_warmimg.log`
-
-## Already Fixed
-
-- The AITER-FA causal-mask bug is fixed: draft is bidirectional and verify is
-  causal on separate passes.
-- TiDAR TF defaults to the paged AITER attention path. Falling back to generic
-  ROCm AITER extend attention caused incoherent drafts and acceptance near one.
-- V2 async scheduling works with stable per-request CCA state slots.
-- Target and drafter cudagraphs replay. The graph cap grows to at least
-  `max_num_seqs * (K + 1)`, including 1,088 tokens at b64.
-- The acceptance probe uses active requests as its denominator and includes the
-  sampled bonus token.
-- The fast LM-head path is present. Full-shape LM-head calls are below 1 ms and
-  a BF16-output experiment did not improve throughput.
-
-These checks matter because older logs can otherwise look like the same issue
-while exercising a different attention path, an undersized graph cap, or the
-legacy acceptance denominator.
-
-## Optimization Targets
-
-1. **AITER unquantized MoE.** Tune the E=16, H=2048, top-1 workload at TiDAR's
-   uniform 17B graph shapes. The current path reports a generic two-stage AITER
-   default and is the highest-priority kernel target.
-2. **AITER attention by pass.** Measure and tune causal verify and bidirectional
-   draft separately at b8, b16, and b64. Preserve the per-pass causal flag and
-   the TF paged-attention path.
-3. **CCA uniform-K+1 path.** A TiDAR-aware fused HIP kernel may remove CCA
-   overhead, but it must preserve candidate-state stashing and separate drafter
-   scratch writes.
-4. **Graph-level breakdown.** Add per-layer or per-op device timings inside the
-   target and draft graphs. Compare the AMD share of MoE, attention, CCA, norms,
-   and LM head against the matched NVIDIA profile.
-5. **Steady state versus drain.** For serving-style tests, report full-batch
-   windows separately from low-active-request tail windows. Keep the pure-decode
-   table above as the stable kernel baseline.
-
-An earlier AMD screen found no win from switching to Triton MoE, the alternate
-SMoE AITER op, removing router padding, enabling the CCA Triton fusion, or using
-CCA unfold/einsum. Those variants should remain off unless their kernels change.
-
-Success means TF is faster than the paired AMD AR baseline at b8, b16, and b64,
-without lowering acceptance. Closing AMD/NVIDIA TF toward the corresponding AR
-ratio is the cross-platform target.
+Draft temperature is zero, so proposals are argmax. Target temperature `0.6`
+is supported through the V2 sampler. The fallback mask token is ID 4 when the
+checkpoint has no configured mask ID, matching the old runner.
 
 ## Code Map
 
 | Area | File |
 |---|---|
-| V2 runner and TiDAR graph execution | `vllm/v1/worker/gpu/model_runner.py` |
-| Async GPU-to-host output | `vllm/v1/worker/gpu/async_utils.py` |
-| V2 self-draft implementation | `vllm/v1/worker/gpu/spec_decode/tidar.py` |
-| Draft-token scheduler handoff | `vllm/v1/worker/gpu/spec_decode/utils.py` |
-| Verify cudagraph selection | `vllm/v1/worker/gpu/cudagraph_utils.py` |
-| Per-pass AITER attention setup | `vllm/v1/worker/gpu/attn_utils.py` |
+| V2 runner and verify graph | `vllm/v1/worker/gpu/model_runner.py` |
+| Async output | `vllm/v1/worker/gpu/async_utils.py` |
+| V2 self-draft | `vllm/v1/worker/gpu/spec_decode/tidar.py` |
+| Per-pass attention setup | `vllm/v1/worker/gpu/attn_utils.py` |
 | ROCm AITER-FA backend | `vllm/v1/attention/backends/rocm_aiter_fa.py` |
-| TF paged attention helper | `vllm/attention/ops/tf_attention.py` |
-| CCA implementation | `vllm/model_executor/layers/mamba/cca.py` |
-| SMoE routing, MoE, and LM head | `vllm/model_executor/models/smoe.py` |
-| Graph-cap configuration | `vllm/config/vllm.py` |
-| Corrected rejection metrics | `vllm/v1/sample/rejection_sampler.py` |
-| Matched benchmark driver | `benchmarks/tidar/run_iter12600_tput.sh` |
+| TF paged attention | `vllm/attention/ops/tf_attention.py` |
+| CCA | `vllm/model_executor/layers/mamba/cca.py` |
+| SMoE/MoE/LM head | `vllm/model_executor/models/smoe.py` |
+| Block tables and b128 fix | `vllm/v1/worker/gpu/block_table.py` |
+| AR probe | `benchmarks/tidar/probe_v2_ar.py` |
+| TF probe | `benchmarks/tidar/probe_v2_tidar_nv.py` |
+| AMD lockstep Slurm driver | `benchmarks/tidar/slurm_lockstep_steady.sh` |
 
-## Reproducer
+## Lockstep Reproducer
 
 Clone the tested branch and download the public checkpoint:
 
@@ -295,91 +266,117 @@ huggingface-cli download Zyphra-staging/smoediffusion_128k-hf_iter_0012600 \
     --local-dir "$CKPT"
 ```
 
-The tested AMD environment is `zyphra/rocm-primus:aiter_pa_swa` with Torch
-2.10, Triton 3.7, and ROCm 7.2. Mount the repo at `/work` and the checkpoint
-filesystem at `/shared`, then build inside a fresh container:
+The tested AMD image is `zyphra/rocm-primus:aiter_pa_swa` with Torch 2.10,
+Triton 3.7, and ROCm 7.2. The first load in a fresh image can spend about 12
+minutes compiling AITER kernels. On shared IBM nodes, do not use GPU 0.
+
+The checked-in Slurm script runs paired AR and TF lockstep tests across GPUs:
 
 ```bash
-cd /work
-pip install -q "setuptools>=77.0.3,<81.0.0" "setuptools-scm>=8"
-pip install -q --no-build-isolation -e .
+CKPT="$CKPT" BATCHES="1 8 16 32 64" \
+    sbatch benchmarks/tidar/slurm_lockstep_steady.sh
 ```
 
-The first model load in a fresh image can spend about 12 minutes compiling
-AITER kernels. Use a free GPU; on the shared IBM nodes, do not use GPU 0.
-
-Run the primary MT4000, target-temperature-0.6 comparison:
+For a direct single-GPU AMD TF run, build the branch in the container and use:
 
 ```bash
-export CKPT=${CKPT:-/shared/home/$USER/checkpoints/smoediffusion_128k-hf_iter_0012600}
-export DATA=benchmarks/tidar/aime25_zpo_texts.json
-export BACKEND=ROCM_AITER_FA
-export GPU=1
-export BATCHES="1 8 16 64"
-export MAX_TOKENS=4000
-export MAX_MODEL_LEN=12000
-export TARGET_TEMP=0.6
-export DRAFT_TEMP=0
-export N_SAMPLE_AR=1
-export N_SAMPLE_TF=1
-export LOGROOT=/shared/home/$USER/tfscope/iter12600_mt4k_t06_$(date +%Y%m%d_%H%M%S)
+export VLLM_USE_V2_MODEL_RUNNER=1
+export VLLM_ENABLE_V1_MULTIPROCESSING=0
+export VLLM_ATTENTION_BACKEND=ROCM_AITER_FA
+export VLLM_ROCM_USE_AITER=1
+export VLLM_ROCM_USE_AITER_MHA=1
+export VLLM_ROCM_USE_AITER_MOE=1
+export VLLM_ROCM_MOE_PADDING=1
+export VLLM_TIDAR_TWO_FORWARD=1
+export VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1
+export VLLM_TIDAR_TF_PAGED_NO_SPLITS=1
+export VLLM_TIDAR_FA_NO_SPLITS=1
+export PATCH_PROBE_STEADY=1
+export PATCH_PROBE_STEADY_BATCH=64
+export PATCH_PROBE_EXACT_CUDAGRAPH_BATCH=1
 
-bash benchmarks/tidar/run_iter12600_tput.sh
+python -u benchmarks/tidar/probe_v2_tidar_nv.py \
+  --ckpt "$CKPT" --dataset benchmarks/tidar/aime25_zpo_texts.json \
+  --batch 64 --num-prompts 1 --max-num-seqs 64 --n-sample 64 \
+  --max-tokens 512 --warmup-tokens 64 --repeats 1 --seed 0 \
+  --target-temp 0.6 --draft-temp 0 --num-spec-tokens 16 \
+  --max-model-len 12000 --max-num-batched-tokens 8192 \
+  --gpu-memory-utilization 0.65 --backend ROCM_AITER_FA \
+  --cudagraph-mode FULL_AND_PIECEWISE --prompt-token-ids --force-bos \
+  --ignore-eos
 ```
 
-For a quick validation, use `BATCHES="1 16"`. For the greedy diagnostic, keep
-the same command and set `MAX_TOKENS=5000 TARGET_TEMP=0 DRAFT_TEMP=0`.
+For H100, use the same arguments with `--backend FLASH_ATTN`,
+`VLLM_ATTENTION_BACKEND=FLASH_ATTN`, and `VLLM_FLASH_ATTN_VERSION=3`; remove
+the ROCm/AITER variables.
 
-The driver selects this AMD path:
+A valid AMD run must report one forced BOS, AITER Flash Attention, AITER
+unquantized MoE, both paged-attention causal signatures, and exact capture size
+`17B`. Compare `PATCH_PROBE_STEADY` device step time before comparing accepted
+tok/s.
 
-```text
-VLLM_USE_V2_MODEL_RUNNER=1
-VLLM_ATTENTION_BACKEND=ROCM_AITER_FA
-VLLM_ROCM_USE_AITER=1
-VLLM_ROCM_USE_AITER_MHA=1
-VLLM_ROCM_USE_AITER_MOE=1
-VLLM_ROCM_MOE_PADDING=1
-VLLM_TIDAR_TWO_FORWARD=1
-VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1
-VLLM_TIDAR_TF_PAGED_NO_SPLITS=1
-VLLM_TIDAR_FA_NO_SPLITS=1
-```
+## Appendix: Finite-Batch Drain Results
 
-For the H100 reference, use the same script and parameters with:
+These historical tests divide total generated tokens by total time for a fixed
+set of requests with no refill. They are valid finite offline-batch numbers,
+but TF requests finish at different iterations because accepted lengths vary.
+The active batch therefore shrinks, and the aggregate rate mixes full-batch
+execution with inefficient tail shapes. They motivated the lockstep benchmark
+above and should not be read as the hardware ceiling.
 
-```bash
-BACKEND=FLASH_ATTN VLLM_FLASH_ATTN_VERSION=3 GPU=0 \
-    bash benchmarks/tidar/run_iter12600_tput.sh
-```
+### MT4000, Target Temperature 0.6
 
-## Result Acceptance Checklist
+Checkpoint `iter_0012600`, one forced BOS, K=16, argmax draft, ignore EOS,
+`FULL_AND_PIECEWISE`; H100 uses `FLASH_ATTN` v3 and MI300X uses
+`ROCM_AITER_FA` plus AITER MoE.
 
-Every accepted run must satisfy all of the following:
+| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `82.258` | `132.427` / `4.619` | `1.61x` | `60.702` | `60.753` / `4.209` | `1.00x` |
+| 8 | `542.912` | `680.086` / `5.317` | `1.25x` | `377.326` | `314.923` / `5.422` | `0.83x` |
+| 16 | `975.975` | `1333.164` / `5.263` | `1.37x` | `773.367` | `587.371` / `5.444` | `0.76x` |
+| 64 | `3141.139` | `4043.730` / `5.942` | `1.29x` | `2532.184` | `1788.693` / `5.002` | `0.71x` |
 
-- `PATCH_PROBE_CONTEXT` reports `force_bos=true`,
-  `leading4=[2,105,9731,107]`, and `leading_bos_count=1`.
-- AMD logs say `Using Aiter Flash Attention backend` and
-  `Using ROCm AITER backend for Unquantized MoE`.
-- AMD TF logs show the paged path for both
-  `S=17, causal=True` and `S=17, causal=False`.
-- The b64 startup log includes cudagraph capture size `1088`.
-- AR and TF use the same checkpoint, prompts, active batch, output length,
-  target temperature, EOS policy, and request count.
-- Acceptance remains in the expected band and output is coherent.
+Logs:
 
-If acceptance collapses toward one, first check BOS and the two paged-attention
-causal signatures. If those are correct, compare target and draft forward time
-before changing rejection sampling.
+- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_iter12000meta_mt4k_t06_d0_n1_vp16_20260709_190123/`
+- AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_iter12000meta_mt4k_t06_d0_n1_c17_20260710_010137/`
 
-Expected greedy AMD ballpark:
+### MT5000, Greedy
 
-```text
-b1:  AR 53.8 tok/s, TF 62.3 tok/s, accept 4.70
-b8:  AR 382.1 tok/s, TF 375.8 tok/s, accept 6.75
-b16: AR 772.4 tok/s, TF 661.8 tok/s, accept 8.33
-b64: AR 2509.8 tok/s, TF 2102.3 tok/s, accept 8.25
-```
+| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `79.723` | `207.554` / `7.562` | `2.60x` | `53.828` | `62.296` / `4.703` | `1.16x` |
+| 8 | `539.015` | `972.872` / `6.136` | `1.80x` | `382.078` | `375.808` / `6.746` | `0.98x` |
+| 16 | `968.246` | `1603.001` / `6.802` | `1.66x` | `772.428` | `661.769` / `8.325` | `0.86x` |
+| 64 | `3093.504` | `3482.665` / `6.936` | `1.13x` | `2509.826` | `2102.265` / `8.250` | `0.84x` |
+
+AMD acceptance is higher than NVIDIA at b8-b64 here, yet aggregate AMD TF is
+not faster than AR. This is direct evidence that acceptance alone does not
+explain the finite-batch result.
+
+Logs:
+
+- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_forcebos_mt5k_n1_vp16_20260709_175900/`
+- AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_forcebos_mt5k_n1_c17_20260710_002037/`
+
+### H100 Metric-Control Experiment
+
+An earlier mixed-prompt H100 run timed complete full-batch TF iterations while
+also reporting aggregate completion throughput:
+
+| bsz | AR | Aggregate TF | Full-batch TF | Full-batch TF/AR | Full-batch acc |
+|---:|---:|---:|---:|---:|---:|
+| 1 | `82.4` | `198.4` | `208.5` | `2.53x` | `6.905` |
+| 8 | `558.2` | `882.7` | `1091.4` | `1.96x` | `5.383` |
+| 16 | `1123.6` | `1593.7` | `2183.9` | `1.94x` | `5.906` |
+| 64 | `3316.6` | `2669.5` | `5270.3` | `1.59x` | `5.023` |
+
+At b64, drain cuts the observed TF rate by about `49%`, while the complete
+full-batch path remains `1.59x` faster than AR. CUDA-event and host-clock rates
+agree within `0.1%`, confirming that the timed intervals are device-bound.
+
+Logs: `/data/home/jinzhao/nv_v2_tidar_logs/vp85_steady_direct_20260712/`.
 
 For migration history and distributed EPLB status, see
-`docs/TIDAR_AMD_HANDOFF.md`. Those topics are intentionally outside this
-single-GPU throughput handoff.
+`docs/TIDAR_AMD_HANDOFF.md`.
