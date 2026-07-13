@@ -105,6 +105,7 @@ def kernel_unified_attention_2d(
     num_seqs: tl.int32,
     BLOCK_M: tl.constexpr,  # int
     USE_FP8: tl.constexpr,  # bool
+    IS_CAUSAL: tl.constexpr,  # bool
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
@@ -183,16 +184,15 @@ def kernel_unified_attention_2d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
     max_seq_prefix_len = (
         context_len
         + q_block_local_idx * BLOCK_Q
         + (BLOCK_M - 1) // num_queries_per_kv
         + 1
     )
-
-    if USE_MM_PREFIX:
+    if not IS_CAUSAL:
+        max_seq_prefix_len = seq_len
+    elif USE_MM_PREFIX:
         # image bidirectional attention ranges require a full range
         # including q_block padding to make sure doc mask is correct
         max_seq_prefix_len = tl.maximum(max_seq_prefix_len, seq_len)
@@ -282,9 +282,11 @@ def kernel_unified_attention_2d(
         else:
             V = V_load
 
-        # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         # Apply sliding window to base mask BEFORE mm_prefix OR.
         # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
@@ -453,6 +455,7 @@ def kernel_unified_attention_3d(
     USE_MM_PREFIX: tl.constexpr,  # bool
     MAX_MM_RANGES: tl.constexpr,  # int
     mm_prefix_range_ptr,  # [num_seqs] - prefix length for each sequence
+    IS_CAUSAL: tl.constexpr,  # bool
 ):
     q_block_global_idx = tl.program_id(0)
     kv_head_idx = tl.program_id(1)
@@ -540,18 +543,16 @@ def kernel_unified_attention_3d(
             qq_bias_ptr + query_pos[:, None] * qq_bias_stride_0
         )  # shape: [BLOCK_M]
 
-    # compute the length of the longest sequence prefix spanned by any
-    # query token in the current q_block (q_block_local_idx)
-    max_seq_prefix_len = (
-        context_len
-        + q_block_local_idx * BLOCK_Q
-        + (BLOCK_M - 1) // num_queries_per_kv
-        + 1
-    )
-
-    # adjust for potential padding in the last q_block by considering the
-    # actual sequence length
-    max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    if IS_CAUSAL:
+        max_seq_prefix_len = (
+            context_len
+            + q_block_local_idx * BLOCK_Q
+            + (BLOCK_M - 1) // num_queries_per_kv
+            + 1
+        )
+        max_seq_prefix_len = tl.minimum(max_seq_prefix_len, seq_len)
+    else:
+        max_seq_prefix_len = seq_len
 
     # calculate the number of tiles that need to be processed to
     # cover the longest sequence prefix (due to causal masking, tiles beyond
@@ -637,9 +638,11 @@ def kernel_unified_attention_3d(
         else:
             V = V_load
 
-        # Compute attention mask: causal by default (key <= query)
         query_abs_pos = context_len + query_pos[:, None]
-        seq_mask = seq_offset[None, :] <= query_abs_pos
+        if IS_CAUSAL:
+            seq_mask = seq_offset[None, :] <= query_abs_pos
+        else:
+            seq_mask = seq_offset[None, :] < seq_len
 
         # Apply sliding window to base mask BEFORE mm_prefix OR.
         # Order must match FlexAttention: (causal AND sliding_window) OR mm_prefix
@@ -912,8 +915,14 @@ def unified_attention(
     mm_prefix_range=None,
     use_alibi_sqrt=False,
 ):
-    assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
+    if not causal:
+        assert window_size[0] < 0, (
+            "Noncausal Triton unified attention does not support a sliding window"
+        )
+        assert mm_prefix_range is None, (
+            "Noncausal Triton unified attention does not support PrefixLM ranges"
+        )
 
     if sinks is not None:
         assert sinks.shape[0] == q.shape[1], "Sinks must be num_query_heads size"
@@ -1040,6 +1049,7 @@ def unified_attention(
             num_seqs=num_seqs,
             BLOCK_M=BLOCK_M,
             USE_FP8=output_scale is not None,
+            IS_CAUSAL=causal,
         )
     else:
         kernel_unified_attention_3d[
@@ -1078,6 +1088,7 @@ def unified_attention(
             USE_MM_PREFIX=use_mm_prefix,
             MAX_MM_RANGES=max_mm_ranges,
             mm_prefix_range_ptr=mm_prefix_range,
+            IS_CAUSAL=causal,
             SLIDING_WINDOW=(1 + window_size[0]),
             stride_k_cache_0=k.stride(0),
             stride_k_cache_1=k.stride(1),

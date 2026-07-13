@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import os
 from abc import abstractmethod
 from typing import Any
 
@@ -43,6 +44,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
+
+_VLLM_TIDAR_BATCH_INVARIANT_DENSE = (
+    os.environ.get("VLLM_TIDAR_BATCH_INVARIANT_DENSE", "0").lower()
+    in ("1", "true", "yes"))
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "UnquantizedLinearMethod",
@@ -241,6 +246,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if _VLLM_TIDAR_BATCH_INVARIANT_DENSE and current_platform.is_rocm():
+            return linear_batch_invariant(x, layer.weight, bias)
         if (
             vllm_is_batch_invariant()
             and current_platform.is_cuda_alike()

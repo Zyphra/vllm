@@ -30,6 +30,10 @@ drain that distorted the older fixed-output tests. Under this workload:
 - The remaining absolute AMD gap is concentrated in the two model backbones:
   at b64 AMD adds `6.73 ms` to target and `7.02 ms` to draft relative to H100,
   but only `0.73 ms` to all target sampling.
+- A raw-byte b1/b64 trace localizes AMD's acceptance-shape variation to
+  unquantized dense GEMMs. The first difference is the attention output
+  projection, after byte-identical CCA and AITER attention outputs. AITER MoE
+  and CCA convolution are not the initial source.
 
 The older aggregate fixed-output tests made AMD TF look slower than AMD AR at
 high batch because requests completed at different rates and the batch drained
@@ -69,11 +73,10 @@ identical acceptance in those rows. At b128 its `M=2176` trajectory changes;
 H100 and MI300X then have nearly identical full-batch acceptance (`5.396`
 versus `5.420`). MI300X is shape-dependent at smaller batches as well. At b16
 the final output hash exactly matches H100, while AMD takes 71 TF steps and
-H100 takes 70 for the same 526 accepted tokens. This points to small
-shape-dependent proposal differences in model numerics, most likely AITER MoE
-or CCA, rather than rejection-sampler corruption. Raw TF tok/s combines device
-time with the acceptance shown in the table; use step latency for a kernel-only
-comparison.
+H100 takes 70 for the same 526 accepted tokens. The controlled trace below
+shows that this comes from shape-dependent dense-GEMM numerics, not
+rejection-sampler corruption. Raw TF tok/s combines device time with the
+acceptance shown in the table; use step latency for a kernel-only comparison.
 
 Source logs:
 
@@ -82,6 +85,85 @@ Source logs:
 - AMD: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265603/`
 - AMD b32/b64 profiles: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265615/`
 - AMD b128 fixed: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265635/tf_b128.log`
+
+## Batch-Shape Numerical Diagnostic
+
+Fresh-process b1 and b64 runs used the same prompt, token IDs, positions,
+checkpoint, K=16, and exact graph sizes `M=17` and `M=1088`. The probe hashes
+the first request's BF16 draft hidden rows and FP32 logits as raw bytes. On
+H100, all 16 hidden rows, all 16 logits rows, and all 16 top-1 proposals match
+for each of the first eight traced proposal steps. Batch-shape invariance is
+therefore attainable for this workload.
+
+The initial AMD A/B results are:
+
+| AMD variant | Hidden rows | Logit rows | Top-1 proposals | Result |
+|---|---:|---:|---:|---|
+| AITER MoE + AITER-FA + default CCA | `0/16` | `0/16` | `13/16` | Baseline |
+| Triton MoE | `0/16` | `0/16` | `15/16` | Does not restore invariance; slower |
+| Triton attention | `0/16` | `0/16` | `15/16` | Does not restore invariance |
+| CCA unfold/einsum convolution | `0/16` | `0/16` | `13/16` | Does not restore invariance |
+| ROCm skinny GEMM disabled | `0/16` | `0/16` | `13/16` | Does not restore invariance |
+| Fixed-reduction `o_proj` | `0/16` | `0/16` | `10/16` | Layers 0-1 become exact |
+| Fixed-reduction all dense linears | `0/16` | `0/16` | `10/16` | First mismatch moves to layer-2 CCA conv |
+
+Layer-boundary hashes identify the first responsible operation. In layer 0,
+the normalized input, CCA QKV, and AITER attention output before `o_proj` are
+all `16/16` byte-identical. The `o_proj` output is only `7/16` identical. This
+is an unquantized `ReplicatedLinear` with shape `M x 1024 -> M x 2048`.
+Disabling the low-row `wvSplitKrc` path does not change the result, so the
+problem is not limited to skinny GEMM; the fallback
+`torch.nn.functional.linear`/ROCm BLAS path is also M-dependent.
+
+Forcing only `o_proj` through v0.24's fixed-reduction Triton GEMM makes layer 0
+and the following AITER MoE layer both `16/16` identical. This directly
+exonerates AITER MoE as the initial numerical source. The next difference is
+inside layer 2: its current input, Q/K linear output, and cached hidden state
+are exact, but its cached Q/K window is already different before convolution.
+The CCA value projection also differs in one row despite exact inputs. The
+alternate convolution alone leaves this boundary unchanged because its input
+state has already diverged.
+
+Forcing all unquantized dense linears through the fixed-reduction kernel makes
+layer 0, AITER MoE, the layer-2 Q/K and hidden caches, Q/K projections, and
+value projections exact. The first remaining difference is then the default
+CCA convolution (`14/16` exact rows), followed by layer-2 QKV (`15/16`). This
+establishes the order: ROCm dense GEMMs are the first source and CCA convolution
+is a second source; AITER MoE is not causal for the numerical divergence. The
+all-dense diagnostic is not a performance fix: versus the instrumented
+non-invariant control, step time grows from about `36.5` to `54.4 ms` at b1
+and from `64.9` to `82.5 ms` at b64.
+
+The fully controlled all-dense plus alternate-CCA-convolution pair remains to
+be run when a full Slurm node is available. A partial-GPU allocation cannot be
+scheduled on this cluster, and direct containers are reaped outside Slurm.
+
+The practical priority is a fast, fixed-reduction ROCm BF16 dense GEMM for the
+SMoE projection shapes. The diagnostic implementation is opt-in through
+`VLLM_TIDAR_BATCH_INVARIANT_O_PROJ=1`; it proves causality but is not yet the
+recommended production setting. AITER MoE remains a throughput target, just
+not the cause of the b1/b64 numerical divergence. CCA needs a fixed-reduction
+implementation after the dense projections are made invariant.
+
+Diagnostic logs:
+
+- H100 control: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_shape_hash_control_20260713/`
+- AMD component A/B: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_265694/`
+- AMD Triton attention and layer trace: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_265808/`
+- AMD stage trace: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_265883/`
+- AMD skinny-GEMM control: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_265951/`
+- AMD fixed-`o_proj` and state trace: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_267096/`
+- AMD fixed-`o_proj` plus CCA unfold: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_266125/`
+- AMD fixed-reduction all-dense control: `/shared/home/jinzhao/tfscope/amd_shape_hash_ab_268004/`
+
+Reproduce the baseline, all-dense localization, and remaining controlled CCA
+A/B with:
+
+```bash
+ONLY=core sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+ONLY=invariant_dense sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+ONLY=invariant_dense_cca_unfold sbatch benchmarks/tidar/slurm_shape_hash_ab.sh
+```
 
 ## Actual Remaining Gap
 
@@ -138,20 +220,29 @@ Profile logs:
 
 The highest-value work is inside the model graphs at the exact TiDAR shapes:
 
-1. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
+1. Provide or tune a fixed-reduction ROCm BF16 dense GEMM for the SMoE
+   `ReplicatedLinear` shapes, starting with attention `o_proj`
+   (`K=1024`, `N=2048`, `M=17/136/272/544/1088`). It should retain the H100's
+   b1/b64 numerical trajectory without giving up the current BLAS throughput.
+2. Provide a fixed-reduction CCA convolution. With all dense projections made
+   invariant, layer-2 input and recurrent caches are byte-identical and the
+   default convolution becomes the first mismatch (`14/16` rows exact). Run
+   the all-dense plus alternate-convolution control when a full node is free.
+3. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
    `M=544/1088/2176`, paying attention to low per-expert row counts. Current
-   logs select the generic two-stage default rather than a tuned row.
-2. Trace and reduce the ROCm CCA layout, copy, and convolution chain in target
+   logs select the generic two-stage default rather than a tuned row. This is
+   a throughput target, not the initial numerical-divergence source.
+4. Trace and reduce the ROCm CCA layout, copy, and convolution chain in target
    and draft. Any replacement must preserve candidate-state stashing, stable
    request slots, and separate draft scratch state.
-3. Tune the FP32-output vocabulary GEMM. At b64 the AMD target LM head is
+5. Tune the FP32-output vocabulary GEMM. At b64 the AMD target LM head is
    `1.82x` H100 and the draft LM head is `1.36x` H100. A fused draft
    LM-head-plus-argmax path is especially relevant because draft temperature is
    zero.
-4. Use a ROCm kernel trace to verify the shares above. AITER attention is lower
+6. Use a ROCm kernel trace to verify the shares above. AITER attention is lower
    priority from the H100 composition, and prefix rejection is already
    negligible.
-5. Preserve acceptance and output behavior. Performance changes should be
+7. Preserve acceptance and output behavior. Performance changes should be
    compared using full-batch step time as well as accepted tok/s so numeric
    trajectory changes are visible.
 
@@ -250,6 +341,7 @@ checkpoint has no configured mask ID, matching the old runner.
 | AR probe | `benchmarks/tidar/probe_v2_ar.py` |
 | TF probe | `benchmarks/tidar/probe_v2_tidar_nv.py` |
 | AMD lockstep Slurm driver | `benchmarks/tidar/slurm_lockstep_steady.sh` |
+| AMD shape-hash A/B driver | `benchmarks/tidar/slurm_shape_hash_ab.sh` |
 
 ## Lockstep Reproducer
 

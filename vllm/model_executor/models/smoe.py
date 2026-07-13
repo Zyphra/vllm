@@ -120,6 +120,38 @@ _VLLM_SMOE_ROCM_BF16_LM_HEAD = (
     os.environ.get("VLLM_SMOE_ROCM_BF16_LM_HEAD", "0").lower()
     in ("1", "true", "yes"))
 
+_VLLM_TIDAR_BATCH_INVARIANT_O_PROJ = (
+    os.environ.get("VLLM_TIDAR_BATCH_INVARIANT_O_PROJ", "0").lower()
+    in ("1", "true", "yes"))
+
+
+def _tidar_batch_invariant_linear_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    from vllm.model_executor.layers.batch_invariant import (
+        linear_batch_invariant,
+    )
+
+    return linear_batch_invariant(x, weight, bias)
+
+
+def _tidar_batch_invariant_linear_fake(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    del bias
+    return x.new_empty((*x.shape[:-1], weight.shape[0]))
+
+
+_direct_register_custom_op(
+    op_name="tidar_batch_invariant_linear",
+    op_func=_tidar_batch_invariant_linear_impl,
+    fake_impl=_tidar_batch_invariant_linear_fake,
+)
+
 
 class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
     """High-precision LM-head projection with a ROCm BF16 fast path.
@@ -305,6 +337,21 @@ class SMoEAttention(nn.Module):
         self.k_dim = self.cca_num_k_heads * self.head_dim
         self.v_dim = self.cca_num_k_heads * self.head_dim
         self.qkv_dim = self.q_dim + self.k_dim + self.v_dim
+        if os.environ.get("PATCH_PROBE_LAYER_HASH", "0").lower() in (
+                "1", "true", "yes"):
+            probe_rows = int(os.environ.get("PATCH_PROBE_LAYER_ROWS", "17"))
+            probe_dtype = (model_config.dtype if model_config is not None
+                           else torch.get_default_dtype())
+            self.register_buffer(
+                "_patch_probe_qkv",
+                torch.empty(probe_rows, self.qkv_dim, dtype=probe_dtype),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_patch_probe_attn_pre_o",
+                torch.empty(probe_rows, self.o_proj_in, dtype=probe_dtype),
+                persistent=False,
+            )
 
     def forward(
         self,
@@ -316,6 +363,11 @@ class SMoEAttention(nn.Module):
         output_qkv = torch.zeros((cca_input.shape[0], self.qkv_dim), device=cca_input.device, dtype=cca_input.dtype)
         if not VLLM_DISABLE_CCA_QKV:
             self.qkv(cca_input, output_qkv)
+        if hasattr(self, "_patch_probe_qkv"):
+            probe_rows = min(output_qkv.shape[0],
+                             self._patch_probe_qkv.shape[0])
+            self._patch_probe_qkv[:probe_rows].copy_(
+                output_qkv[:probe_rows])
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
         attn_output = self.attn(q, k, v)
@@ -323,7 +375,16 @@ class SMoEAttention(nn.Module):
             attn_output = attn_output.view(-1, self.cca_num_q_heads, self.head_dim)
             attn_output = attn_output.repeat_interleave(self.q_head_expand, dim=-2)
             attn_output = attn_output.reshape(-1, self.o_proj_in)
-        attn_output = self.o_proj(attn_output)     
+        if hasattr(self, "_patch_probe_attn_pre_o"):
+            probe_rows = min(attn_output.shape[0],
+                             self._patch_probe_attn_pre_o.shape[0])
+            self._patch_probe_attn_pre_o[:probe_rows].copy_(
+                attn_output[:probe_rows])
+        if _VLLM_TIDAR_BATCH_INVARIANT_O_PROJ:
+            attn_output = torch.ops.vllm.tidar_batch_invariant_linear(
+                attn_output, self.o_proj.weight, self.o_proj.bias)
+        else:
+            attn_output = self.o_proj(attn_output)
 
         return attn_output
 
@@ -363,6 +424,17 @@ class SMoEDecoderATTLayer(nn.Module):
         if self.config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, layer_n)
 
+        if os.environ.get("PATCH_PROBE_LAYER_HASH", "0").lower() in (
+                "1", "true", "yes"):
+            probe_rows = int(os.environ.get("PATCH_PROBE_LAYER_ROWS", "17"))
+            probe_dtype = (model_config.dtype if model_config is not None
+                           else torch.get_default_dtype())
+            self.register_buffer(
+                "_patch_probe_input",
+                torch.empty(probe_rows, config.hidden_size, dtype=probe_dtype),
+                persistent=False,
+            )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -383,6 +455,11 @@ class SMoEDecoderATTLayer(nn.Module):
             residual = hidden_states
         hidden_states = _apply_norm_with_fp32_residual(self.input_norm, residual,
                                                        layer_input_dtype)
+        if hasattr(self, "_patch_probe_input"):
+            probe_rows = min(hidden_states.shape[0],
+                             self._patch_probe_input.shape[0])
+            self._patch_probe_input[:probe_rows].copy_(
+                hidden_states[:probe_rows])
         
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
@@ -852,6 +929,29 @@ class SMoEModel(nn.Module):
                 )
         self.layers = nn.ModuleList(self.layers)
 
+        # Optional diagnostic buffers used by the TiDAR shape-parity probe.
+        # Keeping explicit buffers makes the snapshots update on graph replay;
+        # Python forward hooks only run while the graph is being captured.
+        self._patch_probe_layer_names: list[str] = []
+        self._patch_probe_layer_labels: list[str] = []
+        if os.environ.get("PATCH_PROBE_LAYER_HASH", "0").lower() in (
+                "1", "true", "yes"):
+            probe_rows = int(os.environ.get("PATCH_PROBE_LAYER_ROWS", "17"))
+            for layer_n, decoder_layer in enumerate(self.layers):
+                name = f"_patch_probe_layer_hidden_{layer_n}"
+                self.register_buffer(
+                    name,
+                    torch.empty(
+                        probe_rows,
+                        config.hidden_size,
+                        dtype=model_config.dtype,
+                    ),
+                    persistent=False,
+                )
+                self._patch_probe_layer_names.append(name)
+                self._patch_probe_layer_labels.append(
+                    type(decoder_layer).__name__)
+
         if self.config.scale_residual_merge:
             self.res_scale = ResidualScaling(config, len(config.smoe_layers))
 
@@ -900,6 +1000,12 @@ class SMoEModel(nn.Module):
                 layer_n,
                 prev_router_hidden_states,
             )
+            if self._patch_probe_layer_names:
+                probe = getattr(
+                    self, self._patch_probe_layer_names[layer_n])
+                num_probe_rows = min(probe.shape[0], hidden_states.shape[0])
+                probe[:num_probe_rows].copy_(
+                    hidden_states[:num_probe_rows])
 
         if self.config.scale_residual_merge:
             residual, hidden_states = self.res_scale(residual, hidden_states)

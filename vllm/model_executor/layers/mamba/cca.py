@@ -243,6 +243,25 @@ class CCA(MambaBase, CustomOp):
             self._spec_stash_conv is not None
         )
 
+        if os.environ.get("PATCH_PROBE_LAYER_HASH", "0").lower() in (
+                "1", "true", "yes"):
+            probe_rows = int(os.environ.get("PATCH_PROBE_LAYER_ROWS", "17"))
+            probe_dtype = (model_config.dtype if model_config is not None
+                           else torch.get_default_dtype())
+            for name, width in (
+                ("_patch_probe_qk_linear", self.in_out_ch),
+                ("_patch_probe_qk_conv", self.in_out_ch),
+                ("_patch_probe_value", self.latent_k_dim),
+                ("_patch_probe_qk_cached",
+                 self.in_out_ch * self.total_padding),
+                ("_patch_probe_hs_cached", self.hidden_size),
+            ):
+                self.register_buffer(
+                    name,
+                    torch.empty(probe_rows, width, dtype=probe_dtype),
+                    persistent=False,
+                )
+
     def _conv_qk_apply(self, x: torch.Tensor) -> torch.Tensor:
         x_fp32 = x.to(torch.float32)
 
@@ -459,6 +478,12 @@ class CCA(MambaBase, CustomOp):
         hs_cached = prev_hs[state_indices_p].to(hs_p_2d.dtype)
         qk_cached = conv_states[state_indices_p].to(
             qk_packed0_p_2d.dtype)
+        if hasattr(self, "_patch_probe_qk_cached"):
+            probe_reqs = min(P, self._patch_probe_qk_cached.shape[0])
+            self._patch_probe_qk_cached[:probe_reqs].copy_(
+                qk_cached[:probe_reqs].reshape(probe_reqs, -1))
+            self._patch_probe_hs_cached[:probe_reqs].copy_(
+                hs_cached[:probe_reqs])
 
         # hs2 context: [hs_cached, hs_p[:, :-1]] -> [P, S, H_hs].
         hs2_p_2d = torch.cat(
@@ -798,6 +823,11 @@ class CCA(MambaBase, CustomOp):
         q = self.linear_q(hs)  # [S, latent_q_dim]
         k = self.linear_k(hs)  # [S, latent_k_dim]
         qk_packed0 = torch.cat([q, k], dim=-1)  # [S, latent_q + latent_k]
+        if hasattr(self, "_patch_probe_qk_linear"):
+            probe_rows = min(qk_packed0.shape[0],
+                             self._patch_probe_qk_linear.shape[0])
+            self._patch_probe_qk_linear[:probe_rows].copy_(
+                qk_packed0[:probe_rows])
 
         query_pre = qk_packed0[..., :self.latent_q_dim].view(
             num_actual_tokens, self.num_q_heads, self.head_dim
@@ -1691,6 +1721,11 @@ class CCA(MambaBase, CustomOp):
                     num_prefill_tokens, self.latent_k_dim)
         else:
             qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
+            if hasattr(self, "_patch_probe_qk_conv"):
+                probe_rows = min(qk_packed3.shape[0],
+                                 self._patch_probe_qk_conv.shape[0])
+                self._patch_probe_qk_conv[:probe_rows].copy_(
+                    qk_packed3[:probe_rows])
             query_h = qk_packed3[..., :self.latent_q_dim].view(
                 num_actual_tokens, self.num_q_heads, self.head_dim
             ).float() + qk_mean_q
@@ -1704,6 +1739,10 @@ class CCA(MambaBase, CustomOp):
             key = key_h.reshape(num_actual_tokens, self.latent_k_dim)
 
         value = value.reshape(num_actual_tokens, self.num_k_heads * self.head_dim)
+        if hasattr(self, "_patch_probe_value"):
+            probe_rows = min(value.shape[0],
+                             self._patch_probe_value.shape[0])
+            self._patch_probe_value[:probe_rows].copy_(value[:probe_rows])
 
         qkv = torch.cat([query, key, value], dim=1)
         output[:num_actual_tokens] = qkv

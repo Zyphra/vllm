@@ -66,6 +66,7 @@ class TiDARSpeculator:
         self.draft_graphs: dict[int, torch.cuda.CUDAGraph] = {}
         self.draft_graph_pool = torch.cuda.graph_pool_handle()
         self.draft_hidden_states: torch.Tensor | None = None
+        self.last_draft_hidden_states: torch.Tensor | None = None
         self.last_draft_logits: torch.Tensor | None = None
         self.last_draft_probs: torch.Tensor | None = None
 
@@ -462,6 +463,7 @@ class TiDARSpeculator:
         hidden_states = hidden_states[:num_tokens]
         draft_hidden_states = hidden_states.view(
             num_reqs, query_len, -1)[:, 1:, :].contiguous().view(num_reqs * K, -1)
+        self.last_draft_hidden_states = draft_hidden_states.detach()
         logits = self.model.compute_logits(draft_hidden_states)
         self.last_draft_logits = logits.detach().contiguous()
         if self.diff_temperature == 0.0:

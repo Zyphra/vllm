@@ -343,6 +343,19 @@ class TraceStats:
         print("PATCH_PROBE_TRACE " + json.dumps(payload, sort_keys=True),
               flush=True)
 
+    def _tensor_hashes(self, tensor: torch.Tensor) -> dict[str, Any]:
+        tensor = tensor.detach().contiguous()
+        raw = tensor.view(torch.uint8).cpu().numpy()
+        return {
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "hash": hashlib.sha256(raw.tobytes()).hexdigest()[:16],
+            "row_hashes": [
+                hashlib.sha256(raw[i].tobytes()).hexdigest()[:16]
+                for i in range(raw.shape[0])
+            ],
+        }
+
     def observe_sample(self, input_batch: Any, sampled_tokens: torch.Tensor,
                        num_sampled: torch.Tensor,
                        num_rejected: torch.Tensor) -> None:
@@ -411,6 +424,8 @@ class TraceStats:
             draft_cpu = draft_tokens[:limit].detach().cpu().tolist()
             rows = []
             logits = getattr(speculator, "last_draft_logits", None)
+            hidden_states = getattr(
+                speculator, "last_draft_hidden_states", None)
             if logits is not None and self.topk > 0:
                 top_vals, top_ids = torch.topk(
                     logits[:limit * k].float(), k=self.topk, dim=-1)
@@ -434,6 +449,79 @@ class TraceStats:
                         for vals in top_vals_cpu[start:end]
                         if len(vals) > 1
                     ]
+                if req_idx == 0:
+                    start = req_idx * k
+                    end = start + k
+                    query_len = k + 1
+                    row["draft_input_ids"] = (
+                        speculator.input_buffers.input_ids[:query_len]
+                        .detach().cpu().tolist()
+                    )
+                    row["draft_positions"] = (
+                        speculator.input_buffers.positions[:query_len]
+                        .detach().cpu().tolist()
+                    )
+                    if hidden_states is not None:
+                        row["draft_hidden"] = self._tensor_hashes(
+                            hidden_states[start:end])
+                    if logits is not None:
+                        row["draft_logits"] = self._tensor_hashes(
+                            logits[start:end])
+                    model = getattr(speculator.model, "model", None)
+                    layer_names = getattr(
+                        model, "_patch_probe_layer_names", ())
+                    layer_labels = getattr(
+                        model, "_patch_probe_layer_labels", ())
+                    if layer_names:
+                        draft_layers = []
+                        for layer_n, name in enumerate(layer_names):
+                            layer = model.layers[layer_n]
+                            layer_trace = {
+                                "index": layer_n,
+                                "type": layer_labels[layer_n],
+                                **self._tensor_hashes(
+                                    getattr(model, name)[1:query_len]),
+                            }
+                            if hasattr(layer, "_patch_probe_input"):
+                                layer_trace["input"] = self._tensor_hashes(
+                                    layer._patch_probe_input[1:query_len])
+                            self_attn = getattr(layer, "self_attn", None)
+                            if self_attn is not None:
+                                for key, attr in (
+                                    ("qkv", "_patch_probe_qkv"),
+                                    ("attn_pre_o",
+                                     "_patch_probe_attn_pre_o"),
+                                ):
+                                    if hasattr(self_attn, attr):
+                                        layer_trace[key] = (
+                                            self._tensor_hashes(
+                                                getattr(self_attn, attr)[
+                                                    1:query_len]))
+                                cca = getattr(self_attn, "qkv", None)
+                                for key, attr in (
+                                    ("cca_qk_linear",
+                                     "_patch_probe_qk_linear"),
+                                    ("cca_qk_conv",
+                                     "_patch_probe_qk_conv"),
+                                    ("cca_value", "_patch_probe_value"),
+                                ):
+                                    if cca is not None and hasattr(cca, attr):
+                                        layer_trace[key] = (
+                                            self._tensor_hashes(
+                                                getattr(cca, attr)[
+                                                    1:query_len]))
+                                for key, attr in (
+                                    ("cca_qk_cached",
+                                     "_patch_probe_qk_cached"),
+                                    ("cca_hs_cached",
+                                     "_patch_probe_hs_cached"),
+                                ):
+                                    if cca is not None and hasattr(cca, attr):
+                                        layer_trace[key] = (
+                                            self._tensor_hashes(
+                                                getattr(cca, attr)[:1]))
+                            draft_layers.append(layer_trace)
+                        row["draft_layers"] = draft_layers
                 rows.append(row)
             self._emit({
                 "event": "propose",
