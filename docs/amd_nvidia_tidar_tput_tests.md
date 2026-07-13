@@ -6,6 +6,14 @@ Repository: [Zyphra/vllm-smoe-amd](https://github.com/Zyphra/vllm-smoe-amd),
 branch `jinzhao/tidar_v024`. Checkpoint:
 [Zyphra-staging/smoediffusion_128k-hf_iter_0012600](https://huggingface.co/Zyphra-staging/smoediffusion_128k-hf_iter_0012600).
 
+> **Prompt mode: template-level thinking is OFF.** The current matched tests
+> use the pre-rendered `benchmarks/tidar/aime25_zpo_texts.json` prompts, which
+> end with an empty, closed `<think>\n</think>\n\n` block before generation.
+> The probes encode those strings directly and do not call
+> `apply_chat_template` or set `enable_thinking=True`. The user text still says
+> "Let's think step by step," so the model may emit visible reasoning, but
+> these results must not be labeled thinking-on.
+
 ## Executive Summary
 
 TiDAR two-forward (TF) is correct and operational on one MI300X with the vLLM
@@ -74,7 +82,8 @@ and prefill.
 
 Both platforms use `iter_0012600`, exactly one forced BOS, target temperature
 `0.6`, argmax draft, K=16, V2 async scheduling, exact graph capture, and
-`FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3 and MI300X uses
+`FULL_AND_PIECEWISE`. Prompt mode is template-level thinking-off as specified
+above. H100 uses `FLASH_ATTN` v3 and MI300X uses
 `ROCM_AITER_FA`, AITER unquantized MoE, and the batch-invariant CCA
 convolution. AMD TF uses adaptive paged-attention split-K at b8-b64; b1 reports
 the faster no-splits result.
@@ -123,7 +132,8 @@ device cost from short prefixes through a 10k-token context.
 
 Both platforms use `iter_0012600`, exactly one forced BOS, target temperature
 `0.6`, argmax draft, K=16, V2 async scheduling, exact full-batch graph capture,
-and `FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3 and the default CCA
+`FULL_AND_PIECEWISE`, and template-level thinking-off prompts. H100 uses
+`FLASH_ATTN` v3 and the default CCA
 convolution. MI300X uses `ROCM_AITER_FA`, AITER unquantized MoE, and the
 batch-invariant CCA convolution. The table reports the best measured AMD TF
 setting per batch: no-splits at b1 and adaptive TF paged split-K at b8-b64.
@@ -500,6 +510,12 @@ export CKPT=/shared/home/$USER/checkpoints/smoediffusion_128k-hf_iter_0012600
 huggingface-cli download Zyphra-staging/smoediffusion_128k-hf_iter_0012600 \
     --local-dir "$CKPT"
 ```
+
+The checked-in `aime25_zpo_texts.json` is already chat-formatted and explicitly
+closes an empty `<think>` block before generation. The reproducer passes
+`--prompt-token-ids`, so it intentionally measures thinking-off prompts even
+though the user message requests step-by-step reasoning. Do not describe this
+configuration as thinking-on.
 
 The tested AMD image is `zyphra/rocm-primus:aiter_pa_swa` with Torch 2.10,
 Triton 3.7, and ROCm 7.2. The first load in a fresh image can spend about 12
