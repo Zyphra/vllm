@@ -20,8 +20,20 @@ RUN_AR=${RUN_AR:-1}
 RUN_TF=${RUN_TF:-1}
 PROFILE=${PROFILE:-0}
 START_GPU=${START_GPU:-1}
+CCA_BATCH_INVARIANT=${CCA_BATCH_INVARIANT:-0}
+TF_PAGED_NO_SPLITS=${TF_PAGED_NO_SPLITS:-0}
+MAX_TOKENS=${MAX_TOKENS:-512}
+WARMUP_TOKENS=${WARMUP_TOKENS:-64}
+MAX_MODEL_LEN=${MAX_MODEL_LEN:-12000}
 
 mkdir -p "$LOGROOT"
+
+num_batches=$(wc -w <<<"$BATCHES")
+num_cases=$((num_batches * (RUN_AR + RUN_TF)))
+if (( START_GPU < 0 || START_GPU + num_cases > 8 )); then
+    echo "Requested $num_cases cases starting at GPU $START_GPU, but GPU IDs must be in [0, 7]." >&2
+    exit 2
+fi
 
 cleanup() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -49,6 +61,7 @@ common_env=(
     -e VLLM_CCA_TRITON=1
     -e VLLM_CCA_TRITON_FUSION_ENABLED=0
     -e VLLM_CCA_AMD_CONV_UNFOLD=0
+    -e VLLM_CCA_BATCH_INVARIANT_CONV="$CCA_BATCH_INVARIANT"
     -e VLLM_TIDAR_ROUTER_PAD=1
     -e VLLM_ROCM_USE_AITER=1
     -e VLLM_ROCM_USE_AITER_MHA=1
@@ -74,9 +87,10 @@ run_ar() {
         "$CONTAINER" bash -lc \
         "cd /work && $PYTHON -u benchmarks/tidar/probe_v2_ar.py \
          --ckpt '$CKPT' --dataset '$DATA' --batch '$batch' --num-prompts 1 \
-         --max-num-seqs '$batch' --n-sample '$batch' --max-tokens 512 \
-         --warmup-tokens 64 --repeats 1 --seed 0 --target-temp 0.6 \
-         --max-model-len 12000 --max-num-batched-tokens 8192 \
+         --max-num-seqs '$batch' --n-sample '$batch' \
+         --max-tokens '$MAX_TOKENS' --warmup-tokens '$WARMUP_TOKENS' \
+         --repeats 1 --seed 0 --target-temp 0.6 \
+         --max-model-len '$MAX_MODEL_LEN' --max-num-batched-tokens 8192 \
          --gpu-memory-utilization 0.65 --backend ROCM_AITER_FA \
          --cudagraph-mode FULL_AND_PIECEWISE --prompt-token-ids --force-bos \
          --ignore-eos" >"$LOGROOT/ar_b${batch}.log" 2>&1
@@ -90,14 +104,16 @@ run_tf() {
         -e PATCH_PROBE_STEADY_BATCH="$batch" \
         -e VLLM_TIDAR_TWO_FORWARD=1 \
         -e VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1 \
-        -e VLLM_TIDAR_TF_PAGED_NO_SPLITS=1 \
-        -e VLLM_TIDAR_FA_NO_SPLITS=1 \
+        -e VLLM_TIDAR_TF_PAGED_NO_SPLITS="$TF_PAGED_NO_SPLITS" \
+        -e VLLM_TIDAR_FA_NO_SPLITS="$TF_PAGED_NO_SPLITS" \
         "$CONTAINER" bash -lc \
         "cd /work && $PYTHON -u benchmarks/tidar/probe_v2_tidar_nv.py \
          --ckpt '$CKPT' --dataset '$DATA' --batch '$batch' --num-prompts 1 \
-         --max-num-seqs '$batch' --n-sample '$batch' --max-tokens 512 \
-         --warmup-tokens 64 --repeats 1 --seed 0 --target-temp 0.6 \
-         --draft-temp 0 --num-spec-tokens 16 --max-model-len 12000 \
+         --max-num-seqs '$batch' --n-sample '$batch' \
+         --max-tokens '$MAX_TOKENS' --warmup-tokens '$WARMUP_TOKENS' \
+         --repeats 1 --seed 0 --target-temp 0.6 \
+         --draft-temp 0 --num-spec-tokens 16 \
+         --max-model-len '$MAX_MODEL_LEN' \
          --max-num-batched-tokens 8192 --gpu-memory-utilization 0.65 \
          --backend ROCM_AITER_FA --cudagraph-mode FULL_AND_PIECEWISE \
          --prompt-token-ids --force-bos --ignore-eos" \

@@ -13,23 +13,32 @@ V2 GPU runner, async scheduling, target and draft cudagraph replay,
 `ROCM_AITER_FA`, AITER unquantized MoE, CCA recurrent-state handling, and
 prefix rejection.
 
-The main result is the drain-controlled lockstep table below. It keeps the full
-batch active and times complete device iterations, avoiding the request-tail
-drain that distorted the older fixed-output tests. Under this workload:
+The main result is the drain-controlled 10k-output lockstep table below. It
+keeps the full batch active and times complete device iterations, avoiding the
+request-tail drain that distorted older fixed-output tests while exercising
+the full long-context decode path. Under this workload:
 
-- AMD TF is faster than AMD AR at every measured batch: `2.26-3.14x` through
-  b32 and `1.74x` at b64.
-- At b64, MI300X reaches `6067 tok/s` TF versus H100 `9247 tok/s`, or `0.66x`.
-  The paired AR ratio is `3483/4817 = 0.72x`.
-- The b64 TF device step is `67.4 ms` on MI300X versus `52.0 ms` on H100
-  (`1.30x` slower). The AR step is `18.4 ms` versus `13.3 ms` (`1.38x`
-  slower). Thus TF is not disproportionately slow on AMD once drain is removed.
-- At b128, after fixing the V2 block-table kernels, MI300X reaches `6385 tok/s`
-  (`1.12x` AR) and H100 reaches `8379 tok/s` (`0.98x` AR). Their acceptance is
-  nearly identical, and the AMD TF step remains `1.32x` slower than H100.
-- The remaining absolute AMD gap is concentrated in the two model backbones:
-  at b64 AMD adds `6.73 ms` to target and `7.02 ms` to draft relative to H100,
-  but only `0.73 ms` to all target sampling.
+- Adaptive split-K restores AMD TF speedups of `2.15x`, `2.09x`, `1.81x`, and
+  `1.07x` at b8/b16/b32/b64. The forced no-splits control made those rows look
+  much worse. Batch 1 remains unresolved at `0.69x` AR.
+- At b64, MI300X reaches `3128 tok/s` TF versus H100 `4008 tok/s`, or `0.78x`.
+  The paired AR ratio is `2933/3668 = 0.80x`, so accepted-token platform scaling
+  is nearly the same for AR and TF.
+- The b64 TF device step is still `94.4 ms` on MI300X versus `60.2 ms` on H100
+  (`1.57x` slower). The AR step is `21.8 ms` versus `17.4 ms` (`1.25x`
+  slower); higher AMD acceptance (`4.615` versus `3.769`) compensates for most
+  of that latency gap in output tok/s.
+- At b1, no-splits preserves acceptance (`4.217`) but takes `112.3 ms` per TF
+  step. Adaptive split-K cuts the step to `36.1 ms` but changes the trajectory
+  to acceptance `1.330`; both deliver only about `37 tok/s`. This is the
+  clearest remaining AMD TF acceptance/performance target.
+- Single-GPU b128 is not a valid 10k lockstep comparison: TF exhausts cache
+  capacity on both platforms before the common completion boundary. H100 AR
+  also preempts, while MI300X AR remains resident.
+- In the prior MT512 component profile, the remaining absolute AMD gap is
+  concentrated in the two model backbones: at b64 AMD adds `6.73 ms` to target
+  and `7.02 ms` to draft relative to H100, but only `0.73 ms` to all target
+  sampling.
 - A raw-byte b1/b64 trace localizes AMD's acceptance-shape variation to
   unquantized dense GEMMs. The first difference is the attention output
   projection, after byte-identical CCA and AITER attention outputs. AITER MoE
@@ -45,52 +54,60 @@ The older aggregate fixed-output tests made AMD TF look slower than AMD AR at
 high batch because requests completed at different rates and the batch drained
 through progressively smaller graph shapes. Those results are retained in the
 appendix because they describe finite offline batches, but they should not be
-used as the device-throughput ceiling or as evidence of an AMD-only TF failure.
+used as the device-throughput ceiling. The 10k no-splits control had a separate
+long-prefix attention bottleneck; adaptive split-K removes most of it.
 
 ## Drain-Controlled AMD/NVIDIA Result
 
 The matched lockstep workload replicates one AIME25 prompt and sampling state
-across every request (`num_prompts=1`, `n_sample=B`), forces exactly 512 output
-tokens, and ignores EOS. The probe reports only complete full-batch decode
-iterations after warmup. AR emits one token per request per iteration; TF
-reports accepted output tokens per complete target/sample/CCA/draft interval.
-Prefill, startup, partial final TF iterations, and all smaller tail shapes are
-excluded.
+across every request (`num_prompts=1`, `n_sample=B`), forces exactly 10,000
+output tokens, and ignores EOS. The probe reports only complete full-batch
+decode iterations after warmup. AR emits one token per request per iteration;
+TF reports accepted output tokens per complete target/sample/CCA/draft
+interval. Prefill, startup, partial final TF iterations, and all smaller tail
+shapes are excluded. Unlike the earlier MT512 table, these rates average the
+device cost from short prefixes through a 10k-token context.
 
 Both platforms use `iter_0012600`, exactly one forced BOS, target temperature
 `0.6`, argmax draft, K=16, V2 async scheduling, exact full-batch graph capture,
-and `FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3. MI300X uses
-`ROCM_AITER_FA`, AITER unquantized MoE, and TF paged no-splits attention.
+and `FULL_AND_PIECEWISE`. H100 uses `FLASH_ATTN` v3 and the default CCA
+convolution. MI300X uses `ROCM_AITER_FA`, AITER unquantized MoE, and the
+batch-invariant CCA convolution. The table reports the best measured AMD TF
+setting per batch: no-splits at b1 and adaptive TF paged split-K at b8-b64.
 
 | bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | `85.995` | `240.175` / `7.514` | `2.79x` | `56.466` | `170.186` / `6.564` | `3.01x` | `0.66x` | `0.71x` |
-| 8 | `646.746` | `1813.426` / `7.514` | `2.80x` | `454.600` | `1143.828` / `6.633` | `2.52x` | `0.70x` | `0.63x` |
-| 16 | `1297.721` | `3362.292` / `7.514` | `2.59x` | `814.879` | `2555.903` / `7.408` | `3.14x` | `0.63x` | `0.76x` |
-| 32 | `2479.075` | `6201.975` / `7.514` | `2.50x` | `1580.296` | `3579.318` / `5.885` | `2.26x` | `0.64x` | `0.58x` |
-| 64 | `4816.921` | `9247.443` / `7.514` | `1.92x` | `3482.532` | `6067.079` / `6.390` | `1.74x` | `0.72x` | `0.66x` |
-| 128 | `8512.417` | `8379.099` / `5.396` | `0.98x` | `5687.594` | `6385.331` / `5.420` | `1.12x` | `0.67x` | `0.76x` |
+| 1 | `84.750` | `129.680` / `4.280` | `1.53x` | `54.760` | `37.564` / `4.217` | `0.69x` | `0.65x` | `0.29x` |
+| 8 | `619.152` | `1026.857` / `4.498` | `1.66x` | `397.457` | `855.992` / `4.646` | `2.15x` | `0.64x` | `0.83x` |
+| 16 | `1190.385` | `1713.385` / `4.267` | `1.44x` | `837.559` | `1753.972` / `5.680` | `2.09x` | `0.70x` | `1.02x` |
+| 32 | `2124.758` | `2646.111` / `3.754` | `1.25x` | `1490.878` | `2702.458` / `5.606` | `1.81x` | `0.70x` | `1.02x` |
+| 64 | `3668.461` | `4007.641` / `3.769` | `1.09x` | `2932.523` | `3127.915` / `4.615` | `1.07x` | `0.80x` | `0.78x` |
+| 128 | capacity-limited | capacity-limited | - | `4630.055` | capacity-limited | - | - | - |
 
 All rates are device-event output tok/s. Acceptance includes TiDAR's normal
-bonus token. Every request remains active until the common completion boundary.
+bonus token. Rows b1-b64 keep every request active until the common completion
+boundary. At b128, H100 AR records only 6,830 full-batch calls out of 9,999;
+H100 and MI300X TF retain b128 for only 618 and 597 calls, respectively. Those
+early-context rates are intentionally omitted.
 
-H100 follows the same sampled trajectory through b64 and therefore has
-identical acceptance in those rows. At b128 its `M=2176` trajectory changes;
-H100 and MI300X then have nearly identical full-batch acceptance (`5.396`
-versus `5.420`). MI300X is shape-dependent at smaller batches as well. At b16
-the final output hash exactly matches H100, while AMD takes 71 TF steps and
-H100 takes 70 for the same 526 accepted tokens. The controlled trace below
-shows that this comes from shape-dependent dense-GEMM numerics, not
-rejection-sampler corruption. Raw TF tok/s combines device time with the
+Acceptance varies with batch shape and long trajectory because BF16 dense-GEMM
+and CCA reduction geometry can alter proposals near decision boundaries. The
+controlled trace below shows that this is model-level numerical sensitivity,
+not rejection-sampler corruption. Raw TF tok/s combines device time with the
 acceptance shown in the table; use step latency for a kernel-only comparison.
 
 Source logs:
 
-- NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/vp16_lockstep_steady_20260712_212216/`
-- NVIDIA b128 fixed: `/data/home/jinzhao/nv_v2_tidar_logs/vp49_b128_typed_blocktables_20260712/tf_b128.log`
-- AMD: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265603/`
-- AMD b32/b64 profiles: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265615/`
-- AMD b128 fixed: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_265635/tf_b128.log`
+- NVIDIA TF and b1-b32 AR: `/data/home/jinzhao/nv_v2_tidar_logs/mt10k_cca_fix_20260713_r2/`
+- NVIDIA b64 AR retry: `/data/home/jinzhao/nv_v2_tidar_logs/mt10k_cca_fix_20260713_r2_retry/`
+- AMD AR and no-splits control: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271083/`,
+  `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271084/`, and
+  `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271111/`
+- AMD adaptive split-K TF: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271123/`
+
+Slurm job 271083 is marked failed only because its final case was assigned the
+invalid GPU ID 8; its completed b1/b8/b16 and AR-b32 logs are valid. The driver
+now rejects out-of-range case layouts before launching.
 
 ## Batch-Shape Numerical Diagnostic
 
@@ -202,10 +219,35 @@ sbatch benchmarks/tidar/slurm_cca_kernel_probe.sh
 
 ## Actual Remaining Gap
 
-Matched b32 and b64 event profiles isolate the residual device gap. `Target`
-and `Draft` are backbone graph replays. `Target sample` includes the target
-vocabulary projection, temperature/Gumbel sampling, and prefix rejection.
-LM-head and Gumbel values are nested inside those totals.
+The 10k result adds a long-prefix effect that the MT512 profiles did not expose.
+Forcing a single TF attention pass raises the AMD b64 step to `139.8 ms` and
+reduces TF to `1880 tok/s`. Adaptive split-K lowers the step to `94.4 ms` and
+raises TF to `3128 tok/s`. The remaining b64 TF step ratio is `1.57x` AMD/H100,
+versus `1.25x` for AR, although higher AMD acceptance makes accepted-token
+platform scaling nearly equal (`0.78x` TF versus `0.80x` AR).
+
+Batch 1 is the sharper unresolved case. Adaptive split-K reaches a competitive
+`36.1 ms` step but changes the draft trajectory to acceptance `1.330`;
+no-splits restores acceptance `4.217` but takes `112.3 ms`. The custom AMD TF
+attention reads the full paged prefix for 17 query positions in each target and
+draft pass, so both split selection and verifier-feeding numerics need focused
+work.
+
+The direct MI300X attention-mode A/B is:
+
+| bsz | No-splits TF / acc / step | Adaptive TF / acc / step | Adaptive throughput gain |
+|---:|---:|---:|---:|
+| 1 | `37.564 / 4.217 / 112.3 ms` | `36.882 / 1.330 / 36.1 ms` | `0.98x` |
+| 8 | `283.421 / 4.103 / 115.8 ms` | `855.992 / 4.646 / 43.4 ms` | `3.02x` |
+| 16 | `619.448 / 4.516 / 116.7 ms` | `1753.972 / 5.680 / 51.8 ms` | `2.83x` |
+| 32 | `1675.888 / 6.119 / 116.8 ms` | `2702.458 / 5.606 / 66.4 ms` | `1.61x` |
+| 64 | `1879.970 / 4.106 / 139.8 ms` | `3127.915 / 4.615 / 94.4 ms` | `1.66x` |
+
+The earlier matched MT512 b32 and b64 event profiles isolate the residual
+short-context device gap. `Target` and `Draft` are backbone graph replays.
+`Target sample` includes the target vocabulary projection, temperature/Gumbel
+sampling, and prefix rejection. LM-head and Gumbel values are nested inside
+those totals.
 
 | Platform | bsz | TF step | Target | Draft | Target sample | Target LM head | Draft LM head | Gumbel |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -255,29 +297,33 @@ Profile logs:
 
 The highest-value work is inside the model graphs at the exact TiDAR shapes:
 
-1. Provide or tune a fixed-reduction ROCm BF16 dense GEMM for the SMoE
+1. Profile and tune long-prefix `vllm/attention/ops/tf_attention.py`. First fix
+   the b1 split-K numerical trajectory without losing its `36.1 ms` step; then
+   reduce the adaptive b64 `94.4 ms` step. Sweep split count using prefix length
+   and launch occupancy, and compare target and draft attention separately.
+   Preserve causal verify and bidirectional draft numerics.
+2. Provide or tune a fixed-reduction ROCm BF16 dense GEMM for the SMoE
    `ReplicatedLinear` shapes, starting with attention `o_proj`
    (`K=1024`, `N=2048`, `M=17/136/272/544/1088`). It should retain the H100's
    b1/b64 numerical trajectory without giving up the current BLAS throughput.
-2. Review, tune, and help land the new fixed-reduction Triton CCA convolution.
+3. Review, tune, and help land the new fixed-reduction Triton CCA convolution.
    It closes the CCA divergence, is cudagraph-stable, and improves matched b64
    TF by `8.4%` on MI300X. Broader prompt, prefill, dtype, and shape validation
    is needed before enabling it by default.
-3. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
+4. Tune AITER unquantized top-1 MoE for E=16, H=2048 and aggregate
    `M=544/1088/2176`, paying attention to low per-expert row counts. Current
    logs select the generic two-stage default rather than a tuned row. This is
    a throughput target, not the initial numerical-divergence source.
-4. Trace and reduce the ROCm CCA layout, copy, and convolution chain in target
+5. Trace and reduce the ROCm CCA layout, copy, and convolution chain in target
    and draft. Any replacement must preserve candidate-state stashing, stable
    request slots, and separate draft scratch state.
-5. Tune the FP32-output vocabulary GEMM. At b64 the AMD target LM head is
+6. Tune the FP32-output vocabulary GEMM. At b64 the AMD target LM head is
    `1.82x` H100 and the draft LM head is `1.36x` H100. A fused draft
    LM-head-plus-argmax path is especially relevant because draft temperature is
    zero.
-6. Use a ROCm kernel trace to verify the shares above. AITER attention is lower
-   priority from the H100 composition, and prefix rejection is already
-   negligible.
-7. Preserve acceptance and output behavior. Performance changes should be
+7. Use a ROCm kernel trace to verify the long-context shares above. Prefix
+   rejection is already negligible.
+8. Preserve acceptance and output behavior. Performance changes should be
    compared using full-batch step time as well as accepted tok/s so numeric
    trajectory changes are visible.
 
@@ -285,10 +331,11 @@ Earlier AMD screening found no gain from Triton MoE, the alternate SMoE AITER
 op, removing router padding, CCA Triton fusion, or CCA unfold/einsum. Leave
 those variants off unless their implementations change.
 
-## b128 Block-Table Fix
+## MT512 b128 Block-Table Fix
 
-The original b128 fault was in the V2 block-table preparation path, not memory
-capacity or graph size. On H100, `CUDA_LAUNCH_BLOCKING=1` localized the first
+The original short-context b128 fault was in the V2 block-table preparation
+path, not memory capacity or graph size. On H100,
+`CUDA_LAUNCH_BLOCKING=1` localized the first
 misaligned access to `_gather_block_tables_kernel` at `(2 cache groups, 128
 requests)`. Replacing only that gather exposed `_compute_slot_mappings_kernel`
 as the next failure. Both kernels loaded raw block-table addresses from a
@@ -376,6 +423,7 @@ checkpoint has no configured mask ID, matching the old runner.
 | AR probe | `benchmarks/tidar/probe_v2_ar.py` |
 | TF probe | `benchmarks/tidar/probe_v2_tidar_nv.py` |
 | AMD lockstep Slurm driver | `benchmarks/tidar/slurm_lockstep_steady.sh` |
+| NVIDIA lockstep driver | `benchmarks/tidar/run_lockstep_nvidia.sh` |
 | AMD shape-hash A/B driver | `benchmarks/tidar/slurm_shape_hash_ab.sh` |
 
 ## Lockstep Reproducer
@@ -397,10 +445,16 @@ The tested AMD image is `zyphra/rocm-primus:aiter_pa_swa` with Torch 2.10,
 Triton 3.7, and ROCm 7.2. The first load in a fresh image can spend about 12
 minutes compiling AITER kernels. On shared IBM nodes, do not use GPU 0.
 
-The checked-in Slurm script runs paired AR and TF lockstep tests across GPUs:
+The checked-in Slurm script runs AR or TF lockstep tests across GPUs. Submit
+the modes separately to cover b1-b64 without using GPU 0:
 
 ```bash
-CKPT="$CKPT" BATCHES="1 8 16 32 64" \
+CKPT="$CKPT" BATCHES="1 8 16 32 64" RUN_AR=1 RUN_TF=0 \
+    MAX_TOKENS=10000 CCA_BATCH_INVARIANT=1 \
+    sbatch benchmarks/tidar/slurm_lockstep_steady.sh
+
+CKPT="$CKPT" BATCHES="1 8 16 32 64" RUN_AR=0 RUN_TF=1 \
+    MAX_TOKENS=10000 CCA_BATCH_INVARIANT=1 TF_PAGED_NO_SPLITS=0 \
     sbatch benchmarks/tidar/slurm_lockstep_steady.sh
 ```
 
@@ -416,8 +470,9 @@ export VLLM_ROCM_USE_AITER_MOE=1
 export VLLM_ROCM_MOE_PADDING=1
 export VLLM_TIDAR_TWO_FORWARD=1
 export VLLM_TIDAR_USE_TF_PAGED_ATTENTION=1
-export VLLM_TIDAR_TF_PAGED_NO_SPLITS=1
-export VLLM_TIDAR_FA_NO_SPLITS=1
+export VLLM_TIDAR_TF_PAGED_NO_SPLITS=0
+export VLLM_TIDAR_FA_NO_SPLITS=0
+export VLLM_CCA_BATCH_INVARIANT_CONV=1
 export PATCH_PROBE_STEADY=1
 export PATCH_PROBE_STEADY_BATCH=64
 export PATCH_PROBE_EXACT_CUDAGRAPH_BATCH=1
@@ -425,7 +480,7 @@ export PATCH_PROBE_EXACT_CUDAGRAPH_BATCH=1
 python -u benchmarks/tidar/probe_v2_tidar_nv.py \
   --ckpt "$CKPT" --dataset benchmarks/tidar/aime25_zpo_texts.json \
   --batch 64 --num-prompts 1 --max-num-seqs 64 --n-sample 64 \
-  --max-tokens 512 --warmup-tokens 64 --repeats 1 --seed 0 \
+  --max-tokens 10000 --warmup-tokens 64 --repeats 1 --seed 0 \
   --target-temp 0.6 --draft-temp 0 --num-spec-tokens 16 \
   --max-model-len 12000 --max-num-batched-tokens 8192 \
   --gpu-memory-utilization 0.65 --backend ROCM_AITER_FA \
@@ -435,14 +490,36 @@ python -u benchmarks/tidar/probe_v2_tidar_nv.py \
 
 For H100, use the same arguments with `--backend FLASH_ATTN`,
 `VLLM_ATTENTION_BACKEND=FLASH_ATTN`, and `VLLM_FLASH_ATTN_VERSION=3`; remove
-the ROCm/AITER variables.
+the ROCm/AITER variables. `benchmarks/tidar/run_lockstep_nvidia.sh` wraps the
+same probe and accepts `CASES="ar:1:1 tf:1:2 ..."` for direct multi-GPU runs.
+
+For the best measured AMD b1 configuration, set
+`VLLM_TIDAR_TF_PAGED_NO_SPLITS=1` and `VLLM_TIDAR_FA_NO_SPLITS=1`. Keep adaptive
+split-K (`0`) for b8-b64.
 
 A valid AMD run must report one forced BOS, AITER Flash Attention, AITER
 unquantized MoE, both paged-attention causal signatures, and exact capture size
 `17B`. Compare `PATCH_PROBE_STEADY` device step time before comparing accepted
 tok/s.
 
-## Appendix: Finite-Batch Drain Results
+## Appendix: Earlier Results
+
+### MT512 Drain-Controlled Reference
+
+This was the original short-context lockstep table. It remains useful for
+isolating model-graph throughput, but it does not exercise long-prefix TF
+attention and must not be substituted for the 10k table above.
+
+| bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR | AMD/NVIDIA AR | AMD/NVIDIA TF |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | `85.995` | `240.175` / `7.514` | `2.79x` | `56.466` | `170.186` / `6.564` | `3.01x` | `0.66x` | `0.71x` |
+| 8 | `646.746` | `1813.426` / `7.514` | `2.80x` | `454.600` | `1143.828` / `6.633` | `2.52x` | `0.70x` | `0.63x` |
+| 16 | `1297.721` | `3362.292` / `7.514` | `2.59x` | `814.879` | `2555.903` / `7.408` | `3.14x` | `0.63x` | `0.76x` |
+| 32 | `2479.075` | `6201.975` / `7.514` | `2.50x` | `1580.296` | `3579.318` / `5.885` | `2.26x` | `0.64x` | `0.58x` |
+| 64 | `4816.921` | `9247.443` / `7.514` | `1.92x` | `3482.532` | `6067.079` / `6.390` | `1.74x` | `0.72x` | `0.66x` |
+| 128 | `8512.417` | `8379.099` / `5.396` | `0.98x` | `5687.594` | `6385.331` / `5.420` | `1.12x` | `0.67x` | `0.76x` |
+
+### Finite-Batch Drain Results
 
 These historical tests divide total generated tokens by total time for a fixed
 set of requests with no refill. They are valid finite offline-batch numbers,
@@ -451,7 +528,7 @@ The active batch therefore shrinks, and the aggregate rate mixes full-batch
 execution with inefficient tail shapes. They motivated the lockstep benchmark
 above and should not be read as the hardware ceiling.
 
-### MT4000, Target Temperature 0.6
+#### MT4000, Target Temperature 0.6
 
 Checkpoint `iter_0012600`, one forced BOS, K=16, argmax draft, ignore EOS,
 `FULL_AND_PIECEWISE`; H100 uses `FLASH_ATTN` v3 and MI300X uses
@@ -469,7 +546,7 @@ Logs:
 - NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_iter12000meta_mt4k_t06_d0_n1_vp16_20260709_190123/`
 - AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_iter12000meta_mt4k_t06_d0_n1_c17_20260710_010137/`
 
-### MT5000, Greedy
+#### MT5000, Greedy
 
 | bsz | NVIDIA AR | NVIDIA TF / acc | TF/AR | AMD AR | AMD TF / acc | TF/AR |
 |---:|---:|---:|---:|---:|---:|---:|
@@ -487,7 +564,7 @@ Logs:
 - NVIDIA: `/data/home/jinzhao/nv_v2_tidar_logs/iter12600_forcebos_mt5k_n1_vp16_20260709_175900/`
 - AMD: `/shared/home/jinzhao/tfscope/amd_iter12600_forcebos_mt5k_n1_c17_20260710_002037/`
 
-### H100 Metric-Control Experiment
+#### H100 Metric-Control Experiment
 
 An earlier mixed-prompt H100 run timed complete full-batch TF iterations while
 also reporting aggregate completion throughput:
