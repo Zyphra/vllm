@@ -728,6 +728,20 @@ def load_prompt_texts(path: str) -> list[str]:
     return prompts
 
 
+def enable_thinking(prompts: list[str]) -> list[str]:
+    thinking_off_suffix = "<think>\n</think>\n\n"
+    thinking_on_suffix = "<think>\n"
+    transformed = []
+    for index, prompt in enumerate(prompts):
+        if not prompt.endswith(thinking_off_suffix):
+            raise ValueError(
+                f"Prompt {index} does not end with the expected closed "
+                "thinking block")
+        transformed.append(prompt[:-len(thinking_off_suffix)] +
+                           thinking_on_suffix)
+    return transformed
+
+
 def select_prompts(prompts: list[str], batch: int, offset: int) -> list[str]:
     return [prompts[(offset + i) % len(prompts)] for i in range(batch)]
 
@@ -877,6 +891,9 @@ def parse_args() -> argparse.Namespace:
                         default=os.environ.get("PATCH_PROBE_FORCE_BOS") == "1",
                         help="Prepend exactly one BOS to prompt token IDs.")
     parser.add_argument("--prompt-token-limit", type=int, default=0)
+    parser.add_argument("--thinking-on", action="store_true",
+                        default=os.environ.get("PATCH_PROBE_THINKING_ON") == "1",
+                        help="Leave the pre-rendered <think> block open.")
     parser.add_argument("--ignore-eos", action="store_true",
                         default=os.environ.get("PATCH_PROBE_IGNORE_EOS") == "1")
     return parser.parse_args()
@@ -890,6 +907,8 @@ def main() -> None:
     max_num_batched_tokens = max(
         args.max_num_batched_tokens, max_num_seqs * per_step_tokens)
     all_prompts = load_prompt_texts(args.dataset)
+    if args.thinking_on:
+        all_prompts = enable_thinking(all_prompts)
     base_prompts = select_prompts(all_prompts, num_prompts, args.offset)
     selected_prompts = base_prompts * args.n_sample
     if args.prompt_token_ids:
@@ -913,6 +932,8 @@ def main() -> None:
         "num_dataset_prompts": len(all_prompts),
         "prompt_token_ids": args.prompt_token_ids,
         "force_bos": args.force_bos,
+        "thinking_on": args.thinking_on,
+        "prompt_suffix": selected_prompts[0][-48:] if selected_prompts else "",
         "prompt_token_limit": args.prompt_token_limit,
         "tokenization": tokenization,
         "max_tokens": args.max_tokens,

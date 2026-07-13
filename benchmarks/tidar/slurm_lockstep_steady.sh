@@ -23,6 +23,7 @@ START_GPU=${START_GPU:-1}
 CCA_BATCH_INVARIANT=${CCA_BATCH_INVARIANT:-0}
 TF_PAGED_NO_SPLITS=${TF_PAGED_NO_SPLITS:-0}
 IGNORE_EOS=${IGNORE_EOS:-1}
+THINKING_ON=${THINKING_ON:-0}
 MAX_TOKENS=${MAX_TOKENS:-512}
 WARMUP_TOKENS=${WARMUP_TOKENS:-64}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-12000}
@@ -31,6 +32,11 @@ case "$IGNORE_EOS" in
     0) eos_arg=() ;;
     1) eos_arg=(--ignore-eos) ;;
     *) echo "IGNORE_EOS must be 0 or 1." >&2; exit 2 ;;
+esac
+case "$THINKING_ON" in
+    0) thinking_arg=() ;;
+    1) thinking_arg=(--thinking-on) ;;
+    *) echo "THINKING_ON must be 0 or 1." >&2; exit 2 ;;
 esac
 
 mkdir -p "$LOGROOT"
@@ -100,7 +106,7 @@ run_ar() {
          --max-model-len '$MAX_MODEL_LEN' --max-num-batched-tokens 8192 \
          --gpu-memory-utilization 0.65 --backend ROCM_AITER_FA \
          --cudagraph-mode FULL_AND_PIECEWISE --prompt-token-ids --force-bos \
-         ${eos_arg[*]}" >"$LOGROOT/ar_b${batch}.log" 2>&1
+         ${thinking_arg[*]} ${eos_arg[*]}" >"$LOGROOT/ar_b${batch}.log" 2>&1
 }
 
 run_tf() {
@@ -123,7 +129,7 @@ run_tf() {
          --max-model-len '$MAX_MODEL_LEN' \
          --max-num-batched-tokens 8192 --gpu-memory-utilization 0.65 \
          --backend ROCM_AITER_FA --cudagraph-mode FULL_AND_PIECEWISE \
-         --prompt-token-ids --force-bos ${eos_arg[*]}" \
+         --prompt-token-ids --force-bos ${thinking_arg[*]} ${eos_arg[*]}" \
         >"$LOGROOT/tf_b${batch}.log" 2>&1
 }
 

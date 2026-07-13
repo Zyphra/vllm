@@ -12,6 +12,7 @@ MAX_TOKENS=${MAX_TOKENS:-10000}
 WARMUP_TOKENS=${WARMUP_TOKENS:-64}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-12000}
 IGNORE_EOS=${IGNORE_EOS:-1}
+THINKING_ON=${THINKING_ON:-0}
 CASES=${CASES:?Set CASES to mode:batch:gpu entries}
 DOCKER=${DOCKER:-docker}
 
@@ -19,6 +20,11 @@ case "$IGNORE_EOS" in
     0) eos_args=() ;;
     1) eos_args=(--ignore-eos) ;;
     *) echo "IGNORE_EOS must be 0 or 1." >&2; exit 2 ;;
+esac
+case "$THINKING_ON" in
+    0) thinking_args=() ;;
+    1) thinking_args=(--thinking-on) ;;
+    *) echo "THINKING_ON must be 0 or 1." >&2; exit 2 ;;
 esac
 
 mkdir -p "$LOGROOT"
@@ -93,6 +99,7 @@ run_case() {
                 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.65 \
                 --backend FLASH_ATTN --cudagraph-mode FULL_AND_PIECEWISE \
                 --prompt-token-ids --force-bos \
+                "${thinking_args[@]}" \
                 "${eos_args[@]}" \
                 "${spec_args[@]}"
         ) >"$LOGROOT/${mode}_b${batch}.log" 2>&1
@@ -109,7 +116,8 @@ run_case() {
              --max-model-len '$MAX_MODEL_LEN' --max-num-batched-tokens 8192 \
              --gpu-memory-utilization 0.65 --backend FLASH_ATTN \
              --cudagraph-mode FULL_AND_PIECEWISE \
-             --prompt-token-ids --force-bos ${eos_args[*]} ${spec_args[*]}" \
+             --prompt-token-ids --force-bos ${thinking_args[*]} \
+             ${eos_args[*]} ${spec_args[*]}" \
             >"$LOGROOT/${mode}_b${batch}.log" 2>&1
     fi
 }

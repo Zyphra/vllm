@@ -107,6 +107,20 @@ def load_prompt_texts(path: str) -> list[str]:
     return prompts
 
 
+def enable_thinking(prompts: list[str]) -> list[str]:
+    thinking_off_suffix = "<think>\n</think>\n\n"
+    thinking_on_suffix = "<think>\n"
+    transformed = []
+    for index, prompt in enumerate(prompts):
+        if not prompt.endswith(thinking_off_suffix):
+            raise ValueError(
+                f"Prompt {index} does not end with the expected closed "
+                "thinking block")
+        transformed.append(prompt[:-len(thinking_off_suffix)] +
+                           thinking_on_suffix)
+    return transformed
+
+
 def encode_prompts(
     prompts: list[str],
     checkpoint: str,
@@ -185,6 +199,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-bos", action="store_true",
                         help="Prepend exactly one BOS to prompt token IDs.")
     parser.add_argument("--prompt-token-limit", type=int, default=0)
+    parser.add_argument("--thinking-on", action="store_true",
+                        help="Leave the pre-rendered <think> block open.")
     parser.add_argument("--ignore-eos", action="store_true")
     return parser.parse_args()
 
@@ -195,6 +211,8 @@ def main() -> None:
         raise ValueError("--force-bos requires --prompt-token-ids")
 
     all_prompts = load_prompt_texts(args.dataset)
+    if args.thinking_on:
+        all_prompts = enable_thinking(all_prompts)
     base_prompts = [
         all_prompts[i % len(all_prompts)] for i in range(args.num_prompts)
     ]
@@ -220,6 +238,8 @@ def main() -> None:
         "num_dataset_prompts": len(all_prompts),
         "prompt_token_ids": args.prompt_token_ids,
         "force_bos": args.force_bos,
+        "thinking_on": args.thinking_on,
+        "prompt_suffix": selected_prompts[0][-48:] if selected_prompts else "",
         "prompt_token_limit": args.prompt_token_limit,
         "tokenization": tokenization,
         "max_tokens": args.max_tokens,
