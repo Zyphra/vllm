@@ -15,11 +15,11 @@ v0.16-family SMoE fork and adopts the useful v0.24/DiffusionGemma architecture:
 V2 runner execution, speculative-decode data flow, hybrid recurrent state,
 async output, and graph-friendly model-state handling.
 
-Current performance claims use natural EOS only. `max_tokens=10000` is a
-safety cap; the measured prompt completes after roughly 686-776 output tokens.
-The prompt is **template-level thinking-off**: its pre-rendered assistant turn
-closes an empty `<think>` block before generation. The step-by-step instruction
-in the user text does not make it thinking-on.
+Current performance claims use **thinking-on**, with EOS enabled and
+`max_tokens=10000` as a safety cap. The probes replace the pre-rendered closed
+`<think>\n</think>\n\n` suffix with an open `<think>\n` suffix before direct
+tokenization. Thinking-on trajectories are long, and several rows reach the
+10k cap before EOS; the focused report labels every result as `EOS` or `CAP`.
 
 Matched single-GPU results use `iter_0012600`, one forced BOS, target
 temperature 0.6, argmax draft, K=16, seed 0, V2 async, and
@@ -27,16 +27,19 @@ temperature 0.6, argmax draft, K=16, seed 0, V2 async, and
 
 | bsz | H100 AR / TF | H100 TF/AR | MI300X AR / TF | MI300X TF/AR | MI300X acc |
 |---:|---:|---:|---:|---:|---:|
-| 1 | `80.7 / 216.4` | `2.68x` | `55.2 / 191.6` | `3.47x` | `7.408` |
-| 8 | `612.7 / 1435.1` | `2.34x` | `453.2 / 1404.9` | `3.10x` | `6.901` |
-| 16 | `1221.9 / 3108.2` | `2.54x` | `792.9 / 2711.6` | `3.42x` | `6.804` |
-| 32 | `2337.5 / 6071.5` | `2.60x` | `1614.8 / 4796.1` | `2.97x` | `7.010` |
-| 64 | `4508.0 / 9731.7` | `2.16x` | `3491.1 / 7464.8` | `2.14x` | `7.118` |
+| 1 | `84.6 / 171.0` | `2.02x` | `62.9 / 146.2` | `2.33x` | `5.495` |
+| 8 | `623.0 / 1171.3` | `1.88x` | `444.6 / 843.4` | `1.90x` | `4.690` |
+| 16 | `1247.9 / 1916.8` | `1.54x` | `848.5 / 1745.4` | `2.06x` | `5.227` |
+| 32 | `2124.2 / 3588.0` | `1.69x` | `1641.8 / 2456.5` | `1.50x` | `4.662` |
+| 64 | `3649.2 / 5315.1` | `1.46x` | `3157.2 / 3409.7` | `1.08x` | `4.725` |
 
-Rates are device-event output tok/s. Acceptance includes the bonus token. At
-b64, AMD/NVIDIA is `0.77x` for both AR and TF. The remaining absolute TF gap
-therefore tracks the base SMoE/AR platform gap rather than a separate TiDAR
-penalty. Full lengths, backend details, logs, and the reproducer are in
+Rates are device-event output tok/s. Acceptance includes the bonus token.
+MI300X matches or exceeds H100's observed TF/AR gain at b1-b16, but is lower at
+b32-b64. The large-b result is confounded by different sampled context-length
+trajectories: at b64, MI300X AR ends at 5,599 output tokens while MI300X TF
+runs to 7,998, whereas H100 AR and TF run to 10,000 and 9,581. A matched-context
+profile is required before assigning that difference to an AMD kernel. Full
+lengths, completion status, backend details, logs, and the reproducer are in
 `docs/amd_nvidia_tidar_tput_tests.md`.
 
 ## 2. Migration Status
@@ -60,8 +63,10 @@ the bonus token, accepted-state commit, and mask-token handling are wired.
 
 ### M4: Validate and Measure
 
-Complete for the natural-EOS single-GPU matrix above. MI300X receives a TF/AR
-speedup comparable to or better than H100 across b1-b64.
+Complete for the EOS-enabled, thinking-on single-GPU matrix above. MI300X's
+observed TF/AR gain matches or exceeds H100 at b1-b16. The lower b32-b64 ratios
+need a matched-context profile because AR and TF sampled different output
+lengths.
 
 ### M5-M6: Distributed Smoke
 
@@ -137,7 +142,7 @@ VLLM_TIDAR_ROUTER_PAD=1
 ```
 
 Use `benchmarks/tidar/slurm_lockstep_steady.sh` on AMD and
-`benchmarks/tidar/run_lockstep_nvidia.sh` on H100. The exact natural-EOS
+`benchmarks/tidar/run_lockstep_nvidia.sh` on H100. The exact thinking-on
 commands are maintained in `docs/amd_nvidia_tidar_tput_tests.md`.
 
 ## 4. Implementation
@@ -179,19 +184,23 @@ Key choices:
 
 ## 5. Scope and Next Work
 
-The natural-EOS data does not show an AMD-specific TiDAR speedup regression.
-Do not pursue cross-vendor bitwise matching or production deterministic GEMM.
+The thinking-on data does not show an AMD-specific TiDAR speedup regression at
+b1-b16. The b32-b64 gap must first be separated from the different sampled
+context-length trajectories. Do not pursue cross-vendor bitwise matching or
+production deterministic GEMM.
 
 Priority work:
 
-1. Improve ordinary SMoE forward throughput on MI300X: normal BF16 dense GEMM
+1. Profile matched-context b32-b64 target and draft steps, including
+   long-prefix `ROCM_AITER_FA` with `S=17`.
+2. Improve ordinary SMoE forward throughput on MI300X: normal BF16 dense GEMM
    and AITER unquantized MoE at `M=17B`.
-2. Review the batch-invariant CCA convolution for production adoption and
+3. Review the batch-invariant CCA convolution for production adoption and
    broader coverage.
-3. Debug captured DP+EP+EPLB concurrency, focusing on main-graph and EPLB
+4. Debug captured DP+EP+EPLB concurrency, focusing on main-graph and EPLB
    expert-state interaction.
-4. Refine DP pause/resume so EPLB does not require keepalive busy-spin.
-5. Decide whether to submit the independent v0.24 mixed-causal OOB fix in
+5. Refine DP pause/resume so EPLB does not require keepalive busy-spin.
+6. Decide whether to submit the independent v0.24 mixed-causal OOB fix in
    `docs/tidar_amd_handoff/`.
 
 Per-sequence-causal unified attention and its OOB fix belong to the optional
@@ -200,7 +209,7 @@ separate forwards.
 
 ## 6. References
 
-- Focused natural-EOS report: `docs/amd_nvidia_tidar_tput_tests.md`
+- Focused thinking-on report: `docs/amd_nvidia_tidar_tput_tests.md`
 - Migration scope: `docs/dllm_migration_scope.md`
 - OOB materials: `docs/tidar_amd_handoff/`
 - TF split-K design: `docs/tf_full_splitk_design.md`
