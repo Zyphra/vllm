@@ -3,6 +3,7 @@
 import gc
 import os
 import time
+from contextlib import nullcontext
 from copy import deepcopy
 from typing import Any
 
@@ -19,16 +20,20 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import is_mixture_of_experts
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+    select_routed_experts_kv_group,
+)
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces import is_mixture_of_experts
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
-from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
     build_slot_mappings_by_layer,
@@ -329,6 +334,46 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Attention groups are not supported.
         self.attn_groups = []  # type: ignore
+
+        if self.model_config.enable_return_routed_experts:
+            self.init_routed_experts_capturer()
+
+    def init_routed_experts_capturer(self) -> None:
+        logger.info("Initializing routed experts capturer for the V2 runner.")
+        capturer = RoutedExpertsCapturer.create()
+        (
+            self._routed_experts_kv_group_idx,
+            route_block_size,
+        ) = select_routed_experts_kv_group(self.kv_cache_config.kv_cache_groups)
+        max_num_kv_tokens = (
+            self.kv_cache_config.num_blocks
+            * self.parallel_config.data_parallel_size
+            * len(self.kv_cache_config.kv_cache_groups)
+            + 1
+        ) * route_block_size
+        capturer.init_buffer(
+            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+            max_num_kv_tokens=max_num_kv_tokens,
+            vllm_config=self.vllm_config,
+        )
+        self._bind_routed_experts_capturer(capturer)
+
+    def _bind_routed_experts_capturer(
+        self, capturer: RoutedExpertsCapturer
+    ) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.compilation_config.static_forward_context.values():
+            if isinstance(module, FusedMoE) and isinstance(module.router, BaseRouter):
+                layer_id = module.layer_id
+
+                def _capture_fn(topk_ids, _layer_id=layer_id, _capturer=capturer):
+                    _capturer.capture(_layer_id, topk_ids)
+
+                module.router.set_capture_fn(_capture_fn)
 
     def prepare_dummy_attn_metadata(self, input_batch: InputBatch) -> None:
         block_tables = self.block_tables.get_dummy_block_tables(input_batch.num_reqs)
@@ -753,6 +798,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
+            routed_expert_indices=slot_mappings[
+                self._routed_experts_kv_group_idx, :num_tokens
+            ],
         )
 
     @torch.inference_mode()
@@ -1145,6 +1193,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
     ) -> ModelRunnerOutput | None:
         assert intermediate_tensors is None
+        if self.model_config.enable_return_routed_experts:
+            capturer = RoutedExpertsCapturer.get_instance()
+            if capturer is not None:
+                capturer.clear_buffer()
+            elif not dummy_run:
+                raise RuntimeError("RoutedExpertsCapturer is not initialized.")
+
         if not dummy_run:
             # Update the request states.
             self.finish_requests(scheduler_output)
@@ -1290,6 +1345,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not model_dummy_run:
             self._build_tidar_cca_commit_ctx(input_batch, scheduler_output)
 
+        if self.model_config.enable_return_routed_experts and not model_dummy_run:
+            capturer = RoutedExpertsCapturer.get_instance()
+            assert capturer is not None
+            assert input_batch.routed_expert_indices is not None
+            capturer.save_captured_experts(
+                input_batch.routed_expert_indices.cpu().numpy()
+            )
+
         kv_connector_output = self.kv_connector.post_forward(scheduler_output)
         if runtime_dummy_run:
             self._dp_debug("runtime_dummy_draft_begin")
@@ -1361,13 +1424,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self._use_tidar():
                 self._commit_tidar_cca_state_from_num_sampled(num_sampled)
             self._dp_debug("draft_begin reqs=%d", input_batch.num_reqs)
-            draft_tokens = self.propose_draft(
-                input_batch,
-                hidden_states,
-                None,  # aux_hidden_states
-                num_sampled,
-                num_rejected,
-            )
+            capture_guard = nullcontext()
+            if (
+                self.model_config.enable_return_routed_experts
+                and self._use_tidar()
+            ):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capture_guard = capturer.capture_disabled()
+            with capture_guard:
+                draft_tokens = self.propose_draft(
+                    input_batch,
+                    hidden_states,
+                    None,  # aux_hidden_states
+                    num_sampled,
+                    num_rejected,
+                )
             self._dp_debug("draft_end reqs=%d", input_batch.num_reqs)
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
             self.draft_tokens_handler.set_draft_tokens(

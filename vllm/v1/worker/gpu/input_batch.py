@@ -80,6 +80,10 @@ class InputBatch:
     # Whether any requests in batch use structured output.
     has_structured_output_reqs: bool
 
+    # Selected dense KV group's unpadded slot mapping. Used by the
+    # routed-expert sidecar and scheduler reader in the same namespace.
+    routed_expert_indices: torch.Tensor | None = None
+
     @classmethod
     def make_dummy(
         cls,

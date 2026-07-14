@@ -102,6 +102,7 @@ class TiDARSpeculator:
             "parallel_drafting_mask_token_id",
             "draft_mask_token_id",
             "bidirectional_mask_token_id",
+            "diffusion_mask_token_id",
             "mask_token_id",
         ):
             value = getattr(hf_config, attr, None)
@@ -123,7 +124,87 @@ class TiDARSpeculator:
         if not self.attn_layer_names:
             raise RuntimeError(
                 "TiDAR requires at least one attention layer in the target model.")
-        logger.info("Initialized V2 TiDAR two-forward self-speculator.")
+        logger.info(
+            "Initialized V2 TiDAR two-forward self-speculator%s.",
+            " with DSpark+Markov drafting" if self._dspark_active() else "",
+        )
+
+    def _dspark_active(self) -> bool:
+        return (
+            getattr(self.model, "dspark_markov_enabled", False)
+            and os.environ.get("VLLM_TIDAR_DSPARK", "1") != "0"
+        )
+
+    def _dspark_sample_drafts(
+        self,
+        hidden_states: torch.Tensor,
+        batch_size: int,
+        mask_positions: torch.Tensor,
+        prev_token: torch.Tensor,
+    ) -> torch.Tensor:
+        model = self.model
+        draft_weight = model.diffusion_output_layer.weight
+        markov_w1 = model.diffusion_markov_head.w1
+        markov_w2 = model.diffusion_markov_head.w2
+        block_len = int(getattr(model, "dspark_block_len", 16))
+        K = self.num_speculative_steps
+        assert hidden_states.shape[0] == batch_size * K
+
+        base_logits = torch.matmul(hidden_states, draft_weight.t()).view(
+            batch_size, K, -1
+        )
+        vocab_size = base_logits.shape[-1]
+        tokens = torch.empty(
+            batch_size, K, dtype=torch.long, device=base_logits.device
+        )
+        probs = None
+        if self.diff_temperature != 0.0:
+            probs = torch.empty(
+                batch_size,
+                K,
+                vocab_size,
+                dtype=torch.float32,
+                device=base_logits.device,
+            )
+
+        use_global_reset = os.environ.get("VLLM_DSPARK_GLOBAL_RESET", "1") != "0"
+        prev = (
+            prev_token.to(torch.long).clone()
+            if use_global_reset
+            else torch.zeros(batch_size, dtype=torch.long, device=base_logits.device)
+        )
+        for k in range(K):
+            if use_global_reset:
+                at_boundary = mask_positions[:, k] % block_len == 0
+                prev = torch.where(at_boundary, torch.zeros_like(prev), prev)
+            elif k > 0 and k % block_len == 0:
+                prev.zero_()
+            bias = torch.matmul(markov_w1.index_select(0, prev), markov_w2)
+            if os.environ.get("VLLM_DSPARK_NO_MARKOV", "0") == "1":
+                bias.zero_()
+            base_logits[:, k].add_(bias)
+            logits_k = base_logits[:, k].to(torch.float32)
+            if self.diff_temperature == 0.0:
+                sampled = logits_k.argmax(dim=-1)
+            else:
+                draft_probs = torch.softmax(
+                    logits_k / self.diff_temperature, dim=-1
+                )
+                sampled = torch.multinomial(draft_probs, num_samples=1).squeeze(-1)
+                assert probs is not None
+                probs[:, k] = draft_probs
+            tokens[:, k] = sampled
+            prev = sampled
+
+        self.last_draft_logits = base_logits.view(
+            batch_size * K, vocab_size
+        ).detach().contiguous()
+        self.last_draft_probs = (
+            None
+            if probs is None
+            else probs.view(batch_size * K, vocab_size).contiguous()
+        )
+        return tokens.view(-1)
 
     def set_attn(
         self,
@@ -464,6 +545,21 @@ class TiDARSpeculator:
         draft_hidden_states = hidden_states.view(
             num_reqs, query_len, -1)[:, 1:, :].contiguous().view(num_reqs * K, -1)
         self.last_draft_hidden_states = draft_hidden_states.detach()
+        if self._dspark_active():
+            draft_token_ids = self._dspark_sample_drafts(
+                draft_hidden_states,
+                num_reqs,
+                mask_positions=positions_2d[:, 1:],
+                prev_token=next_token_ids,
+            )
+            self.draft_tokens[:num_reqs].copy_(
+                draft_token_ids.view(num_reqs, K)
+            )
+            if torch.any(num_sampled[:num_reqs] == 0):
+                inactive = num_sampled[:num_reqs] == 0
+                self.draft_tokens[:num_reqs][inactive] = -1
+            return self.draft_tokens[:num_reqs]
+
         logits = self.model.compute_logits(draft_hidden_states)
         self.last_draft_logits = logits.detach().contiguous()
         if self.diff_temperature == 0.0:
