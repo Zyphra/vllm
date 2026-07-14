@@ -725,6 +725,11 @@ class GPUModelRunner(
         # can construct mixed_logits = w*target + (1-w)*draft without
         # depending on the (None-at-Dirac) draft_probs.
         self._draft_logits_by_req_id: dict[str, torch.Tensor] = {}
+        # DSpark stochastic drafting stores q(draft_token) and logsumexp
+        # instead of a [num_spec, vocab] q matrix. Keep them request-keyed so
+        # a token-budget-delayed request retains the exact proposal state.
+        self._draft_token_probs_by_req_id: dict[str, torch.Tensor] = {}
+        self._draft_logsumexp_by_req_id: dict[str, torch.Tensor] = {}
         # === end TiDAR Block 1 =====================================
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2342,17 +2347,21 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        # === TiDAR Block 4: thread draft_probs/draft_logits through ====
-        # TiDAR drafter (T_Diff > 0) stashes per-req draft_probs in
-        # self._draft_probs_by_req_id; gather them in current input-batch
-        # order and slice to num_draft_tokens. Returns None at T_Diff == 0
-        # or for non-TiDAR drafters — routes the rejection sampler to its
-        # NO_DRAFT_PROBS branch. draft_logits is the parallel raw-logits
-        # plumbing used by mix-logit v1.
+        # === TiDAR Block 4: thread draft distribution through ===========
+        # The request-keyed state supplies either dense q(v) or compact
+        # {q(draft_token), logsumexp, logits}; the latter is exact while
+        # avoiding a second [num_tokens, vocab] allocation for DSpark.
         # === end TiDAR Block 4 =========================================
-        draft_probs, draft_logits = self._take_tidar_draft_state(
-            num_draft_tokens
-        )
+        (
+            draft_probs,
+            draft_logits,
+            draft_token_probs,
+            draft_logsumexp,
+        ) = self._take_tidar_draft_state(num_draft_tokens)
+        draft_temperature = None
+        if draft_token_probs is not None:
+            assert self.speculative_config is not None
+            draft_temperature = self.speculative_config.tidar_diff_temperature
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2362,7 +2371,10 @@ class GPUModelRunner(
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
             draft_probs=draft_probs,
+            draft_token_probs=draft_token_probs,
             draft_logits=draft_logits,
+            draft_logsumexp=draft_logsumexp,
+            draft_temperature=draft_temperature,
         )
 
     # === TiDAR Block 2: per-request draft distribution lifetime =======
@@ -2373,6 +2385,8 @@ class GPUModelRunner(
         discard_tidar_draft_state(
             self._draft_probs_by_req_id,
             self._draft_logits_by_req_id,
+            self._draft_token_probs_by_req_id,
+            self._draft_logsumexp_by_req_id,
             req_ids,
         )
 
@@ -2382,20 +2396,31 @@ class GPUModelRunner(
         num_spec_tokens: int | None,
         draft_probs: torch.Tensor | None,
         draft_logits: torch.Tensor | None,
+        draft_token_probs: torch.Tensor | None,
+        draft_logsumexp: torch.Tensor | None,
     ) -> None:
         stash_tidar_draft_state(
             self._draft_probs_by_req_id,
             self._draft_logits_by_req_id,
+            self._draft_token_probs_by_req_id,
+            self._draft_logsumexp_by_req_id,
             req_ids,
             num_spec_tokens,
             draft_probs,
             draft_logits,
+            draft_token_probs,
+            draft_logsumexp,
         )
 
     def _take_tidar_draft_state(
         self,
         num_draft_tokens: np.ndarray,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         require_probs = (
             self.speculative_config is not None
             and self.speculative_config.use_tidar()
@@ -2404,6 +2429,8 @@ class GPUModelRunner(
         return take_tidar_draft_state(
             self._draft_probs_by_req_id,
             self._draft_logits_by_req_id,
+            self._draft_token_probs_by_req_id,
+            self._draft_logsumexp_by_req_id,
             self.input_batch.req_ids,
             num_draft_tokens,
             require_probs=require_probs,
@@ -4779,11 +4806,17 @@ class GPUModelRunner(
                 num_spec = spec_config.num_speculative_tokens
                 last_probs = getattr(tidar_drafter, "last_draft_probs", None)
                 last_logits = getattr(tidar_drafter, "last_draft_logits", None)
+                last_token_probs = getattr(
+                    tidar_drafter, "last_draft_token_probs", None)
+                last_logsumexp = getattr(
+                    tidar_drafter, "last_draft_logsumexp", None)
                 self._stash_tidar_draft_state(
                     self.input_batch.req_ids,
                     num_spec,
                     last_probs,
                     last_logits,
+                    last_token_probs,
+                    last_logsumexp,
                 )
             # === end TiDAR Block 7 =====================================
 

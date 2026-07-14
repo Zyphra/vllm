@@ -182,6 +182,10 @@ class RejectionSampler(nn.Module):
             target_logits,
             bonus_token_ids,
             sampling_metadata,
+            draft_token_probs=metadata.draft_token_probs,
+            draft_logits=metadata.draft_logits,
+            draft_logsumexp=metadata.draft_logsumexp,
+            draft_temperature=metadata.draft_temperature,
         )
 
         logprobs_tensors = None
@@ -472,6 +476,13 @@ def rejection_sample(
     # [batch_size, 1]
     bonus_token_ids: torch.Tensor,
     sampling_metadata: SamplingMetadata,
+    # Compact stochastic-draft representation. When present, q(x) is used
+    # for acceptance and q(v) is reconstructed from logits only by the
+    # residual sampler. This avoids materializing [num_tokens, vocab_size] q.
+    draft_token_probs: torch.Tensor | None = None,
+    draft_logits: torch.Tensor | None = None,
+    draft_logsumexp: torch.Tensor | None = None,
+    draft_temperature: float | None = None,
 ) -> torch.Tensor:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
@@ -486,6 +497,25 @@ def rejection_sample(
     assert draft_probs is None or draft_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape == (num_tokens, vocab_size)
+
+    has_compact_draft_probs = draft_token_probs is not None
+    if has_compact_draft_probs:
+        assert draft_probs is None
+        assert draft_logits is not None
+        assert draft_logsumexp is not None
+        assert draft_temperature is not None and draft_temperature > 0.0
+        assert draft_token_probs.shape == (num_tokens,)
+        assert draft_logsumexp.shape == (num_tokens,)
+        assert draft_logits.shape == (num_tokens, vocab_size)
+        assert draft_token_probs.is_contiguous()
+        assert draft_logsumexp.is_contiguous()
+        assert draft_logits.is_contiguous()
+
+    # 0 is a Dirac/argmax draft, 1 has a materialized q(v), and 2 stores
+    # only q(x), logits and logsumexp for an exact compact stochastic q.
+    draft_mode = 2 if has_compact_draft_probs else (
+        1 if draft_probs is not None else 0
+    )
 
     # Create output buffer.
     output_token_ids = torch.full(
@@ -535,9 +565,13 @@ def rejection_sample(
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
+        draft_logits,
+        draft_logsumexp,
+        float(draft_temperature or 1.0),
         target_probs,
         sampling_metadata,
         device,
+        draft_mode,
     )
 
     # Rejection sampling for random sampling requests.
@@ -546,6 +580,7 @@ def rejection_sample(
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
+        draft_token_probs,
         target_probs,
         bonus_token_ids,
         recovered_token_ids,
@@ -553,7 +588,7 @@ def rejection_sample(
         is_greedy,
         max_spec_len,
         vocab_size,
-        NO_DRAFT_PROBS=draft_probs is None,
+        DRAFT_MODE=draft_mode,
     )
     return output_token_ids
 
@@ -720,10 +755,16 @@ def sample_recovered_tokens(
     draft_token_ids: torch.Tensor,
     # [num_tokens, vocab_size]
     draft_probs: torch.Tensor | None,
+    # [num_tokens, vocab_size] or None. Used only with compact q.
+    draft_logits: torch.Tensor | None,
+    # [num_tokens] or None. Used only with compact q.
+    draft_logsumexp: torch.Tensor | None,
+    draft_temperature: float,
     # [num_tokens, vocab_size]
     target_probs: torch.Tensor,
     sampling_metadata: SamplingMetadata,
     device: torch.device,
+    draft_mode: int,
 ) -> torch.Tensor:
     # NOTE(woosuk): Create only one distribution for each request.
     batch_size = len(num_draft_tokens)
@@ -746,11 +787,14 @@ def sample_recovered_tokens(
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
+        draft_logits,
+        draft_logsumexp,
+        draft_temperature,
         target_probs,
         q,
         vocab_size,
         triton.next_power_of_2(vocab_size),
-        NO_DRAFT_PROBS=draft_probs is None,
+        DRAFT_MODE=draft_mode,
     )
     return recovered_token_ids
 
@@ -807,6 +851,7 @@ def rejection_random_sample_kernel(
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
+    draft_token_probs_ptr,  # [num_tokens] or None
     target_probs_ptr,  # [num_tokens, vocab_size]
     bonus_token_ids_ptr,  # [batch_size]
     recovered_token_ids_ptr,  # [num_tokens]
@@ -814,7 +859,7 @@ def rejection_random_sample_kernel(
     is_greedy_ptr,  # [batch_size]
     max_spec_len,
     vocab_size,
-    NO_DRAFT_PROBS: tl.constexpr,
+    DRAFT_MODE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     is_greedy = tl.load(is_greedy_ptr + req_idx)
@@ -830,12 +875,14 @@ def rejection_random_sample_kernel(
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
-            if NO_DRAFT_PROBS:
+            if DRAFT_MODE == 0:
                 draft_prob = 1
-            else:
+            elif DRAFT_MODE == 1:
                 draft_prob = tl.load(
                     draft_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
                 )
+            else:
+                draft_prob = tl.load(draft_token_probs_ptr + start_idx + pos)
             target_prob = tl.load(
                 target_probs_ptr + (start_idx + pos) * vocab_size + draft_token_id
             )
@@ -892,11 +939,14 @@ def sample_recovered_tokens_kernel(
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
+    draft_logits_ptr,  # [num_tokens, vocab_size] or None
+    draft_logsumexp_ptr,  # [num_tokens] or None
+    draft_temperature,
     target_probs_ptr,  # [num_tokens, vocab_size]
     q_ptr,  # [batch_size, vocab_size]
     vocab_size,
     PADDED_VOCAB_SIZE: tl.constexpr,
-    NO_DRAFT_PROBS: tl.constexpr,
+    DRAFT_MODE: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     start_idx = 0 if req_idx == 0 else tl.load(cu_num_draft_tokens_ptr + req_idx - 1)
@@ -909,14 +959,14 @@ def sample_recovered_tokens_kernel(
         return
 
     vocab_offset = tl.arange(0, PADDED_VOCAB_SIZE)
-    if NO_DRAFT_PROBS:
+    if DRAFT_MODE == 0:
         draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
         prob = tl.load(
             target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
             mask=((vocab_offset < vocab_size) & (vocab_offset != draft_token_id)),
             other=0,
         )
-    else:
+    elif DRAFT_MODE == 1:
         draft_prob = tl.load(
             draft_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
             mask=vocab_offset < vocab_size,
@@ -930,6 +980,22 @@ def sample_recovered_tokens_kernel(
         prob = tl.maximum(target_prob - draft_prob, 0)
         # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here because
         # `tl.argmax` will select the maximum value.
+    else:
+        target_prob = tl.load(
+            target_probs_ptr + (start_idx + pos) * vocab_size + vocab_offset,
+            mask=vocab_offset < vocab_size,
+            other=0,
+        )
+        draft_logits = tl.load(
+            draft_logits_ptr + (start_idx + pos) * vocab_size + vocab_offset,
+            mask=vocab_offset < vocab_size,
+            other=float("-inf"),
+        ).to(tl.float32)
+        draft_logsumexp = tl.load(
+            draft_logsumexp_ptr + start_idx + pos
+        ).to(tl.float32)
+        draft_prob = tl.exp(draft_logits / draft_temperature - draft_logsumexp)
+        prob = tl.maximum(target_prob - draft_prob, 0)
 
     q = tl.load(
         q_ptr + req_idx * vocab_size + vocab_offset,

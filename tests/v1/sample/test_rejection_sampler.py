@@ -360,6 +360,67 @@ def test_deterministic_when_seeded(
                 assert torch.equal(results[j][i], results[0][i])
 
 
+def test_compact_draft_probs_match_materialized_path(rejection_sampler):
+    """Compact q(x)+logsumexp has the same rejection outcome as dense q."""
+    batch_size = 2
+    k = 3
+    vocab_size = 128
+    draft_temperature = 0.7
+    num_tokens = batch_size * k
+
+    torch.manual_seed(17)
+    draft_logits = torch.randn(num_tokens, vocab_size, device=DEVICE)
+    draft_probs = torch.softmax(draft_logits / draft_temperature, dim=-1)
+    draft_token_ids = torch.multinomial(draft_probs, num_samples=1).view(
+        batch_size, k
+    )
+    target_logits = torch.randn(num_tokens, vocab_size, device=DEVICE)
+    bonus_token_ids = torch.randint(
+        vocab_size, (batch_size, 1), dtype=torch.int64, device=DEVICE
+    )
+    sampling_metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.ones(batch_size, dtype=torch.float32, device=DEVICE),
+    )
+
+    dense_metadata = create_spec_decode_metadata(
+        draft_token_ids.tolist(), target_logits
+    )
+    compact_metadata = create_spec_decode_metadata(
+        draft_token_ids.tolist(), target_logits
+    )
+    compact_metadata.draft_token_probs = draft_probs.gather(
+        1, draft_token_ids.reshape(-1, 1)
+    ).view(-1).contiguous()
+    compact_metadata.draft_logits = draft_logits.contiguous()
+    compact_metadata.draft_logsumexp = torch.logsumexp(
+        draft_logits / draft_temperature, dim=-1
+    ).contiguous()
+    compact_metadata.draft_temperature = draft_temperature
+
+    mock_sampler_output(rejection_sampler, bonus_token_ids)
+    torch.manual_seed(19)
+    dense_output = rejection_sampler(
+        dense_metadata,
+        draft_probs=draft_probs.contiguous(),
+        logits=target_logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    mock_sampler_output(rejection_sampler, bonus_token_ids)
+    torch.manual_seed(19)
+    compact_output = rejection_sampler(
+        compact_metadata,
+        draft_probs=None,
+        logits=target_logits,
+        sampling_metadata=sampling_metadata,
+    )
+
+    assert torch.equal(
+        compact_output.sampled_token_ids, dense_output.sampled_token_ids
+    )
+
+
 def test_rejection_sampling_approximates_target_distribution():
     """Verify rejection sampling approximates target distribution,
     despite sampling from a potentially distinct draft distribution.

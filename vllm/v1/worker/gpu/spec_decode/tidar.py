@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 
 logger = init_logger(__name__)
 
@@ -69,6 +70,8 @@ class TiDARSpeculator:
         self.last_draft_hidden_states: torch.Tensor | None = None
         self.last_draft_logits: torch.Tensor | None = None
         self.last_draft_probs: torch.Tensor | None = None
+        self.last_draft_token_probs: torch.Tensor | None = None
+        self.last_draft_logsumexp: torch.Tensor | None = None
 
     def _get_draft_cudagraph_sizes(self) -> set[int]:
         if os.environ.get("VLLM_TIDAR_V2_DISABLE_DRAFT_CUDAGRAPH") == "1":
@@ -135,6 +138,50 @@ class TiDARSpeculator:
             and os.environ.get("VLLM_TIDAR_DSPARK", "1") != "0"
         )
 
+    def _sample_dspark_stochastic(
+        self,
+        logits: torch.Tensor,
+        sample_position: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample DSpark logits without constructing their probability matrix.
+
+        Gumbel-max samples exactly from softmax(logits / T). The compact
+        selected-token probability and log-normalizer are all the rejection
+        sampler needs: q(x) accepts a draft token, and logits plus logsumexp
+        reconstruct q(v) only if that position needs residual recovery.
+        """
+        batch_size = logits.shape[0]
+        device = logits.device
+        row_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
+        temperatures = torch.full(
+            (batch_size,), self.diff_temperature, dtype=torch.float32, device=device
+        )
+        # TiDAR's historical torch.multinomial path used the global CUDA RNG.
+        # Keep that contract while letting the fused gumbel kernel generate one
+        # independent categorical draw per row.
+        seeds = torch.randint(
+            torch.iinfo(torch.int32).max,
+            (batch_size,),
+            dtype=torch.int64,
+            device=device,
+        )
+        positions = torch.full(
+            (batch_size,), sample_position, dtype=torch.int64, device=device
+        )
+        sampled = gumbel_sample(
+            logits,
+            row_indices,
+            temperatures,
+            seeds,
+            positions,
+            apply_temperature=True,
+        )
+        scaled_logits = logits.to(torch.float32).div(self.diff_temperature)
+        logsumexp = torch.logsumexp(scaled_logits, dim=-1)
+        selected_logits = scaled_logits.gather(1, sampled.unsqueeze(1)).squeeze(1)
+        selected_probs = torch.exp(selected_logits - logsumexp)
+        return sampled, selected_probs, logsumexp
+
     def _dspark_sample_drafts(
         self,
         hidden_states: torch.Tensor,
@@ -153,19 +200,19 @@ class TiDARSpeculator:
         base_logits = torch.matmul(hidden_states, draft_weight.t()).view(
             batch_size, K, -1
         )
-        vocab_size = base_logits.shape[-1]
         tokens = torch.empty(
             batch_size, K, dtype=torch.long, device=base_logits.device
         )
-        probs = None
+        token_probs = None
+        logsumexp = None
         if self.diff_temperature != 0.0:
-            probs = torch.empty(
+            token_probs = torch.empty(
                 batch_size,
                 K,
-                vocab_size,
                 dtype=torch.float32,
                 device=base_logits.device,
             )
+            logsumexp = torch.empty_like(token_probs)
 
         use_global_reset = os.environ.get("VLLM_DSPARK_GLOBAL_RESET", "1") != "0"
         prev = (
@@ -187,22 +234,25 @@ class TiDARSpeculator:
             if self.diff_temperature == 0.0:
                 sampled = logits_k.argmax(dim=-1)
             else:
-                draft_probs = torch.softmax(
-                    logits_k / self.diff_temperature, dim=-1
-                )
-                sampled = torch.multinomial(draft_probs, num_samples=1).squeeze(-1)
-                assert probs is not None
-                probs[:, k] = draft_probs
+                sampled, selected_probs, row_logsumexp = \
+                    self._sample_dspark_stochastic(logits_k, k)
+                assert token_probs is not None and logsumexp is not None
+                token_probs[:, k] = selected_probs
+                logsumexp[:, k] = row_logsumexp
             tokens[:, k] = sampled
             prev = sampled
 
         self.last_draft_logits = base_logits.view(
-            batch_size * K, vocab_size
+            batch_size * K, base_logits.shape[-1]
         ).detach().contiguous()
-        self.last_draft_probs = (
-            None
-            if probs is None
-            else probs.view(batch_size * K, vocab_size).contiguous()
+        # The standard full-probability interface stays available for other
+        # drafters. DSpark's compact q(x) path intentionally leaves it empty.
+        self.last_draft_probs = None
+        self.last_draft_token_probs = (
+            None if token_probs is None else token_probs.view(-1).contiguous()
+        )
+        self.last_draft_logsumexp = (
+            None if logsumexp is None else logsumexp.view(-1).contiguous()
         )
         return tokens.view(-1)
 
@@ -562,14 +612,12 @@ class TiDARSpeculator:
 
         logits = self.model.compute_logits(draft_hidden_states)
         self.last_draft_logits = logits.detach().contiguous()
+        self.last_draft_token_probs = None
+        self.last_draft_logsumexp = None
         if self.diff_temperature == 0.0:
             self.last_draft_probs = None
             draft_token_ids = logits.argmax(dim=-1)
         else:
-            logger.warning_once(
-                "V2 TiDAR draft probabilities are not yet wired into the "
-                "V2 rejection sampler; non-zero tidar_diff_temperature is "
-                "experimental on this path.")
             scaled_logits = logits.to(torch.float32) / self.diff_temperature
             draft_probs = torch.softmax(scaled_logits, dim=-1)
             draft_token_ids = torch.multinomial(

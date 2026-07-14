@@ -28,11 +28,20 @@ class SpecDecodeMetadata:
     # ngram), which lets the rejection sampler stay on its NO_DRAFT_PROBS
     # branch (acceptance = p_AR(v*), residual = p_AR masked excluding v*).
     draft_probs: Optional[torch.Tensor] = None
+    # [num_tokens] -- q(draft_token) for compact stochastic drafters. This
+    # avoids retaining a full [num_tokens, vocab_size] draft-probability
+    # tensor while still providing the exact acceptance ratio p(x) / q(x).
+    draft_token_probs: Optional[torch.Tensor] = None
     # [num_tokens, vocab_size] — raw drafter logits per draft position.
     # When set, downstream consumers should use these directly for
     # mix-logit (mixed = a*target + (1-a)*draft) instead of
     # softmax→log roundtripping through draft_probs.
     draft_logits: Optional[torch.Tensor] = None
+    # [num_tokens] -- logsumexp(draft_logits / draft_temperature). Together
+    # with draft_logits this reconstructs q(v) only for residual sampling.
+    draft_logsumexp: Optional[torch.Tensor] = None
+    # Temperature used to sample the compact draft distribution.
+    draft_temperature: Optional[float] = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)
