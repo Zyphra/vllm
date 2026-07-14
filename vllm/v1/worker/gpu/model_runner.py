@@ -434,6 +434,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.kv_connector.set_disabled(False)
         assert self.execute_model_state is not None
         hidden_states, input_batch, _ = self.execute_model_state
+        self.execute_model_state = None  # type: ignore
         sample_hidden_states = hidden_states[input_batch.logits_indices]
         return hidden_states, sample_hidden_states
 
@@ -774,6 +775,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.uses_mrope:
             mrope_positions = self.mrope_states.mrope_positions
             mrope_positions = mrope_positions[:, :num_tokens_after_padding]
+        routed_expert_indices = None
+        if self.model_config.enable_return_routed_experts:
+            routed_expert_indices = slot_mappings[
+                self._routed_experts_kv_group_idx, :num_tokens
+            ]
+
         return InputBatch(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -798,9 +805,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             cu_num_logits=cu_num_logits,
             cu_num_logits_np=cu_num_logits_np,
             has_structured_output_reqs=scheduler_output.has_structured_output_requests,
-            routed_expert_indices=slot_mappings[
-                self._routed_experts_kv_group_idx, :num_tokens
-            ],
+            routed_expert_indices=routed_expert_indices,
         )
 
     @torch.inference_mode()

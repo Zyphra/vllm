@@ -28,6 +28,50 @@ The 24-minute drain consumes 34% of total wall time while producing only about
 below the refill-controlled result even though both come from the same server
 run.
 
+### Drain-controlled bsz32
+
+A separate lockstep run isolates saturated bsz32 decode from the live
+workload's KV admission and terminal drain. It uses the same checkpoint,
+DSpark+Markov draft path, K16, target temperature 0.6, argmax draft, and
+thinking-on prompt mode. To match the earlier drain-controlled H100 probe, it
+uses `FULL_AND_PIECEWISE`, a 12K model limit, 0.65 GPU-memory utilization, no
+logprob or routed-expert output, and a fixed 10,000 output tokens per request.
+EOS is bypassed only for this fixed-work benchmark.
+
+The client submits 32 independent requests with seed 0. All 32 remain resident
+with no waiting, produce exactly 10,000 tokens, and finish within 0.24 seconds
+of one another.
+
+| Metric | DSpark+Markov bsz32 |
+|---|---:|
+| Output throughput | **1,848.8 tok/s** |
+| Per-request throughput | **57.78 tok/s** |
+| Mean acceptance length, including bonus | **2.787** |
+| Draft-token acceptance | 11.17% |
+| Mean request latency | 173.07 s |
+| Successful requests | 32 / 32 |
+
+This is 1.72x the live run's 1,074.2 tok/s refill-controlled rate. The live
+workload averaged only 15.74 running sequences at 94.97% KV use and carried
+much longer contexts, so its concurrency setting of 32 was not a resident
+bsz32 decode batch.
+
+The earlier `iter_0012600` drain-controlled result was 3,588.0 tok/s with mean
+acceptance 5.097 and a 45.46 ms device TF iteration. The DSpark run executes
+114,816 TF iterations across the batch; its 173.08-second end-to-end duration
+gives a conservative 48.24 ms per iteration including prefill and HTTP
+overhead. Thus iteration cost is at most about 6% higher, while acceptance is
+45% lower. The throughput difference is therefore predominantly this
+checkpoint/prompt acceptance difference, not a collapse in bsz32 kernel
+scaling.
+
+The rerun also exposed two startup defects that the live configuration had
+masked because routed-expert output was enabled: the V2 runner accessed the
+routed-expert KV-group index even when capture was disabled, and memory
+profiling left a dummy `execute_model_state` available to the first async
+sample. The branch now gates the route slot mapping and clears the consumed
+dummy state.
+
 ### Output distribution
 
 | Metric | Value |
