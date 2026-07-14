@@ -20,6 +20,7 @@ import torch
 from vllm.config import VllmConfig
 from vllm.distributed import get_tensor_model_parallel_rank
 from vllm.forward_context import get_forward_context
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,38 @@ def _get_num_experts_per_tok(hf_config) -> int:
     raise AttributeError(
         f"{type(hf_config).__name__} does not define an MoE top-k field"
     )
+
+
+def select_routed_experts_kv_group(kv_cache_groups) -> tuple[int, int]:
+    """Select a dense, token-addressable KV group for route ownership.
+
+    Hybrid models can put a recurrent/Mamba group first. Its block size can
+    be max_model_len, so ``block_id * block_size`` is sparse and cannot be
+    stored in a compact shared-memory sidecar without aliasing. Use the
+    smallest full-attention group: it is dense and retains every decoder
+    token. Live KV blocks in that group remain uniquely owned until Scheduler
+    reads routes and frees the request.
+    """
+    if not kv_cache_groups:
+        raise ValueError("routed-expert capture requires a KV cache group")
+    full_history_groups = [
+        i
+        for i, group in enumerate(kv_cache_groups)
+        if isinstance(group.kv_cache_spec, FullAttentionSpec)
+    ]
+    if not full_history_groups:
+        raise ValueError(
+            "routed-expert capture requires a full-attention KV cache group; "
+            "refusing a short-history route-key group"
+        )
+    group_idx = min(
+        full_history_groups,
+        key=lambda i: (int(kv_cache_groups[i].kv_cache_spec.block_size), i),
+    )
+    block_size = int(kv_cache_groups[group_idx].kv_cache_spec.block_size)
+    if block_size <= 0:
+        raise ValueError(f"invalid routed-expert KV block size: {block_size}")
+    return group_idx, block_size
 
 
 @contextmanager
@@ -278,8 +311,15 @@ class RoutedExpertsCapturer:
         data = self._device_buffer[:num_tokens, :, :].cpu().numpy()
         capacity = self._host_buffer_view.shape[0]
         valid_mask = indices >= 0
-        write_indices = np.remainder(indices[valid_mask], capacity)
+        write_indices = indices[valid_mask]
         data = data[valid_mask]
+
+        if write_indices.size and int(write_indices.max()) >= capacity:
+            raise RuntimeError(
+                "routed-expert write slot exceeds sidecar capacity: "
+                f"max={int(write_indices.max())} capacity={capacity}; "
+                "refusing modulo alias"
+            )
 
         with _file_lock(self._lock_file):
             self._host_buffer_view[write_indices, :, :] = data
@@ -388,8 +428,15 @@ class RoutedExpertsReader:
         if self._lock_file is None:
             raise RuntimeError("Lock file not initialized.")
 
+        indices = np.asarray(indices, dtype=np.int64)
         capacity = self._host_buffer_view.shape[0]
-        read_indices = np.remainder(indices, capacity)
+        if indices.size and (int(indices.min()) < 0 or int(indices.max()) >= capacity):
+            raise RuntimeError(
+                "routed-expert read slot is outside sidecar capacity: "
+                f"min={int(indices.min())} max={int(indices.max())} "
+                f"capacity={capacity}; refusing modulo alias"
+            )
+        read_indices = indices
 
         with _file_lock(self._lock_file, mode="rb+"):
             return self._host_buffer_view[read_indices, :, :].copy()

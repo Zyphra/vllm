@@ -30,6 +30,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStat
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsReader,
+    select_routed_experts_kv_group,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY, MultiModalRegistry
 from vllm.multimodal.encoder_budget import MultiModalBudget
@@ -280,14 +281,18 @@ class Scheduler(SchedulerInterface):
                 "enable_return_routed_experts requires at least one kv cache group"
             )
             self._routed_experts_kv_groups = kv_cache_config.kv_cache_groups
-            # Block IDs returned by the KV cache manager are absolute across DP
-            # cache space, so routed-expert replay must use the same slot space.
+            (
+                self._routed_experts_kv_group_idx,
+                self._routed_experts_block_size,
+            ) = select_routed_experts_kv_group(kv_cache_config.kv_cache_groups)
+            # Absolute block ids are unique for the lifetime of a live request.
+            # Size the sidecar in the selected dense group's address space.
             self.max_num_kv_tokens = (
                 kv_cache_config.num_blocks
                 * self.parallel_config.data_parallel_size
                 * len(kv_cache_config.kv_cache_groups)
                 + 1
-            ) * self.block_size
+            ) * self._routed_experts_block_size
 
             self.routed_experts_reader.attach_buffer(
                 max_num_kv_tokens=self.max_num_kv_tokens,
@@ -1551,21 +1556,21 @@ class Scheduler(SchedulerInterface):
             return None
 
         kv_blocks = self.kv_cache_manager.get_blocks(request.request_id)
-        block_ids = kv_blocks.get_block_ids()[0]
+        route_group_idx = self._routed_experts_kv_group_idx
+        block_ids = kv_blocks.get_block_ids()[route_group_idx]
         num_tokens = request.num_tokens - 1
 
         # compute slot mapping
         block_ids_array = np.array(block_ids, dtype=np.int32)
         num_blocks = len(block_ids)
-        # The worker saves captured routes at slot_mappings[0], i.e. KV cache
-        # GROUP 0's slot space. For hybrid models group 0 can be a Mamba/CCA
-        # group whose block_size (= max_model_len) differs from the cache
-        # config block size; using self.block_size here silently addressed a
-        # different slot space and made replayed routes garbage.
-        block_size = self.block_size
-        kv_groups = getattr(self, "_routed_experts_kv_groups", None)
-        if kv_groups:
-            block_size = int(kv_groups[0].kv_cache_spec.block_size)
+        block_size = self._routed_experts_block_size
+        covered_tokens = num_blocks * block_size
+        if covered_tokens < num_tokens:
+            raise RuntimeError(
+                "routed-expert route-key group does not retain the full "
+                f"request: covered={covered_tokens} required={num_tokens}; "
+                "refusing partial-history replay"
+            )
 
         # generate block offsets
         block_offsets = np.arange(0, block_size)
@@ -1576,10 +1581,8 @@ class Scheduler(SchedulerInterface):
             + block_ids_array.reshape((num_blocks, 1)) * block_size
         ).flatten()[:num_tokens]
 
-        # NOTE(TiDAR TF): the worker recomputes the same block-based slots
-        # from its input-batch block table before saving captured routes
-        # (slot_mappings[0] under TF is the TiDAR FA window layout, not this
-        # address space), so no window remap is needed on either side.
+        # The worker writes with the same selected group's slot mapping. Read
+        # before _free_request so no other live request can own these blocks.
         return self.routed_experts_reader.get_routed_experts(indices=slot_mapping)
 
     def _update_request_with_output(

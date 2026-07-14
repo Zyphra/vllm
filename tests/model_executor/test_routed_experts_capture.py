@@ -2,12 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import types
 
+import numpy as np
 import pytest
 import torch
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsReader,
+    select_routed_experts_kv_group,
+)
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheGroupSpec,
+)
 
 pytestmark = pytest.mark.cpu_test
 
@@ -158,3 +167,89 @@ def test_gpu_model_runner_binding_stage(monkeypatch):
     assert callable(dummy_module.router.capture_fn)
     dummy_module.router.capture_fn(torch.tensor([[9, 10]]))
     assert len(capturer.calls) == 1
+
+
+def _slots(block_ids: list[int], block_size: int, num_tokens: int) -> np.ndarray:
+    offsets = np.arange(block_size, dtype=np.int64)
+    return (
+        np.asarray(block_ids, dtype=np.int64)[:, None] * block_size + offsets
+    ).reshape(-1)[:num_tokens]
+
+
+def test_route_key_group_uses_dense_smallest_block_space():
+    def full_attention_group(block_size: int) -> KVCacheGroupSpec:
+        return KVCacheGroupSpec(
+            layer_names=[f"attention_{block_size}"],
+            kv_cache_spec=FullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float16,
+            ),
+        )
+
+    groups = [
+        types.SimpleNamespace(
+            kv_cache_spec=types.SimpleNamespace(block_size=33824)
+        ),
+        full_attention_group(64),
+        full_attention_group(32),
+    ]
+    assert select_routed_experts_kv_group(groups) == (2, 32)
+    with pytest.raises(ValueError, match="full-attention"):
+        select_routed_experts_kv_group(groups[:1])
+
+    # Distinct live requests own disjoint attention blocks until completion.
+    req_a = _slots(list(range(100, 135)), 32, 1098)
+    req_b = _slots(list(range(200, 237)), 32, 1153)
+    assert not np.intersect1d(req_a, req_b).size
+
+
+def test_sparse_group0_modulo_witness_is_rejected(tmp_path):
+    # Exact sealed-cache witness: five corrupt prompt-75 rows begin with the
+    # 34 route rows at token 1120 of a later same-server prompt-130 request.
+    # These sparse group-0 addresses differ by an exact multiple of the old
+    # compact sidecar capacity, so np.remainder silently aliases them.
+    capacity = 493_024
+    earlier_first_slot = 23 * 33_824
+    later_token_1120_slot = 125 * 33_824 + 1120
+    assert later_token_1120_slot - earlier_first_slot == 7 * capacity
+    assert earlier_first_slot % capacity == later_token_1120_slot % capacity
+
+    reader = RoutedExpertsReader()
+    reader._host_buffer_view = np.zeros((capacity, 1, 1), dtype=np.int32)
+    lock_path = tmp_path / "routes.lock"
+    lock_path.touch()
+    reader._lock_file = str(lock_path)
+
+    # The fixed reader must fail closed instead of returning another live
+    # request's routes from a wrapped index.
+    with pytest.raises(RuntimeError, match="refusing modulo alias"):
+        reader.get_routed_experts(np.asarray([later_token_1120_slot]))
+
+
+def test_dense_route_slots_survive_concurrent_request_lifetimes(tmp_path):
+    block_size = 32
+    capacity = 300 * block_size
+    req_a = _slots(list(range(10, 45)), block_size, 1098)
+    req_b = _slots(list(range(100, 137)), block_size, 1153)
+    assert int(max(req_a.max(), req_b.max())) < capacity
+
+    reader = RoutedExpertsReader()
+    reader._host_buffer_view = np.zeros((capacity, 1, 1), dtype=np.int32)
+    lock_path = tmp_path / "routes.lock"
+    lock_path.touch()
+    reader._lock_file = str(lock_path)
+    reader._host_buffer_view[req_a, 0, 0] = 7
+    reader._host_buffer_view[req_b, 0, 0] = 11
+
+    # Writing B cannot change A while both requests own disjoint live blocks.
+    routes_a = reader.get_routed_experts(req_a)
+    assert np.all(routes_a[:, 0, 0] == 7)
+    assert np.all(reader.get_routed_experts(req_b)[:, 0, 0] == 11)
+
+    # Scheduler reads and copies before freeing A. Simulated later reuse of
+    # A's blocks therefore cannot mutate the routes already returned.
+    reader._host_buffer_view[req_a, 0, 0] = 19
+    assert np.all(routes_a[:, 0, 0] == 7)
+    assert np.all(reader.get_routed_experts(req_a)[:, 0, 0] == 19)

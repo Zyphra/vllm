@@ -53,6 +53,7 @@ from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    select_routed_experts_kv_group,
 )
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding,
@@ -1820,7 +1821,10 @@ class GPUModelRunner(
         slot_mapping_gid_0 = slot_mappings[0]
 
         if self.model_config.enable_return_routed_experts:
-            self.slot_mapping = slot_mapping_gid_0[:num_tokens].cpu().numpy()
+            route_group_idx = self._routed_experts_kv_group_idx
+            self.routed_experts_slot_mapping = (
+                slot_mappings[route_group_idx][:num_tokens].cpu().numpy()
+            )
         cm_base = CommonAttentionMetadata(
             query_start_loc=self.query_start_loc.gpu[: num_reqs_padded + 1],
             query_start_loc_cpu=self.query_start_loc.cpu[: num_reqs_padded + 1],
@@ -4179,11 +4183,9 @@ class GPUModelRunner(
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
-                # slot_mappings[0] is KV cache group 0's standard slot
-                # mapping (block_id * group0_block_size + offset).
-                # Scheduler._get_routed_experts reads back with the same
-                # group-0 block ids and group-0 spec block size.
-                routed_expert_indices = self.slot_mapping
+                # Scheduler reads the same dense route-key group before
+                # releasing its request-owned KV blocks.
+                routed_expert_indices = self.routed_experts_slot_mapping
                 capturer.save_captured_experts(indices=routed_expert_indices)  # noqa
             else:
                 logger.error("RoutedExpertsCapturer not initialized.")
@@ -6828,15 +6830,18 @@ class GPUModelRunner(
             self.model_config.enable_return_routed_experts,
         )
         routed_experts_capturer = RoutedExpertsCapturer.create()
-        block_size = self.cache_config.block_size
-        # Block IDs in scheduler slot mappings use the cache manager's absolute
-        # block namespace, not a per-kv-cache-group or per-DP namespace.
+        (
+            self._routed_experts_kv_group_idx,
+            route_block_size,
+        ) = select_routed_experts_kv_group(self.kv_cache_config.kv_cache_groups)
+        # The selected dense group's absolute block ids are direct-indexed;
+        # never fold sparse group-0 slots into this buffer with modulo.
         self.max_num_kv_tokens = (
             self.kv_cache_config.num_blocks
             * self.parallel_config.data_parallel_size
             * len(self.kv_cache_config.kv_cache_groups)
             + 1
-        ) * block_size
+        ) * route_block_size
         routed_experts_capturer.init_buffer(
             max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
             max_num_kv_tokens=self.max_num_kv_tokens,
