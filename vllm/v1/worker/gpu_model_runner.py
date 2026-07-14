@@ -171,6 +171,11 @@ from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
+from vllm.v1.worker.tidar_draft_state import (
+    discard_tidar_draft_state,
+    stash_tidar_draft_state,
+    take_tidar_draft_state,
+)
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 from vllm.v1.worker.ubatch_utils import (
@@ -939,6 +944,11 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+        self._discard_tidar_draft_state(scheduler_output.finished_req_ids)
+        if scheduler_output.preempted_req_ids:
+            self._discard_tidar_draft_state(
+                scheduler_output.preempted_req_ids
+            )
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -2340,6 +2350,9 @@ class GPUModelRunner(
         # NO_DRAFT_PROBS branch. draft_logits is the parallel raw-logits
         # plumbing used by mix-logit v1.
         # === end TiDAR Block 4 =========================================
+        draft_probs, draft_logits = self._take_tidar_draft_state(
+            num_draft_tokens
+        )
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2348,59 +2361,54 @@ class GPUModelRunner(
             target_logits_indices=target_logits_indices,
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
-            draft_probs=self._gather_draft_probs(num_draft_tokens),
-            draft_logits=self._gather_draft_logits(num_draft_tokens),
+            draft_probs=draft_probs,
+            draft_logits=draft_logits,
         )
 
-    # === TiDAR Block 2: _gather_draft_probs ===========================
-    def _gather_draft_probs(
+    # === TiDAR Block 2: per-request draft distribution lifetime =======
+    def _discard_tidar_draft_state(
         self,
-        num_draft_tokens: np.ndarray,
-    ) -> torch.Tensor | None:
-        # Concatenate per-req draft_probs (stashed by the previous step's
-        # drafter call) in current input-batch order, sliced to the actual
-        # num_draft_tokens for this step. Returns None if no probs were
-        # stashed (e.g., T_Diff == 0 on TiDAR, or any non-TiDAR drafter).
-        if not self._draft_probs_by_req_id:
-            return None
-        chunks: list[torch.Tensor] = []
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            n = int(num_draft_tokens[i])
-            if n == 0:
-                continue
-            probs = self._draft_probs_by_req_id.get(req_id)
-            if probs is None:
-                return None
-            chunks.append(probs[:n])
-        if not chunks:
-            return None
-        return torch.cat(chunks, dim=0).contiguous()
-    # === end TiDAR Block 2 ============================================
+        req_ids: Iterable[str],
+    ) -> None:
+        discard_tidar_draft_state(
+            self._draft_probs_by_req_id,
+            self._draft_logits_by_req_id,
+            req_ids,
+        )
 
-    # === TiDAR Block 3: _gather_draft_logits ==========================
-    def _gather_draft_logits(
+    def _stash_tidar_draft_state(
+        self,
+        req_ids: Sequence[str],
+        num_spec_tokens: int | None,
+        draft_probs: torch.Tensor | None,
+        draft_logits: torch.Tensor | None,
+    ) -> None:
+        stash_tidar_draft_state(
+            self._draft_probs_by_req_id,
+            self._draft_logits_by_req_id,
+            req_ids,
+            num_spec_tokens,
+            draft_probs,
+            draft_logits,
+        )
+
+    def _take_tidar_draft_state(
         self,
         num_draft_tokens: np.ndarray,
-    ) -> torch.Tensor | None:
-        # Parallel to _gather_draft_probs but for raw drafter logits
-        # (pre-softmax, pre-temperature). Used by mix-logit v1 to
-        # construct mixed_logits = w*target + (1-w)*draft without
-        # depending on draft_probs (None at T_Diff == 0).
-        if not self._draft_logits_by_req_id:
-            return None
-        chunks: list[torch.Tensor] = []
-        for i, req_id in enumerate(self.input_batch.req_ids):
-            n = int(num_draft_tokens[i])
-            if n == 0:
-                continue
-            logits_i = self._draft_logits_by_req_id.get(req_id)
-            if logits_i is None:
-                return None
-            chunks.append(logits_i[:n])
-        if not chunks:
-            return None
-        return torch.cat(chunks, dim=0).contiguous()
-    # === end TiDAR Block 3 ============================================
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        require_probs = (
+            self.speculative_config is not None
+            and self.speculative_config.use_tidar()
+            and self.speculative_config.tidar_diff_temperature > 0.0
+        )
+        return take_tidar_draft_state(
+            self._draft_probs_by_req_id,
+            self._draft_logits_by_req_id,
+            self.input_batch.req_ids,
+            num_draft_tokens,
+            require_probs=require_probs,
+        )
+    # === end TiDAR Block 2 ============================================
 
     # === TiDAR Block 11: commit CCA spec-decode state =================
     def _commit_tidar_cca_state(
@@ -4643,10 +4651,12 @@ class GPUModelRunner(
                             hidden_states=hidden_states,
                             num_accepted_per_req=num_accepted_per_req,
                         ))
-                    # SF path does not populate last_draft_probs/logits;
-                    # clear the stash so next step uses NO_DRAFT_PROBS.
-                    self._draft_probs_by_req_id.clear()
-                    self._draft_logits_by_req_id.clear()
+                    # SF path does not populate last_draft_probs/logits.
+                    # Discard only this proposal batch; requests delayed by
+                    # the scheduler still own their previous proposal state.
+                    self._discard_tidar_draft_state(
+                        self.input_batch.req_ids
+                    )
                     return draft_token_ids
             # === end TiDAR Block 6 ======================================
 
@@ -4760,26 +4770,21 @@ class GPUModelRunner(
             )
 
             # === TiDAR Block 7: stash drafter outputs for next-step ====
-            # Reassembled in input-batch order by _gather_draft_probs /
-            # _gather_draft_logits on the next spec_decode_metadata build.
-            # Cleared each step so old entries can't leak.
+            # Reassembled in input-batch order by _take_tidar_draft_state on
+            # the next spec_decode_metadata build. Replace only requests in
+            # this proposal batch; budget-delayed requests retain the q/logit
+            # state associated with their still-pending draft IDs.
             if spec_config.use_tidar():
-                self._draft_probs_by_req_id.clear()
-                self._draft_logits_by_req_id.clear()
                 tidar_drafter = self.drafter
                 num_spec = spec_config.num_speculative_tokens
                 last_probs = getattr(tidar_drafter, "last_draft_probs", None)
-                if last_probs is not None and num_spec is not None:
-                    per_req = last_probs.view(-1, num_spec, last_probs.shape[-1])
-                    for i, req_id in enumerate(self.input_batch.req_ids):
-                        if i < per_req.shape[0]:
-                            self._draft_probs_by_req_id[req_id] = per_req[i]
                 last_logits = getattr(tidar_drafter, "last_draft_logits", None)
-                if last_logits is not None and num_spec is not None:
-                    per_req_l = last_logits.view(-1, num_spec, last_logits.shape[-1])
-                    for i, req_id in enumerate(self.input_batch.req_ids):
-                        if i < per_req_l.shape[0]:
-                            self._draft_logits_by_req_id[req_id] = per_req_l[i]
+                self._stash_tidar_draft_state(
+                    self.input_batch.req_ids,
+                    num_spec,
+                    last_probs,
+                    last_logits,
+                )
             # === end TiDAR Block 7 =====================================
 
         return draft_token_ids

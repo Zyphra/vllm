@@ -41,6 +41,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import RoutedExpertsCapturer
+from vllm.utils.dspark import validate_dspark_load_format
 
 from .interfaces import HasInnerState, IsHybrid, MixtureOfExperts
 from .utils import (make_empty_intermediate_tensors_factory, maybe_prefix)
@@ -1113,6 +1114,12 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
         self.vllm_config = vllm_config
         self.quant_config = vllm_config.quant_config
         self.model_config = vllm_config.model_config
+        self.dspark_markov_enabled = bool(
+            getattr(config, "dspark_markov_draft_head", False))
+        validate_dspark_load_format(
+            self.dspark_markov_enabled,
+            vllm_config.load_config.load_format,
+        )
         if config.smoe_use_mod and getattr(config, "ignore_mod_in_smoe_block", False):
             logger.warning(
                 "[SMoE]: WARNING! SMoE is using MoD but ignoring it in SMoE blocks! "
@@ -1179,8 +1186,6 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
         # path picks them up. Consumed by TiDARProposer's DSpark branch
         # (vllm/v1/spec_decode/tidar.py); the AR lm_head above remains the
         # verifier/target head.
-        self.dspark_markov_enabled = bool(
-            getattr(config, "dspark_markov_draft_head", False))
         if self.dspark_markov_enabled:
             if get_tensor_model_parallel_world_size() > 1:
                 raise NotImplementedError(
