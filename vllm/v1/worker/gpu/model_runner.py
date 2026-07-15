@@ -1483,7 +1483,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # CCA metadata remain dynamic while surrounding compiled model
             # partitions are captured and replayed.
             fallback_cudagraph_mode = (
-                self.cudagraph_manager.get_non_full_runtime_mode()
+                self.cudagraph_manager.get_non_full_runtime_mode(
+                    model_dummy_run=model_dummy_run,
+                    has_spec_decode_tokens=bool(
+                        scheduler_output.scheduled_spec_decode_tokens),
+                )
             )
             positions = input_batch.positions
             if self.uses_mrope:

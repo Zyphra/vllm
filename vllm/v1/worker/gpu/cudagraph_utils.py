@@ -69,14 +69,23 @@ class CudaGraphManager:
         self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
 
-    def get_non_full_runtime_mode(self) -> CUDAGraphMode:
+    def get_non_full_runtime_mode(
+        self,
+        *,
+        model_dummy_run: bool = False,
+        has_spec_decode_tokens: bool = False,
+    ) -> CUDAGraphMode:
         """Select the safe runtime mode when a full graph is unavailable.
 
         Geometry-keyed verifier batches use full graphs when available.
-        Prefill, mixed batches, and verifier configurations excluded from
-        full capture can still graph compiler partitions around dynamic
-        attention and CCA metadata.
+        Partial verifier configurations excluded from full capture can still
+        graph compiler partitions around dynamic attention and CCA metadata.
+        Prompt prefills and model dummy runs stay eager.
         """
+        # Piecewise graphs are lazily captured. Dummy/profile and prompt
+        # prefill runs occur on the default stream, where capture is illegal.
+        if model_dummy_run or not has_spec_decode_tokens:
+            return CUDAGraphMode.NONE
         if self.cudagraph_mode.has_piecewise_cudagraphs():
             return CUDAGraphMode.PIECEWISE
         return CUDAGraphMode.NONE
