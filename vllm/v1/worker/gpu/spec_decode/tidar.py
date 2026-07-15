@@ -100,6 +100,9 @@ class TiDARSpeculator:
         self.draft_logits_cache: torch.Tensor | None = None
         self.draft_token_probs_cache: torch.Tensor | None = None
         self.draft_logsumexp_cache: torch.Tensor | None = None
+        self._draft_logits_by_req: torch.Tensor | None = None
+        self._draft_token_probs_by_req: torch.Tensor | None = None
+        self._draft_logsumexp_by_req: torch.Tensor | None = None
         self.draft_batch_index_cache = torch.full(
             (self.max_num_reqs,),
             -1,
@@ -337,6 +340,7 @@ class TiDARSpeculator:
         self,
         idx_mapping: torch.Tensor,
         batch_size: int,
+        preserve_existing: bool = False,
     ) -> None:
         if self.last_draft_token_probs is None:
             return
@@ -344,20 +348,82 @@ class TiDARSpeculator:
         assert self.last_draft_logsumexp is not None
         K = self.num_speculative_steps
         state_indices = idx_mapping[:batch_size].to(torch.long)
+        current_logits = self.last_draft_logits.view(batch_size, K, -1)
+        current_token_probs = self.last_draft_token_probs.view(batch_size, K)
+        current_logsumexp = self.last_draft_logsumexp.view(batch_size, K)
+
+        old_logits = getattr(self, "draft_logits_cache", None)
+        old_token_probs = getattr(self, "draft_token_probs_cache", None)
+        old_logsumexp = getattr(self, "draft_logsumexp_cache", None)
+        if preserve_existing and old_logits is not None:
+            assert old_token_probs is not None
+            assert old_logsumexp is not None
+            if getattr(self, "_draft_logits_by_req", None) is None:
+                self._draft_logits_by_req = torch.empty(
+                    (self.max_num_reqs, K, current_logits.shape[-1]),
+                    dtype=current_logits.dtype,
+                    device=current_logits.device,
+                )
+                self._draft_token_probs_by_req = torch.empty(
+                    (self.max_num_reqs, K),
+                    dtype=current_token_probs.dtype,
+                    device=current_token_probs.device,
+                )
+                self._draft_logsumexp_by_req = torch.empty(
+                    (self.max_num_reqs, K),
+                    dtype=current_logsumexp.dtype,
+                    device=current_logsumexp.device,
+                )
+            assert self._draft_token_probs_by_req is not None
+            assert self._draft_logsumexp_by_req is not None
+
+            if old_logits is not self._draft_logits_by_req:
+                old_rows = self.draft_batch_index_cache.clamp(
+                    min=0, max=old_logits.shape[0] - 1
+                )
+                self._draft_logits_by_req.copy_(
+                    old_logits.index_select(0, old_rows)
+                )
+                self._draft_token_probs_by_req.copy_(
+                    old_token_probs.index_select(0, old_rows)
+                )
+                self._draft_logsumexp_by_req.copy_(
+                    old_logsumexp.index_select(0, old_rows)
+                )
+
+            self._draft_logits_by_req.index_copy_(
+                0, state_indices, current_logits
+            )
+            self._draft_token_probs_by_req.index_copy_(
+                0, state_indices, current_token_probs
+            )
+            self._draft_logsumexp_by_req.index_copy_(
+                0, state_indices, current_logsumexp
+            )
+            torch.arange(
+                self.max_num_reqs,
+                dtype=torch.int64,
+                device=state_indices.device,
+                out=self.draft_batch_index_cache,
+            )
+            self.draft_logits_cache = self._draft_logits_by_req
+            self.draft_token_probs_cache = self._draft_token_probs_by_req
+            self.draft_logsumexp_cache = self._draft_logsumexp_by_req
+            return
+
         batch_indices = torch.arange(
             batch_size, dtype=torch.int64, device=state_indices.device
         )
+        self.draft_batch_index_cache.fill_(-1)
         self.draft_batch_index_cache.index_copy_(
             0, state_indices, batch_indices
         )
         # Verification runs before the next proposal on the same stream, so
         # keeping these tensors in proposal-batch order avoids a full-vocabulary
         # copy while the stable request map preserves scheduler reordering.
-        self.draft_logits_cache = self.last_draft_logits.view(batch_size, K, -1)
-        self.draft_token_probs_cache = self.last_draft_token_probs.view(
-            batch_size, K
-        )
-        self.draft_logsumexp_cache = self.last_draft_logsumexp.view(batch_size, K)
+        self.draft_logits_cache = current_logits
+        self.draft_token_probs_cache = current_token_probs
+        self.draft_logsumexp_cache = current_logsumexp
 
     def set_attn(
         self,
@@ -625,6 +691,7 @@ class TiDARSpeculator:
         temperature: torch.Tensor,
         seeds: torch.Tensor,
         num_tokens_across_dp: torch.Tensor | None = None,
+        preserve_cached_drafts: bool = False,
     ) -> torch.Tensor:
         del last_hidden_states, aux_hidden_states, next_prefill_tokens
         del temperature
@@ -714,7 +781,11 @@ class TiDARSpeculator:
                 prev_token=next_token_ids,
                 sampling_seeds=sampling_seeds,
             )
-            self._cache_compact_draft_state(idx_mapping, num_reqs)
+            self._cache_compact_draft_state(
+                idx_mapping,
+                num_reqs,
+                preserve_existing=preserve_cached_drafts,
+            )
             self.draft_tokens[:num_reqs].copy_(
                 draft_token_ids.view(num_reqs, K)
             )

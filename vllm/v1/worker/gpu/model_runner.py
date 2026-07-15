@@ -1337,6 +1337,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.sampler.sampling_states.temperature.gpu,
             self.sampler.sampling_states.seeds.gpu,
             draft_num_tokens_across_dp,
+            preserve_cached_drafts=(
+                len(self.req_states.req_id_to_index) > input_batch.num_reqs
+            ),
         )
         if draft_num_tokens_across_dp is not None:
             self._tidar_draft_coordinate_ran = True

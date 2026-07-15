@@ -132,3 +132,50 @@ def test_compact_draft_state_stays_in_batch_order() -> None:
         speculator.draft_logsumexp_cache,
         speculator.last_draft_logsumexp.view(2, 2),
     )
+
+
+def test_partial_draft_state_preserves_other_request_rows() -> None:
+    speculator = object.__new__(TiDARSpeculator)
+    speculator.num_speculative_steps = 2
+    speculator.max_num_reqs = 4
+    speculator.draft_batch_index_cache = torch.full(
+        (4,), -1, dtype=torch.int64
+    )
+    speculator._draft_logits_by_req = None
+    speculator._draft_token_probs_by_req = None
+    speculator._draft_logsumexp_by_req = None
+
+    speculator.last_draft_logits = torch.arange(24).view(4, 6)
+    speculator.last_draft_token_probs = torch.arange(4, dtype=torch.float32)
+    speculator.last_draft_logsumexp = torch.arange(4, dtype=torch.float32) + 10
+    speculator.draft_logits_cache = None
+    speculator.draft_token_probs_cache = None
+    speculator.draft_logsumexp_cache = None
+    speculator._cache_compact_draft_state(
+        torch.tensor([2, 0], dtype=torch.int64), batch_size=2
+    )
+    old_req_2_logits = speculator.draft_logits_cache[0].clone()
+    old_req_0_logits = speculator.draft_logits_cache[1].clone()
+
+    speculator.last_draft_logits = torch.arange(12).view(2, 6) + 100
+    speculator.last_draft_token_probs = torch.tensor([20.0, 21.0])
+    speculator.last_draft_logsumexp = torch.tensor([30.0, 31.0])
+    speculator._cache_compact_draft_state(
+        torch.tensor([1], dtype=torch.int64),
+        batch_size=1,
+        preserve_existing=True,
+    )
+
+    assert speculator.draft_batch_index_cache.tolist() == [0, 1, 2, 3]
+    assert torch.equal(speculator.draft_logits_cache[2], old_req_2_logits)
+    assert torch.equal(speculator.draft_logits_cache[0], old_req_0_logits)
+    assert torch.equal(
+        speculator.draft_logits_cache[1],
+        speculator.last_draft_logits.view(1, 2, 6)[0],
+    )
+    assert torch.equal(
+        speculator.draft_token_probs_cache[1], torch.tensor([20.0, 21.0])
+    )
+    assert torch.equal(
+        speculator.draft_logsumexp_cache[1], torch.tensor([30.0, 31.0])
+    )

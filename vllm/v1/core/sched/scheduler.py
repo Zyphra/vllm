@@ -182,12 +182,32 @@ class Scheduler(SchedulerInterface):
                     "VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING=1; got "
                     f"{self.tidar_decode_first_refill_min_running}"
                 )
+        wave_refill_env = os.environ.get(
+            "VLLM_TIDAR_PREFILL_WAVE_REFILL",
+            "1" if self.tidar_require_prefill_verify_segregation else "0",
+        )
+        self.tidar_prefill_wave_refill = (
+            wave_refill_env == "1" and self.tidar_decode_first_refill
+        )
+        if (
+            self.tidar_prefill_wave_refill
+            and not self.tidar_require_prefill_verify_segregation
+        ):
+            raise ValueError(
+                "VLLM_TIDAR_PREFILL_WAVE_REFILL=1 requires "
+                "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION=1"
+            )
         if self.tidar_decode_first_refill:
             logger.info(
                 "TiDAR decode-first refill scheduling is enabled; waiting "
                 "prefills will not be mixed into scheduled decode steps "
                 "with at least %d running requests.",
                 self.tidar_decode_first_refill_min_running,
+            )
+        if self.tidar_prefill_wave_refill:
+            logger.info(
+                "TiDAR prefill-only wave refill is enabled; warm verifier "
+                "requests pause while waiting prompts are admitted."
             )
         self.enable_kv_cache_events = (
             self.kv_events_config is not None
@@ -416,6 +436,23 @@ class Scheduler(SchedulerInterface):
                 pass
         return num_new_tokens
 
+    @staticmethod
+    def _is_tidar_verify_request(request: Request) -> bool:
+        return not request.is_prefill_chunk and (
+            request.num_output_tokens > 0
+            or request.num_output_placeholders > 0
+            or bool(request.spec_token_ids)
+        )
+
+    @staticmethod
+    def _is_tidar_prefill_request(request: Request) -> bool:
+        return request.is_prefill_chunk or (
+            request.num_computed_tokens < request.num_prompt_tokens
+            and request.num_output_tokens == 0
+            and request.num_output_placeholders == 0
+            and not request.spec_token_ids
+        )
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -442,22 +479,24 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
-        # A prompt that was admitted in an earlier chunk is already in the
-        # RUNNING queue, so the waiting-queue gate below cannot protect it.
-        # When any warm TiDAR verifier is live, leave those prompt chunks
-        # untouched for this iteration; they resume after the verifier wave
-        # drains. This check happens before token/KV/encoder accounting.
         has_running_tidar_verify = (
             self.tidar_decode_first_refill
-            and any(
-                not request.is_prefill_chunk
-                and (
-                    request.num_output_tokens > 0
-                    or request.num_output_placeholders > 0
-                    or bool(request.spec_token_ids)
-                )
-                for request in self.running
-            )
+            and any(self._is_tidar_verify_request(req) for req in self.running)
+        )
+        has_running_tidar_prefill = (
+            self.tidar_decode_first_refill
+            and any(self._is_tidar_prefill_request(req) for req in self.running)
+        )
+        can_admit_tidar_refill = (
+            self.tidar_prefill_wave_refill
+            and bool(self.waiting)
+            and len(self.running) < self.max_num_running_reqs
+        )
+        # A TiDAR target step must never mix prompt rows with verifier rows.
+        # Pause the warm wave for a prefill-only iteration whenever prompt
+        # chunks are already running or free slots can admit waiting prompts.
+        tidar_prefill_only_step = has_running_tidar_verify and (
+            has_running_tidar_prefill or can_admit_tidar_refill
         )
 
         # For logging.
@@ -468,20 +507,14 @@ class Scheduler(SchedulerInterface):
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
 
-            if (
-                has_running_tidar_verify
-                and (
-                    request.is_prefill_chunk
-                    or (
-                        request.num_computed_tokens < request.num_prompt_tokens
-                        and request.num_output_tokens == 0
-                        and request.num_output_placeholders == 0
-                        and not request.spec_token_ids
-                    )
-                )
-            ):
-                req_index += 1
-                continue
+            if has_running_tidar_verify:
+                if tidar_prefill_only_step:
+                    if self._is_tidar_verify_request(request):
+                        req_index += 1
+                        continue
+                elif self._is_tidar_prefill_request(request):
+                    req_index += 1
+                    continue
 
             if (
                 request.num_output_placeholders > 0
@@ -663,12 +696,8 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         tidar_decode_running_reqs = (
             sum(
-                not req.is_prefill_chunk
-                and (
-                    req.num_output_tokens > 0
-                    or req.num_output_placeholders > 0
-                    or req.request_id in scheduled_spec_decode_tokens
-                )
+                self._is_tidar_verify_request(req)
+                or req.request_id in scheduled_spec_decode_tokens
                 for req in scheduled_running_reqs
             )
             if self.tidar_decode_first_refill
@@ -963,13 +992,7 @@ class Scheduler(SchedulerInterface):
             mixed_prompt_ids.extend(
                 request.request_id
                 for request in scheduled_running_reqs
-                if request.is_prefill_chunk
-                or (
-                    request.num_computed_tokens < request.num_prompt_tokens
-                    and request.num_output_tokens == 0
-                    and request.num_output_placeholders == 0
-                    and not request.spec_token_ids
-                )
+                if self._is_tidar_prefill_request(request)
             )
             if mixed_prompt_ids:
                 raise RuntimeError(

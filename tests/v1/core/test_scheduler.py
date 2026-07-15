@@ -908,7 +908,7 @@ def _prepare_warm_spec_request_with_waiter(scheduler: Scheduler):
     return warm, waiting
 
 
-def test_v2_tidar_default_segregates_waiting_prefill_from_verify(
+def test_v2_tidar_default_refills_waiting_prompt_without_verify(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
@@ -917,6 +917,7 @@ def test_v2_tidar_default_segregates_waiting_prefill_from_verify(
     monkeypatch.delenv(
         "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", raising=False
     )
+    monkeypatch.delenv("VLLM_TIDAR_PREFILL_WAVE_REFILL", raising=False)
     scheduler = create_scheduler(
         max_num_seqs=2,
         num_speculative_tokens=3,
@@ -927,9 +928,36 @@ def test_v2_tidar_default_segregates_waiting_prefill_from_verify(
 
     assert scheduler.tidar_decode_first_refill is True
     assert scheduler.tidar_require_prefill_verify_segregation is True
+    assert scheduler.tidar_prefill_wave_refill is True
+    assert warm.request_id not in output.num_scheduled_tokens
+    assert not output.scheduled_spec_decode_tokens
+    assert output.num_scheduled_tokens == {waiting.request_id: 1}
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        waiting.request_id
+    ]
+
+
+def test_v2_tidar_wave_refill_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(SpeculativeConfig, "use_tidar", lambda self: True)
+    monkeypatch.delenv("VLLM_TIDAR_DECODE_FIRST_REFILL", raising=False)
+    monkeypatch.delenv(
+        "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", raising=False
+    )
+    monkeypatch.setenv("VLLM_TIDAR_PREFILL_WAVE_REFILL", "0")
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        num_speculative_tokens=3,
+    )
+    warm, waiting = _prepare_warm_spec_request_with_waiter(scheduler)
+
+    output = scheduler.schedule()
+
+    assert scheduler.tidar_prefill_wave_refill is False
     assert warm.request_id in output.scheduled_spec_decode_tokens
     assert waiting.request_id not in output.num_scheduled_tokens
-    assert [req.request_id for req in scheduler.waiting] == [waiting.request_id]
 
 
 def test_v2_tidar_explicit_opt_out_retains_mixed_scheduling(
@@ -955,7 +983,7 @@ def test_v2_tidar_explicit_opt_out_retains_mixed_scheduling(
     ]
 
 
-def test_v2_tidar_omits_running_prompt_chunk_while_verify_is_warm(
+def test_v2_tidar_pauses_verify_to_finish_running_prompt_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
@@ -1005,11 +1033,12 @@ def test_v2_tidar_omits_running_prompt_chunk_while_verify_is_warm(
 
     output = scheduler.schedule()
 
-    assert warm.request_id in output.scheduled_spec_decode_tokens
-    assert long_prompt.request_id not in output.num_scheduled_tokens
+    assert warm.request_id not in output.num_scheduled_tokens
+    assert not output.scheduled_spec_decode_tokens
+    assert output.num_scheduled_tokens == {long_prompt.request_id: 31}
 
 
-def test_v2_tidar_paused_prompt_chunk_resumes_after_verify_drains(
+def test_v2_tidar_verify_resumes_after_prefill_only_chunk_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
@@ -1050,17 +1079,30 @@ def test_v2_tidar_paused_prompt_chunk_resumes_after_verify_drains(
     scheduler.update_draft_token_ids(
         DraftTokenIds([warm.request_id], [[1, 2, 3]])
     )
-    segregated = scheduler.schedule()
-    assert long_prompt.request_id not in segregated.num_scheduled_tokens
-
-    scheduler.finish_requests(
-        warm.request_id,
-        RequestStatus.FINISHED_ABORTED,
+    prefill_only = scheduler.schedule()
+    assert prefill_only.num_scheduled_tokens == {long_prompt.request_id: 31}
+    assert not prefill_only.scheduled_spec_decode_tokens
+    scheduler.update_from_output(
+        prefill_only,
+        ModelRunnerOutput(
+            req_ids=[long_prompt.request_id],
+            req_id_to_index={long_prompt.request_id: 0},
+            sampled_token_ids=[[42]],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[],
+        ),
     )
-    resumed = scheduler.schedule()
+    scheduler.update_draft_token_ids(
+        DraftTokenIds([long_prompt.request_id], [[4, 5, 6]])
+    )
 
-    assert long_prompt.request_id in resumed.num_scheduled_tokens
-    assert resumed.num_scheduled_tokens[long_prompt.request_id] > 0
+    resumed_verify = scheduler.schedule()
+
+    assert set(resumed_verify.scheduled_spec_decode_tokens) == {
+        warm.request_id,
+        long_prompt.request_id,
+    }
 
 
 def test_v2_tidar_default_segregation_supports_async_scheduling(
@@ -1081,8 +1123,9 @@ def test_v2_tidar_default_segregation_supports_async_scheduling(
 
     output = scheduler.schedule()
 
-    assert warm.request_id in output.scheduled_spec_decode_tokens
-    assert waiting.request_id not in output.num_scheduled_tokens
+    assert warm.request_id not in output.num_scheduled_tokens
+    assert not output.scheduled_spec_decode_tokens
+    assert output.num_scheduled_tokens == {waiting.request_id: 1}
 
 
 def test_non_v2_tidar_keeps_decode_first_default_off(
@@ -1099,6 +1142,7 @@ def test_non_v2_tidar_keeps_decode_first_default_off(
 
     assert scheduler.tidar_decode_first_refill is False
     assert scheduler.tidar_require_prefill_verify_segregation is False
+    assert scheduler.tidar_prefill_wave_refill is False
 
 
 def test_v2_tidar_strict_segregation_rejects_disabled_barrier(
@@ -1123,6 +1167,19 @@ def test_v2_tidar_strict_segregation_requires_first_warm_request(
     monkeypatch.setenv("VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", "1")
 
     with pytest.raises(ValueError, match="MIN_RUNNING=1"):
+        create_scheduler(num_speculative_tokens=3)
+
+
+def test_v2_tidar_wave_refill_requires_strict_segregation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(SpeculativeConfig, "use_tidar", lambda self: True)
+    monkeypatch.setenv("VLLM_TIDAR_DECODE_FIRST_REFILL", "1")
+    monkeypatch.setenv("VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", "0")
+    monkeypatch.setenv("VLLM_TIDAR_PREFILL_WAVE_REFILL", "1")
+
+    with pytest.raises(ValueError, match="requires.*SEGREGATION=1"):
         create_scheduler(num_speculative_tokens=3)
 
 
