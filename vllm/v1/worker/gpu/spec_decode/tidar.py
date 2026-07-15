@@ -24,7 +24,7 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.utils.dspark import (
-    validate_dspark_target_contract,
+    enforce_dspark_target_contract,
     validate_tidar_temperature_contract,
 )
 
@@ -143,17 +143,16 @@ class TiDARSpeculator:
 
     def load_model(self, target_model: nn.Module) -> None:
         self.model = target_model
-        if (
-            self._dspark_active()
-            and os.environ.get(
-                "VLLM_TIDAR_REQUIRE_AR_VERIFIER_CONTRACT", "0"
-            ).lower()
-            in {"1", "true", "yes", "on"}
-        ):
-            validate_dspark_target_contract(
-                target_model,
-                retained_target_model=self.model,
-            )
+        require_ar_verifier_contract = os.environ.get(
+            "VLLM_TIDAR_REQUIRE_AR_VERIFIER_CONTRACT", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        enforce_dspark_target_contract(
+            target_model,
+            retained_target_model=self.model,
+            dspark_active=self._dspark_active(),
+            required=require_ar_verifier_contract,
+        )
+        if require_ar_verifier_contract:
             logger.info(
                 "Validated TiDAR AR-verifier contract: shared target "
                 "backbone, regular tied lm_head, and distinct frozen "

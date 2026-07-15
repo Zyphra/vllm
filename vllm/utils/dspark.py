@@ -179,3 +179,25 @@ def validate_dspark_target_contract(
             f"shapes w1={tuple(markov_w1.shape)} "
             f"w2={tuple(markov_w2.shape)} vocab_size={vocab_size}."
         )
+
+
+def enforce_dspark_target_contract(
+    target_model: Any,
+    *,
+    retained_target_model: Any | None = None,
+    dspark_active: bool,
+    required: bool,
+) -> None:
+    """Fail closed when the live TiDAR run requires the DSpark contract."""
+    if not required:
+        return
+    if not dspark_active:
+        raise RuntimeError(
+            "TiDAR AR-verifier contract failed: "
+            "VLLM_TIDAR_REQUIRE_AR_VERIFIER_CONTRACT=1 requires the loaded "
+            "target checkpoint to activate the DSpark/Markov draft heads."
+        )
+    validate_dspark_target_contract(
+        target_model,
+        retained_target_model=retained_target_model,
+    )

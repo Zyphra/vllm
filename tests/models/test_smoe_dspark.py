@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from vllm.utils.dspark import (
+    enforce_dspark_target_contract,
     validate_dspark_load_format,
     validate_dspark_target_contract,
     validate_tidar_temperature_contract,
@@ -118,6 +119,29 @@ def test_dspark_target_contract_rejects_draft_verifier_head() -> None:
 
     with pytest.raises(RuntimeError, match="target compute_logits must"):
         validate_dspark_target_contract(target)
+
+
+def test_required_dspark_target_contract_validates_active_target() -> None:
+    target = _contract_target()
+
+    enforce_dspark_target_contract(
+        target,
+        retained_target_model=target,
+        dspark_active=True,
+        required=True,
+    )
+
+
+def test_required_dspark_target_contract_rejects_inactive_dspark() -> None:
+    target = _contract_target()
+
+    with pytest.raises(RuntimeError, match="requires the loaded target checkpoint"):
+        enforce_dspark_target_contract(
+            target,
+            retained_target_model=target,
+            dspark_active=False,
+            required=True,
+        )
 
 
 def test_tidar_temperature_contract_accepts_one_shared_temperature() -> None:
