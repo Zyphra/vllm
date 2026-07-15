@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any
 
 import numpy as np
@@ -21,6 +23,17 @@ from vllm.v1.worker.gpu.attn_utils import (
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.dp_utils import make_num_tokens_across_dp
 from vllm.v1.worker.gpu.input_batch import InputBuffers
+
+
+class CudaGraphBatchType(IntEnum):
+    DEFAULT = 0
+    TIDAR_VERIFY = 1
+
+
+@dataclass(frozen=True)
+class CudaGraphKey:
+    num_tokens: int
+    batch_type: CudaGraphBatchType = CudaGraphBatchType.DEFAULT
 
 
 class CudaGraphManager:
@@ -51,38 +64,37 @@ class CudaGraphManager:
                 speculative_config, "num_speculative_tokens", None)
             if num_spec_tokens is not None:
                 self._tidar_tokens_per_verify_req = int(num_spec_tokens) + 1
-                # The main target graph key is only the padded token count.
-                # It cannot distinguish N one-token decodes from M TiDAR
-                # verifier rows, and DP padding can promote one rank to a
-                # graph captured with the other geometry. Keep the target
-                # graph manager decode-only. TiDARSpeculator owns a separate
-                # graph manager, so draft graphs remain enabled.
-                self.cudagraph_sizes = {
-                    tokens: size
-                    for tokens, size in self.cudagraph_sizes.items()
-                    if size <= self.max_num_reqs
-                }
 
-        self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.graphs: dict[CudaGraphKey, torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
 
     def needs_capture(self) -> bool:
-        return len(self.cudagraph_sizes) > 0
+        return bool(self._get_capture_keys())
 
-    def get_cudagraph_size(
+    def get_cudagraph_key(
         self,
         num_tokens_after_padding: int,
         num_tokens_per_request: Iterable[int],
-    ) -> int | None:
+    ) -> CudaGraphKey | None:
         num_tokens_per_request = list(num_tokens_per_request)
         tidar_verify_len = self._tidar_tokens_per_verify_req
         if tidar_verify_len is not None:
-            if any(x != 1 for x in num_tokens_per_request):
-                # Target verifier/prefill batches stay eager until graph keys
-                # carry request geometry across every DP rank. Decode graphs
-                # and the speculator's independent draft graphs remain live.
+            decode_only = all(x == 1 for x in num_tokens_per_request)
+            verify_only = all(
+                x == tidar_verify_len for x in num_tokens_per_request)
+            if not decode_only and not verify_only:
                 return None
+            if verify_only:
+                # DP padding currently carries token counts, not synthetic
+                # verifier request rows. Keep that configuration eager until
+                # its cross-rank metadata includes request geometry.
+                if self.dp_size > 1:
+                    return None
+                size = self.cudagraph_sizes.get(num_tokens_after_padding)
+                if size != num_tokens_after_padding:
+                    return None
+                return CudaGraphKey(size, CudaGraphBatchType.TIDAR_VERIFY)
 
         size = get_cudagraph_size(
             num_tokens_after_padding,
@@ -90,14 +102,64 @@ class CudaGraphManager:
             self.cudagraph_sizes,
             self.cudagraph_mode,
         )
-        return size
+        if size is None:
+            return None
+        if tidar_verify_len is not None and size > self.max_num_reqs:
+            # Decode batches cannot replay a verifier graph. Their padded
+            # size never exceeds max_num_reqs, but retain this guard for
+            # explicitly configured capture-size lists.
+            return None
+        return CudaGraphKey(size)
 
-    def _get_num_reqs_for_capture(self, num_tokens: int) -> int:
-        return min(num_tokens, self.max_num_reqs)
+    def get_cudagraph_size(
+        self,
+        num_tokens_after_padding: int,
+        num_tokens_per_request: Iterable[int],
+    ) -> int | None:
+        key = self.get_cudagraph_key(
+            num_tokens_after_padding, num_tokens_per_request)
+        return None if key is None else key.num_tokens
+
+    def get_padded_cudagraph_key(
+        self,
+        num_tokens_after_padding: int,
+        selected_key: CudaGraphKey | None,
+    ) -> CudaGraphKey:
+        batch_type = (
+            CudaGraphBatchType.DEFAULT
+            if selected_key is None else selected_key.batch_type
+        )
+        return CudaGraphKey(num_tokens_after_padding, batch_type)
+
+    def _get_capture_keys(self) -> set[CudaGraphKey]:
+        sizes = set(self.cudagraph_sizes.values())
+        tidar_verify_len = self._tidar_tokens_per_verify_req
+        if tidar_verify_len is None:
+            return {CudaGraphKey(size) for size in sizes}
+
+        keys = {
+            CudaGraphKey(size)
+            for size in sizes
+            if size <= self.max_num_reqs
+        }
+        if self.dp_size == 1:
+            keys.update(
+                CudaGraphKey(size, CudaGraphBatchType.TIDAR_VERIFY)
+                for size in sizes
+                if size % tidar_verify_len == 0
+                and 0 < size // tidar_verify_len <= self.max_num_reqs
+            )
+        return keys
+
+    def _get_num_reqs_for_capture(self, key: CudaGraphKey) -> int:
+        if key.batch_type == CudaGraphBatchType.TIDAR_VERIFY:
+            assert self._tidar_tokens_per_verify_req is not None
+            return key.num_tokens // self._tidar_tokens_per_verify_req
+        return min(key.num_tokens, self.max_num_reqs)
 
     def capture_graph(
         self,
-        num_tokens: int,
+        key: CudaGraphKey,
         model: nn.Module,
         input_buffers: InputBuffers,
         mrope_positions: torch.Tensor | None,
@@ -106,7 +168,8 @@ class CudaGraphManager:
         attn_metadata_builders: list[AttentionMetadataBuilder],
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        num_reqs = self._get_num_reqs_for_capture(num_tokens)
+        num_tokens = key.num_tokens
+        num_reqs = self._get_num_reqs_for_capture(key)
         input_ids = input_buffers.input_ids[:num_tokens]
         positions = input_buffers.positions[:num_tokens]
         if self.uses_mrope:
@@ -143,7 +206,7 @@ class CudaGraphManager:
                 self.hidden_states = torch.empty_like(hidden_states)
 
         # Capture the graph.
-        assert num_tokens not in self.graphs
+        assert key not in self.graphs
         graph = torch.cuda.CUDAGraph()
         with (
             set_forward_context(
@@ -162,7 +225,7 @@ class CudaGraphManager:
                 inputs_embeds=inputs_embeds,
             )
             self.hidden_states[:num_tokens] = hidden_states
-        self.graphs[num_tokens] = graph
+        self.graphs[key] = graph
 
     @torch.inference_mode()
     def capture(
@@ -175,24 +238,33 @@ class CudaGraphManager:
         attn_metadata_builders: list[AttentionMetadataBuilder],
         kv_cache_config: KVCacheConfig,
     ) -> None:
-        capture_graphs(
-            self.cudagraph_sizes,
-            self.device,
-            self.capture_graph,
-            model=model,
-            input_buffers=input_buffers,
-            mrope_positions=mrope_positions,
-            inputs_embeds=inputs_embeds,
-            block_tables=block_tables,
-            attn_metadata_builders=attn_metadata_builders,
-            kv_cache_config=kv_cache_config,
+        keys_to_capture = sorted(
+            self._get_capture_keys(),
+            key=lambda key: (key.num_tokens, key.batch_type),
+            reverse=True,
         )
+        if is_global_first_rank():
+            keys_to_capture = tqdm(
+                keys_to_capture, desc="Capturing CUDA graphs")
 
-    def run(self, num_tokens: int) -> torch.Tensor:
-        assert num_tokens in self.graphs
-        self.graphs[num_tokens].replay()
+        with graph_capture(device=self.device):
+            for key in keys_to_capture:
+                self.capture_graph(
+                    key,
+                    model=model,
+                    input_buffers=input_buffers,
+                    mrope_positions=mrope_positions,
+                    inputs_embeds=inputs_embeds,
+                    block_tables=block_tables,
+                    attn_metadata_builders=attn_metadata_builders,
+                    kv_cache_config=kv_cache_config,
+                )
+
+    def run(self, key: CudaGraphKey) -> torch.Tensor:
+        assert key in self.graphs
+        self.graphs[key].replay()
         assert self.hidden_states is not None
-        return self.hidden_states[:num_tokens]
+        return self.hidden_states[:key.num_tokens]
 
 
 def get_cudagraph_sizes(

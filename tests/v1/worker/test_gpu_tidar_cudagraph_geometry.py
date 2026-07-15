@@ -5,37 +5,48 @@ import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.worker.gpu import dp_utils
-from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
+from vllm.v1.worker.gpu.cudagraph_utils import (
+    CudaGraphBatchType,
+    CudaGraphKey,
+    CudaGraphManager,
+)
 
 
 def _manager() -> CudaGraphManager:
     manager = object.__new__(CudaGraphManager)
     manager._tidar_tokens_per_verify_req = 17
     manager.max_num_reqs = 32
-    manager.cudagraph_sizes = {17: 17, 34: 34}
+    manager.dp_size = 1
+    manager.cudagraph_sizes = {
+        17: 17,
+        34: 34,
+        544: 544,
+    }
     manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     return manager
 
 
-def test_tidar_single_verify_avoids_ambiguous_decode_graph() -> None:
+def test_tidar_single_verify_uses_geometry_specific_graph() -> None:
     manager = _manager()
-    assert manager.get_cudagraph_size(17, [17]) is None
+    assert manager.get_cudagraph_key(17, [17]) == CudaGraphKey(
+        17, CudaGraphBatchType.TIDAR_VERIFY)
 
 
-def test_tidar_decode_keeps_ambiguous_graph_key() -> None:
+def test_tidar_decode_uses_distinct_ambiguous_graph_key() -> None:
     manager = _manager()
-    assert manager.get_cudagraph_size(17, [1] * 17) == 17
+    assert manager.get_cudagraph_key(17, [1] * 17) == CudaGraphKey(17)
 
 
-def test_tidar_multi_verify_stays_eager() -> None:
+def test_tidar_multi_verify_uses_exact_geometry() -> None:
     manager = _manager()
-    assert manager.get_cudagraph_size(34, [17, 17]) is None
+    assert manager.get_cudagraph_key(34, [17, 17]) == CudaGraphKey(
+        34, CudaGraphBatchType.TIDAR_VERIFY)
 
 
-def test_tidar_full_verify_population_stays_eager() -> None:
+def test_tidar_full_verify_population_uses_graph() -> None:
     manager = _manager()
-    manager.cudagraph_sizes[544] = 544
-    assert manager.get_cudagraph_size(544, [17] * 32) is None
+    assert manager.get_cudagraph_key(544, [17] * 32) == CudaGraphKey(
+        544, CudaGraphBatchType.TIDAR_VERIFY)
 
 
 def test_tidar_partial_or_mixed_batches_stay_eager() -> None:
@@ -44,10 +55,24 @@ def test_tidar_partial_or_mixed_batches_stay_eager() -> None:
     assert manager.get_cudagraph_size(18, [1, 17]) is None
 
 
-def test_tidar_target_capture_geometry_is_decode_only() -> None:
+def test_tidar_capture_keys_distinguish_same_token_count() -> None:
     manager = _manager()
-    assert manager._get_num_reqs_for_capture(17) == 17
-    assert manager._get_num_reqs_for_capture(32) == 32
+    decode_key = CudaGraphKey(17)
+    verify_key = CudaGraphKey(17, CudaGraphBatchType.TIDAR_VERIFY)
+    assert {decode_key, verify_key} <= manager._get_capture_keys()
+    assert manager._get_num_reqs_for_capture(decode_key) == 17
+    assert manager._get_num_reqs_for_capture(verify_key) == 1
+    assert manager.get_padded_cudagraph_key(17, verify_key) == verify_key
+
+
+def test_tidar_dp_verify_graphs_stay_disabled() -> None:
+    manager = _manager()
+    manager.dp_size = 2
+    assert manager.get_cudagraph_key(34, [17, 17]) is None
+    assert all(
+        key.batch_type != CudaGraphBatchType.TIDAR_VERIFY
+        for key in manager._get_capture_keys()
+    )
 
 
 def test_tidar_dp_decode_verify_mismatch_forces_eager(monkeypatch) -> None:

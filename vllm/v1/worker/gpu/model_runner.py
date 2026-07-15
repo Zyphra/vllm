@@ -1371,11 +1371,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.update_requests(scheduler_output)
             self.block_tables.apply_staged_writes()
 
-        # Get the CUDA graph size. None means no CUDA graph is used.
-        cudagraph_size = self.cudagraph_manager.get_cudagraph_size(
+        # Get the CUDA graph key. None means no CUDA graph is used.
+        cudagraph_key = self.cudagraph_manager.get_cudagraph_key(
             scheduler_output.total_num_scheduled_tokens,
             scheduler_output.num_scheduled_tokens.values(),
         )
+        cudagraph_size = (
+            None if cudagraph_key is None else cudagraph_key.num_tokens)
         tidar_draft_tokens = self._tidar_step_draft_tokens(
             len(scheduler_output.num_scheduled_tokens),
             dummy_run,
@@ -1470,9 +1472,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                            input_batch.num_tokens_after_padding,
                            use_cudagraph)
             self.kv_connector.pre_forward(scheduler_output)
-            hidden_states = self.cudagraph_manager.run(
-                input_batch.num_tokens_after_padding
-            )
+            replay_key = self.cudagraph_manager.get_padded_cudagraph_key(
+                input_batch.num_tokens_after_padding, cudagraph_key)
+            hidden_states = self.cudagraph_manager.run(replay_key)
             self._dp_debug("main_forward_end runtime_dummy=%s",
                            runtime_dummy_run)
         else:
