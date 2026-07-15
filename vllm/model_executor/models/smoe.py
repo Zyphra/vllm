@@ -1255,6 +1255,13 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
         logits = self.logits_processor(self.lm_head, hidden_states)
         return logits
 
+    @torch.no_grad()
+    def refresh_runtime_weight_views(self) -> None:
+        """Refresh graph-stable derived weights after runtime model sync."""
+        for module in self.modules():
+            if isinstance(module, CCA):
+                module.refresh_runtime_weight_views()
+
     def load_weights(self, weights: Iterable[Tuple[str,
                                                    torch.Tensor]]) -> Set[str]:
 
@@ -1281,6 +1288,12 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
                 fused_moe_modules[name] = module
 
         loaded_params: Set[str] = set()
+        touched_cca_modules: Set[CCA] = set()
+        cca_runtime_weight_prefixes = {
+            name: module
+            for name, module in self.named_modules()
+            if isinstance(module, CCA)
+        }
         import tqdm
         import re
         tp_rank = get_tensor_model_parallel_rank()
@@ -1334,4 +1347,20 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
                                     default_weight_loader)
             weight_loader(param, loaded_weight)
             loaded_params.add(chkpt_weight_name)            
+
+            # CCA keeps FP32/transposed copies of these parameters. Runtime
+            # loaders write through param.data, which does not reliably bump
+            # Tensor._version, so explicitly refresh the owning CCA module.
+            for module_name, module in cca_runtime_weight_prefixes.items():
+                relative_name = chkpt_weight_name.removeprefix(
+                    f"{module_name}.")
+                if relative_name == chkpt_weight_name:
+                    continue
+                if (relative_name == "temp"
+                        or relative_name.startswith("conv_qk.")):
+                    touched_cca_modules.add(module)
+                    break
+
+        for module in touched_cca_modules:
+            module.refresh_runtime_weight_views()
         return loaded_params

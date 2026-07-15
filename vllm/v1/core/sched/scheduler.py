@@ -104,14 +104,44 @@ class Scheduler(SchedulerInterface):
         self.max_num_scheduled_tokens = self.scheduler_config.max_num_batched_tokens
         self.max_model_len = vllm_config.model_config.max_model_len
         speculative_config = vllm_config.speculative_config
+        use_v2_tidar = (
+            envs.VLLM_USE_V2_MODEL_RUNNER
+            and speculative_config is not None
+            and speculative_config.use_tidar()
+        )
+        decode_first_env = os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL")
+        if decode_first_env is None:
+            # Mixed prompt-prefill + warm TiDAR verifier forwards are not
+            # numerically stable in the V2 recurrent target path. Make wave
+            # admission the correctness default; an explicit 0 remains
+            # available for controlled diagnostics.
+            decode_first_env = "1" if use_v2_tidar else "0"
         self.tidar_decode_first_refill = (
-            os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL", "0") == "1"
+            decode_first_env == "1"
             and speculative_config is not None
             and speculative_config.use_tidar()
         )
         self.tidar_decode_first_refill_min_running = int(
             os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING", "1")
         )
+        self.tidar_require_prefill_verify_segregation = (
+            os.environ.get(
+                "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION",
+                "1" if self.tidar_decode_first_refill else "0",
+            ) == "1"
+        )
+        if self.tidar_require_prefill_verify_segregation:
+            if not self.tidar_decode_first_refill:
+                raise ValueError(
+                    "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION=1 "
+                    "requires VLLM_TIDAR_DECODE_FIRST_REFILL=1"
+                )
+            if self.tidar_decode_first_refill_min_running != 1:
+                raise ValueError(
+                    "Strict TiDAR prefill/verify segregation requires "
+                    "VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING=1; got "
+                    f"{self.tidar_decode_first_refill_min_running}"
+                )
         if self.tidar_decode_first_refill:
             logger.info(
                 "TiDAR decode-first refill scheduling is enabled; waiting "
@@ -372,6 +402,24 @@ class Scheduler(SchedulerInterface):
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
 
+        # A prompt that was admitted in an earlier chunk is already in the
+        # RUNNING queue, so the waiting-queue gate below cannot protect it.
+        # When any warm TiDAR verifier is live, leave those prompt chunks
+        # untouched for this iteration; they resume after the verifier wave
+        # drains. This check happens before token/KV/encoder accounting.
+        has_running_tidar_verify = (
+            self.tidar_decode_first_refill
+            and any(
+                not request.is_prefill_chunk
+                and (
+                    request.num_output_tokens > 0
+                    or request.num_output_placeholders > 0
+                    or bool(request.spec_token_ids)
+                )
+                for request in self.running
+            )
+        )
+
         # For logging.
         scheduled_timestamp = time.monotonic()
 
@@ -379,6 +427,21 @@ class Scheduler(SchedulerInterface):
         req_index = 0
         while req_index < len(self.running) and token_budget > 0:
             request = self.running[req_index]
+
+            if (
+                has_running_tidar_verify
+                and (
+                    request.is_prefill_chunk
+                    or (
+                        request.num_computed_tokens < request.num_prompt_tokens
+                        and request.num_output_tokens == 0
+                        and request.num_output_placeholders == 0
+                        and not request.spec_token_ids
+                    )
+                )
+            ):
+                req_index += 1
+                continue
 
             if (
                 request.num_output_placeholders > 0
@@ -560,9 +623,12 @@ class Scheduler(SchedulerInterface):
         # Next, schedule the WAITING requests.
         tidar_decode_running_reqs = (
             sum(
-                req.num_output_tokens > 0
-                or req.num_output_placeholders > 0
-                or bool(req.spec_token_ids)
+                not req.is_prefill_chunk
+                and (
+                    req.num_output_tokens > 0
+                    or req.num_output_placeholders > 0
+                    or req.request_id in scheduled_spec_decode_tokens
+                )
                 for req in scheduled_running_reqs
             )
             if self.tidar_decode_first_refill
@@ -842,6 +908,37 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        if (
+            self.tidar_require_prefill_verify_segregation
+            and scheduled_spec_decode_tokens
+        ):
+            mixed_prompt_ids = [
+                request.request_id
+                for request in itertools.chain(
+                    scheduled_new_reqs,
+                    scheduled_resumed_reqs,
+                )
+            ]
+            mixed_prompt_ids.extend(
+                request.request_id
+                for request in scheduled_running_reqs
+                if request.is_prefill_chunk
+                or (
+                    request.num_computed_tokens < request.num_prompt_tokens
+                    and request.num_output_tokens == 0
+                    and request.num_output_placeholders == 0
+                    and not request.spec_token_ids
+                )
+            )
+            if mixed_prompt_ids:
+                raise RuntimeError(
+                    "TiDAR V2 scheduler attempted a mixed prompt-prefill + "
+                    "speculative-verify forward despite strict segregation; "
+                    f"prompt_request_ids={mixed_prompt_ids}, "
+                    "verify_request_ids="
+                    f"{sorted(scheduled_spec_decode_tokens)}"
+                )
 
         # Check if the scheduling constraints are satisfied.
         total_num_scheduled_tokens = sum(num_scheduled_tokens.values())

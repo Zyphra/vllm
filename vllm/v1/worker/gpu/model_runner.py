@@ -41,7 +41,10 @@ from vllm.v1.worker.gpu.attn_utils import (
     init_attn_backend,
     init_kv_cache,
 )
-from vllm.v1.worker.gpu.block_table import BlockTables
+from vllm.v1.worker.gpu.block_table import (
+    BlockTables,
+    get_max_num_blocks_per_req,
+)
 from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
 from vllm.v1.worker.gpu.cudagraph_utils import CudaGraphManager
 from vllm.v1.worker.gpu.dp_utils import (
@@ -77,6 +80,29 @@ from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _assert_tidar_prefill_verify_segregation(
+    req_ids: list[str],
+    draft_tokens: dict[str, list[int]],
+    computed_tokens: np.ndarray,
+    prefill_lens: np.ndarray,
+) -> None:
+    """Fail closed if a TiDAR verifier batch also contains prompt prefill."""
+    prompt_req_ids = [
+        req_id
+        for req_id, computed, prefill_len in zip(
+            req_ids, computed_tokens, prefill_lens
+        )
+        if req_id not in draft_tokens and computed < prefill_len
+    ]
+    if prompt_req_ids:
+        raise RuntimeError(
+            "TiDAR V2 model runner received a mixed prompt-prefill + "
+            "speculative-verify forward despite strict segregation; "
+            f"prompt_request_ids={prompt_req_ids}, "
+            f"verify_request_ids={sorted(draft_tokens)}"
+        )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -196,6 +222,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
 
+        # Ephemeral state transferred from execute_model() to sample_tokens().
+        # Initialize it explicitly so an execute failure can propagate through
+        # the async batch queue without a secondary attribute/state error.
+        self.execute_model_state: tuple | None = None
+
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
         self.req_states.max_model_len = max_model_len
@@ -302,9 +333,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_group.kv_cache_spec.block_size
             for kv_cache_group in kv_cache_config.kv_cache_groups
         ]
+        max_num_blocks_per_req = get_max_num_blocks_per_req(
+            [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups],
+            self.max_model_len,
+            self.cache_config.enable_prefix_caching,
+        )
 
         self.block_tables = BlockTables(
             block_sizes=block_sizes,
+            max_num_blocks_per_req=max_num_blocks_per_req,
             max_num_reqs=self.max_num_reqs,
             max_num_batched_tokens=self.max_num_tokens,
             max_model_len=self.max_model_len,
@@ -652,6 +689,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
+        require_prefill_verify_segregation_env = os.environ.get(
+            "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION"
+        )
+        if require_prefill_verify_segregation_env is None:
+            require_prefill_verify_segregation = (
+                os.environ.get("VLLM_TIDAR_DECODE_FIRST_REFILL", "1") == "1"
+            )
+        else:
+            require_prefill_verify_segregation = (
+                require_prefill_verify_segregation_env == "1"
+            )
+        if (
+            draft_tokens
+            and self._use_tidar()
+            and require_prefill_verify_segregation
+        ):
+            computed_tokens = self.req_states.num_computed_prefill_tokens[
+                idx_mapping_np
+            ]
+            prefill_lens = self.req_states.prefill_len.np[idx_mapping_np]
+            _assert_tidar_prefill_verify_segregation(
+                req_ids,
+                draft_tokens,
+                computed_tokens,
+                prefill_lens,
+            )
         if not draft_tokens:
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
@@ -1101,23 +1164,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if uniform:
             seg_rows = list(range(len(prefill_lens)))
         else:
-            from vllm.model_executor.layers.mamba.cca import CCA
-
-            if (getattr(first_layer, "_spec_stash_eager_seq", -1)
-                    != CCA._tidar_step_seq):
-                return
-            seg_rows = list(
-                getattr(first_layer, "_spec_stash_eager_rows", []) or [])
-            if not seg_rows:
-                return
+            # The row-wise CCA stash is keyed by prefill-segment row and
+            # writes a -1 slot sentinel for ordinary prompt rows. Preserve
+            # that V0 invariant instead of introducing a second compact-row
+            # representation for mixed prompt + verify batches.
+            seg_rows = list(range(min(len(prefill_lens), spec_max_P)))
 
         stash_rows: list[int] = []
         batch_rows: list[int] = []
-        for j, seg_row in enumerate(seg_rows):
+        for seg_row in seg_rows:
             batch_row = num_decodes + seg_row
             if (batch_row < num_reqs
                     and len(spec_toks.get(input_batch.req_ids[batch_row], ())) > 0):
-                stash_rows.append(j)
+                stash_rows.append(seg_row)
                 batch_rows.append(batch_row)
         if not stash_rows:
             return
@@ -1197,6 +1256,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_run: bool = False,
         skip_attn_for_dummy_run: bool = False,
     ) -> ModelRunnerOutput | None:
+        if self.execute_model_state is not None:
+            raise RuntimeError(
+                "State error: sample_tokens() must be called "
+                "after execute_model() returns None."
+            )
         assert intermediate_tensors is None
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -1378,10 +1442,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     @torch.inference_mode()
     def sample_tokens(
         self, grammar_output: GrammarOutput | None
-    ) -> AsyncOutput | ModelRunnerOutput:
-        assert self.execute_model_state is not None
+    ) -> AsyncOutput | ModelRunnerOutput | None:
+        if self.execute_model_state is None:
+            # The prior execute_model() failed. Returning None lets the engine
+            # core rethrow the original execute future instead of masking it.
+            return None
         hidden_states, input_batch, kv_connector_output = self.execute_model_state
-        self.execute_model_state = None  # type: ignore
+        self.execute_model_state = None
         self._dp_debug("sample_begin reqs=%d tokens=%d", input_batch.num_reqs,
                        input_batch.num_tokens)
 

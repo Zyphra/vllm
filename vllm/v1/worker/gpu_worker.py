@@ -1015,6 +1015,11 @@ class Worker(WorkerBase):
                 load_weights=load_weights_direct,
             )
 
+        refresh_runtime_weight_views = getattr(
+            model, "refresh_runtime_weight_views", None)
+        if callable(refresh_runtime_weight_views):
+            refresh_runtime_weight_views()
+
     def shutdown(self) -> None:
         # has_kv_transfer_group can be None during interpreter shutdown.
         if ensure_kv_transfer_shutdown is not None:

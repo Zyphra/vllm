@@ -55,6 +55,42 @@ _CCA_BATCH_INVARIANT_CONV_ENABLED = os.environ.get(
 _CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
     "CCA_DIM_PRESERVE_CONV", "0").lower() in ("1", "true", "yes")
 
+
+def _gather_cached_state_or_zeros(
+    cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_states: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Gather recurrent state without reading cold or invalid cache slots.
+
+    TiDAR's uniform V2 path is captured with dynamic request metadata. A cold
+    row can therefore replay the same graph as a warm row. Clamp the gather
+    indices to keep the graph memory-safe, then mask cold or invalid rows to
+    the exact zero state required by ordinary CCA prefill semantics.
+    """
+    if cache.shape[0] == 0:
+        return torch.zeros(
+            (state_indices.shape[0], *cache.shape[1:]),
+            dtype=dtype,
+            device=cache.device,
+        )
+    indices = state_indices.to(dtype=torch.long)
+    valid = (
+        has_initial_states.to(dtype=torch.bool)
+        & (indices >= 0)
+        & (indices < cache.shape[0])
+    )
+    safe_indices = indices.clamp(min=0, max=cache.shape[0] - 1)
+    gathered = cache[safe_indices].to(dtype)
+    mask_shape = (valid.shape[0],) + (1,) * (gathered.ndim - 1)
+    return torch.where(
+        valid.view(mask_shape),
+        gathered,
+        torch.zeros_like(gathered),
+    )
+
+
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
     # Monotonic per-engine-step sequence number, bumped by the model runner
@@ -326,24 +362,69 @@ class CCA(MambaBase, CustomOp):
 
     @torch.no_grad()
     def refresh_runtime_weight_views(self) -> None:
-        """Refresh cached conv views after in-place runtime weight reloads."""
+        """Refresh derived CCA weights after an in-place runtime reload.
+
+        Parameter synchronization writes through ``param.data`` and therefore
+        does not reliably advance PyTorch's tensor version counter.  The CCA
+        fast paths also retain FP32/transposed copies that may be inputs to a
+        captured CUDA graph.  Replacing those tensors after graph capture
+        leaves replay reading the old storage, so every existing derived
+        tensor must be updated in place.
+        """
         dim, _, kernel_width = self.conv_qk[0].weight.shape
         groups = self.num_k_heads + self.num_q_heads
         head_dim = dim // groups
-        self.dw_weight_flat = self.conv_qk[0].weight.reshape(
-            dim, kernel_width
-        ).contiguous()
-        self.gw_weight_flat = self.conv_qk[1].weight.reshape(
-            groups, head_dim, -1, kernel_width
-        ).contiguous()
-        self.gw_bias_flat = (
-            None
-            if self.conv_qk[1].bias is None
-            else self.conv_qk[1].bias.reshape(groups, -1).contiguous()
+
+        def _refresh_view(name: str, source: torch.Tensor) -> None:
+            current = getattr(self, name, None)
+            if current is None:
+                setattr(self, name, source)
+            elif current.data_ptr() != source.data_ptr():
+                # Preserve the address consumed by any captured graph.
+                current.copy_(source)
+
+        dw_weight = self.conv_qk[0].weight.reshape(
+            dim, kernel_width).contiguous()
+        gw_weight = self.conv_qk[1].weight.reshape(
+            groups, head_dim, -1, kernel_width).contiguous()
+        _refresh_view("dw_weight_flat", dw_weight)
+        _refresh_view("gw_weight_flat", gw_weight)
+
+        gw_bias = self.conv_qk[1].bias
+        if gw_bias is not None:
+            gw_bias = gw_bias.reshape(groups, -1).contiguous()
+            _refresh_view("gw_bias_flat", gw_bias)
+        elif not hasattr(self, "gw_bias_flat"):
+            self.gw_bias_flat = None
+
+        if self._gw_weight_T is not None:
+            transformed = gw_weight.permute(0, 2, 3, 1).contiguous().view(
+                groups, -1, head_dim)
+            self._gw_weight_T.copy_(transformed)
+
+        if self._conv_qk_fp32_cache is not None:
+            for module, (weight, bias) in zip(
+                    self.conv_qk, self._conv_qk_fp32_cache):
+                weight.copy_(module.weight.detach().to(torch.float32))
+                if bias is not None:
+                    assert module.bias is not None
+                    bias.copy_(module.bias.detach().to(torch.float32))
+        self._conv_qk_fp32_versions = tuple(
+            value
+            for module in self.conv_qk
+            for value in (
+                module.weight.data_ptr(),
+                module.weight._version,
+                -1 if module.bias is None else module.bias.data_ptr(),
+                -1 if module.bias is None else module.bias._version,
+            )
         )
-        self._gw_weight_T = None
-        self._conv_qk_fp32_cache = None
-        self._conv_qk_fp32_versions = None
+
+        if getattr(self, "_temp_fp32_cache", None) is not None:
+            self._temp_fp32_cache.copy_(
+                self.temp.detach().to(torch.float32))
+            self._temp_fp32_key = (
+                self.temp.data_ptr(), self.temp._version)
 
     def _rms_normalize_qk(
         self,
@@ -455,7 +536,7 @@ class CCA(MambaBase, CustomOp):
         hs_p: torch.Tensor,                   # [P*S, 1, hidden_size]
         qk_packed0_p: torch.Tensor,           # [P*S, 1, in_out_ch]
         state_indices_p: torch.Tensor,        # [P] int64 GPU — read slots
-        has_initial_states_p: torch.Tensor,   # [P] bool GPU (unused; cached path)
+        has_initial_states_p: torch.Tensor,   # [P] bool GPU
         prev_hs: torch.Tensor,
         conv_states: torch.Tensor,
         P: int, S: int,
@@ -485,12 +566,21 @@ class CCA(MambaBase, CustomOp):
         hs_p_2d = hs_p.reshape(P, S, H_hs)
         qk_packed0_p_2d = qk_packed0_p.reshape(P, S, H_conv)
 
-        # Cached state reads. In steady-state captured replay,
-        # has_initial_states_p is always True; cold prefills live on
-        # the eager fallback path.
-        hs_cached = prev_hs[state_indices_p].to(hs_p_2d.dtype)
-        qk_cached = conv_states[state_indices_p].to(
-            qk_packed0_p_2d.dtype)
+        # A captured uniform graph can be replayed for a cold request row.
+        # Cold rows must start from zeros, and PAD/OOB state indices must not
+        # be dereferenced even transiently before masking.
+        hs_cached = _gather_cached_state_or_zeros(
+            prev_hs,
+            state_indices_p,
+            has_initial_states_p,
+            hs_p_2d.dtype,
+        )
+        qk_cached = _gather_cached_state_or_zeros(
+            conv_states,
+            state_indices_p,
+            has_initial_states_p,
+            qk_packed0_p_2d.dtype,
+        )
         if hasattr(self, "_patch_probe_qk_cached"):
             probe_reqs = min(P, self._patch_probe_qk_cached.shape[0])
             self._patch_probe_qk_cached[:probe_reqs].copy_(
@@ -1428,17 +1518,6 @@ class CCA(MambaBase, CustomOp):
                 _has_init_cpu = (has_initial_states_p.tolist()
                                  if torch.is_tensor(has_initial_states_p)
                                  else has_initial_states_p)
-                # Sparse spec stash for mixed prefill/decode steps: TiDAR
-                # verify rows (S_cur <= K+1) still need their K+1 candidate
-                # states stashed so commit_spec_decode_state can roll the
-                # recurrent state back to the post-acceptance position. The
-                # vectorized path only handles uniform-S segments, so this
-                # loop stashes eligible rows itself and records which rows
-                # it stashed (+ the runner's step seq) for the commit.
-                _stash_here = (not drafter_pass
-                               and self._spec_stash_conv is not None)
-                _stash_j = 0
-                _stash_rows: list = []
                 for i in range(len(_qsl_cpu) - 1):
                     start_i, end_i = _qsl_cpu[i], _qsl_cpu[i + 1]
                     hs_row = hs_p[start_i:end_i]  # [S_cur, H] raw
@@ -1465,25 +1544,6 @@ class CCA(MambaBase, CustomOp):
                             conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
                                 device=conv_states.device, dtype=conv_states.dtype)
 
-                    _s_cur = end_i - start_i
-                    if (_stash_here and _s_cur <= self._spec_max_S
-                            and _stash_j < self._spec_max_P):
-                        # Same candidate math as the vectorized path:
-                        # window n ends at position n+1 of this row.
-                        _start_off = self.total_padding - self.cca_time0 + 1
-                        _win = (qk_packed2_cur[..., _start_off:]
-                                .unfold(-1, self.cca_time0, 1))
-                        # [1, E, S_cur, t0] -> [S_cur, E, t0]
-                        self._spec_stash_conv[_stash_j, :_s_cur].copy_(
-                            _win.permute(0, 2, 1, 3)[0].to(
-                                dtype=self._spec_stash_conv.dtype))
-                        self._spec_stash_hs[_stash_j, :_s_cur].copy_(
-                            hs_row.to(dtype=self._spec_stash_hs.dtype))
-                        self._spec_stash_slots[_stash_j] = (
-                            state_indices_tensor_p[i].to(torch.int64))
-                        _stash_rows.append(i)
-                        _stash_j += 1
-
                     # Computing conv
                     qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
                     qk_packed3_p[start_i:end_i] = qk_packed3_cur
@@ -1496,9 +1556,6 @@ class CCA(MambaBase, CustomOp):
                         prev_hs[_sit_write_p] = _vals_p
                     else:
                         prev_hs[_sit_write_p[_wv_p]] = _vals_p[_wv_p]
-                if _stash_here:
-                    self._spec_stash_eager_rows = _stash_rows
-                    self._spec_stash_eager_seq = CCA._tidar_step_seq
 
         _fused_decode_active = False
         if has_decode:

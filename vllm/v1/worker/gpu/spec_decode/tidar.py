@@ -525,11 +525,18 @@ class TiDARSpeculator:
                 causal=False,
             )
             if group_idx in self._cca_group_ids:
+                required_columns = 1 + self.num_speculative_steps
+                if block_tables[group_idx].shape[1] < required_columns:
+                    raise RuntimeError(
+                        "V2 TiDAR CCA requires one recurrent-state column plus "
+                        "one column per speculative step; got row width "
+                        f"{block_tables[group_idx].shape[1]} for KV cache "
+                        f"group {group_idx}, expected at least {required_columns}."
+                    )
                 ar_slots = block_tables[group_idx][:num_reqs, 0]
                 setattr(common, "state_indices_tensor_override", ar_slots)
-                if block_tables[group_idx].shape[1] > 1:
-                    setattr(common, "state_indices_tensor_write_override",
-                            block_tables[group_idx][:num_reqs, 1])
+                setattr(common, "state_indices_tensor_write_override",
+                        block_tables[group_idx][:num_reqs, 1])
                 setattr(common, "cca_drafter_pass", True)
 
             metadata = self.attn_metadata_builders[group_idx].build_for_drafting(

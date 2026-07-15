@@ -1,23 +1,56 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Sequence
+
 import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.worker.gpu.buffer_utils import StagedWriteTensor, UvaBackedTensor
+
+
+def get_max_num_blocks_per_req(
+    kv_cache_specs: Sequence[KVCacheSpec],
+    max_model_len: int,
+    enable_prefix_caching: bool,
+) -> list[int]:
+    """Return safe V2 block-table row widths for every KV cache group."""
+    widths: list[int] = []
+    for spec in kv_cache_specs:
+        base_blocks = cdiv(max_model_len, spec.block_size)
+        max_num_blocks = base_blocks
+        if isinstance(spec, MambaSpec):
+            # In cache mode none a recurrent layer normally needs one state
+            # page, but speculative decoding appends K scratch pages. Mirror
+            # V0's established sizing rule so each request owns all 1 + K
+            # columns instead of spilling them into adjacent request rows.
+            mamba_state_blocks = (
+                base_blocks if enable_prefix_caching else 1
+            ) + spec.num_speculative_blocks
+            max_num_blocks = max(base_blocks, mamba_state_blocks)
+        widths.append(max_num_blocks)
+    return widths
 
 
 class BlockTables:
     def __init__(
         self,
         block_sizes: list[int],
+        max_num_blocks_per_req: list[int],
         max_num_reqs: int,
         max_num_batched_tokens: int,
         max_model_len: int,
         device: torch.device,
     ):
+        if len(max_num_blocks_per_req) != len(block_sizes):
+            raise ValueError(
+                "max_num_blocks_per_req must have one entry per KV cache group; "
+                f"got {len(max_num_blocks_per_req)} for {len(block_sizes)} groups"
+            )
         self.block_sizes = block_sizes
+        self.max_num_blocks_per_req = max_num_blocks_per_req
         self.max_num_reqs = max_num_reqs
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
@@ -27,8 +60,13 @@ class BlockTables:
         # num_kv_cache_groups x [max_num_reqs, max_num_blocks]
         self.block_tables: list[StagedWriteTensor] = []
         for i in range(self.num_kv_cache_groups):
-            block_size = self.block_sizes[i]
-            max_num_blocks = cdiv(self.max_model_len, block_size)
+            max_num_blocks = self.max_num_blocks_per_req[i]
+            if max_num_blocks < cdiv(self.max_model_len, self.block_sizes[i]):
+                raise ValueError(
+                    f"KV cache group {i} needs at least "
+                    f"{cdiv(self.max_model_len, self.block_sizes[i])} block-table "
+                    f"columns, got {max_num_blocks}"
+                )
             block_table = StagedWriteTensor(
                 (self.max_num_reqs, max_num_blocks),
                 dtype=torch.int32,
@@ -62,8 +100,17 @@ class BlockTables:
         for i in range(self.num_kv_cache_groups):
             start = self.num_blocks.np[i, req_index] if not overwrite else 0
             block_ids = new_block_ids[i]
+            end = start + len(block_ids)
+            row_width = self.block_tables[i].gpu.shape[1]
+            if end > row_width:
+                raise RuntimeError(
+                    "KV block-table row overflow: "
+                    f"group={i} request_index={req_index} start={start} "
+                    f"new_blocks={len(block_ids)} end={end} row_width={row_width}. "
+                    "The model runner must reserve speculative Mamba columns."
+                )
             self.block_tables[i].stage_write(req_index, start, block_ids)
-            self.num_blocks.np[i, req_index] = start + len(block_ids)
+            self.num_blocks.np[i, req_index] = end
 
     def apply_staged_writes(self) -> None:
         # TODO(woosuk): This can be inefficient since it launches one kernel per
