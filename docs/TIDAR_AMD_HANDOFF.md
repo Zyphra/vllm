@@ -1,6 +1,6 @@
 # TiDAR-on-AMD Handoff
 
-_Last updated: 2026-07-13. Owner: jinzhao. Scope: TiDAR two-forward (TF)
+_Last updated: 2026-07-14. Owner: jinzhao. Scope: TiDAR two-forward (TF)
 decode on MI300X for the 80B SMoE/Zaya checkpoint._
 
 ## 1. Current State
@@ -60,6 +60,13 @@ Complete for single GPU. The implementation uses a self-draft
 `TiDARSpeculator` integrated with the existing V2 speculative-decode path.
 Target verification is causal; drafting is bidirectional. Prefix rejection,
 the bonus token, accepted-state commit, and mask-token handling are wired.
+
+The stochastic DSpark path now uses real rejection sampling. The V2 runner
+persists request-indexed `q(draft_token)`, draft log-normalizers, and draft
+logits; acceptance uses `min(1, p(x) / q(x))`, and the first rejection samples
+from the exact residual `max(p - q, 0)`. Previously, V2 only accepted when an
+independently sampled target token equaled the draft token, even though the
+compact proposal state was available.
 
 ### M4: Validate and Measure
 
@@ -163,6 +170,9 @@ Core files:
 
 - `vllm/v1/worker/gpu/model_runner.py`
 - `vllm/v1/worker/gpu/spec_decode/tidar.py`
+- `vllm/v1/worker/gpu/spec_decode/rejection_sample.py`
+- `vllm/v1/worker/gpu/sample/gumbel.py`
+- `vllm/v1/worker/gpu/sample/logprob.py`
 - `vllm/v1/worker/gpu/attn_utils.py`
 - `vllm/v1/worker/gpu/async_utils.py`
 - `vllm/v1/attention/backends/rocm_aiter_fa.py`
@@ -177,6 +187,10 @@ Key choices:
 - CCA state uses stable per-request slots so async scheduling cannot move
   recurrent state between rows.
 - Verify and draft cudagraphs use exact TiDAR shapes.
+- Stochastic DSpark sampling returns compact probabilities and log-normalizers
+  without materializing a second `[B, K, V]` probability tensor.
+- The common `logprobs=1` path computes sampled-token and top-1 logprobs plus
+  rank in one two-pass Triton kernel.
 - The fallback mask token is ID 4 when the checkpoint lacks a configured mask
   token.
 - On AMD, a correct run logs the TF paged AITER path for both `causal=True`
@@ -191,16 +205,19 @@ production deterministic GEMM.
 
 Priority work:
 
-1. Profile matched-context b32-b64 target and draft steps, including
+1. Deploy the exact stochastic-rejection and top-1 logprob commits on MI300X,
+   then rerun the matched production configuration. The H100 result is in
+   `docs/tidar_dspark_markov_tp1_throughput.md`.
+2. Profile matched-context b32-b64 target and draft steps, including
    long-prefix `ROCM_AITER_FA` with `S=17`.
-2. Improve ordinary SMoE forward throughput on MI300X: normal BF16 dense GEMM
+3. Improve ordinary SMoE forward throughput on MI300X: normal BF16 dense GEMM
    and AITER unquantized MoE at `M=17B`.
-3. Review the batch-invariant CCA convolution for production adoption and
+4. Review the batch-invariant CCA convolution for production adoption and
    broader coverage.
-4. Debug captured DP+EP+EPLB concurrency, focusing on main-graph and EPLB
+5. Debug captured DP+EP+EPLB concurrency, focusing on main-graph and EPLB
    expert-state interaction.
-5. Refine DP pause/resume so EPLB does not require keepalive busy-spin.
-6. Decide whether to submit the independent v0.24 mixed-causal OOB fix in
+6. Refine DP pause/resume so EPLB does not require keepalive busy-spin.
+7. Decide whether to submit the independent v0.24 mixed-causal OOB fix in
    `docs/tidar_amd_handoff/`.
 
 Per-sequence-causal unified attention and its OOB fix belong to the optional

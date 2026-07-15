@@ -8,6 +8,57 @@ distribution are different.
 
 ## Result
 
+### Stochastic V2 production follow-up
+
+A later no-DP H100 run used stochastic DSpark and target sampling
+(`T_d=T_AR=0.6`) with real rejection sampling. This is the current production
+path and supersedes the earlier V2 token-equality approximation for stochastic
+drafts.
+
+The matched benchmark uses `iter_0005600`, 128 prompts, concurrency 32, a
+4,096-token client cap, natural EOS, `gpu_memory_utilization=0.75`, K16,
+`FULL_AND_PIECEWISE`, async V2, BF16, `logprobs=1`, routed-expert output, and
+no data parallelism on one H100.
+
+| V2 implementation | Output tok/s | Mean accept, +1 | Duration | Output tokens |
+|---|---:|---:|---:|---:|
+| Token match, old draft sampler | 1,831.58 | 4.435 | 284.52 s | 521,119 |
+| Token match, fused draft sampler | 1,914.92 | 4.452 | 271.41 s | 519,726 |
+| Exact rejection, fused draft sampler | 2,256.72 | 5.247 | 231.11 s | 521,544 |
+| Exact rejection + fused top-1 logprobs | **2,320.01** | 5.109 | 225.76 s | 523,770 |
+
+Exact rejection raises throughput by 17.9% over the fused token-match path.
+The top-1 logprob kernel adds another 2.8%; its verified request-block rate
+rises from 430.5 to 454.6 blocks/s. From the old draft sampler to the current
+path, aggregate throughput improves by 26.7%.
+
+The acceptance improvement is a correctness fix, not a tuning trick. V2 had
+been computing compact proposal state but discarding it, then accepting only
+when a target Gumbel sample matched the draft token. It now persists proposal
+state by stable request slot, accepts with `min(1, p(x)/q(x))`, and samples the
+first rejected token from `max(p-q, 0)`.
+
+The updated profile measures the fused top-1 logprob kernel at 0.520 ms per
+B32 TF iteration versus 2.495 ms for the previous top-k/log-softmax/rank path.
+Residual recovery is only 0.117 ms per iteration and is not a current
+bottleneck. FP32 Gumbel noise was also tested as an opt-in: it reduced sampler
+microkernel time but did not improve aggregate throughput (`2,314.39 tok/s`),
+so production retains the default FP64-noise behavior.
+
+Raw H100 artifacts are under:
+
+```text
+/tmp/jinzhao_tidar_075_ab_20260714/
+/tmp/jinzhao_tidar_exact_rs_20260714/
+/tmp/jinzhao_tidar_top1_20260714/
+/tmp/jinzhao_tidar_top1_profile_20260714/
+```
+
+Relevant commits are `80147f94b` (fused stochastic draft sampling),
+`825a38dfc` (exact V2 rejection), and `51a2de6c6` (fused top-1 logprobs).
+
+### Original 32K live result
+
 The run completed all 128 requests without an error, OOM, or
 preemption/recompute warning.
 
