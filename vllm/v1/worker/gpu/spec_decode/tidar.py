@@ -23,7 +23,10 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
-from vllm.utils.dspark import validate_dspark_target_contract
+from vllm.utils.dspark import (
+    validate_dspark_target_contract,
+    validate_tidar_temperature_contract,
+)
 
 logger = init_logger(__name__)
 
@@ -50,6 +53,26 @@ class TiDARSpeculator:
         self.max_model_len = vllm_config.model_config.max_model_len
         self.diff_temperature = float(
             self.speculative_config.tidar_diff_temperature)
+        self.ar_temperature = float(
+            self.speculative_config.tidar_ar_temperature)
+        if os.environ.get(
+            "VLLM_TIDAR_ASSERT_AR_LOGPROBS", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}:
+            configured_ar_temperature = os.environ.get(
+                "VLLM_TIDAR_AR_TEMPERATURE"
+            )
+            validate_tidar_temperature_contract(
+                draft_temperature=self.diff_temperature,
+                ar_temperature=self.ar_temperature,
+                configured_ar_temperature=configured_ar_temperature,
+            )
+            logger.info(
+                "Validated strict TiDAR temperature contract: "
+                "draft=%s, AR verifier=%s, returned scores=%s.",
+                self.diff_temperature,
+                self.ar_temperature,
+                configured_ar_temperature,
+            )
         self.mask_token_id = self._resolve_mask_token_id()
 
         self.input_buffers = InputBuffers(

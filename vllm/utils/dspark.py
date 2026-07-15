@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import math
 import os
 from typing import Any
 
@@ -17,6 +18,59 @@ def validate_dspark_load_format(
             "and diffusion_markov_head weights, and Megatron parameter sync "
             "does not provide those vLLM-only tensors. Use "
             "load_format='auto' (or another checkpoint-backed loader)."
+        )
+
+
+def validate_tidar_temperature_contract(
+    *,
+    draft_temperature: float,
+    ar_temperature: float,
+    configured_ar_temperature: float | str | None,
+) -> None:
+    """Require draft, verifier, and exported-score temperatures to match."""
+
+    values: dict[str, float] = {
+        "tidar_diff_temperature": float(draft_temperature),
+        "tidar_ar_temperature": float(ar_temperature),
+    }
+    if configured_ar_temperature is None or not str(
+        configured_ar_temperature
+    ).strip():
+        raise ValueError(
+            "TiDAR temperature contract failed: "
+            "VLLM_TIDAR_AR_TEMPERATURE is required in strict mode."
+        )
+    try:
+        values["VLLM_TIDAR_AR_TEMPERATURE"] = float(
+            configured_ar_temperature
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "TiDAR temperature contract failed: "
+            "VLLM_TIDAR_AR_TEMPERATURE must be a finite positive float."
+        ) from exc
+
+    invalid = {
+        name: value
+        for name, value in values.items()
+        if not math.isfinite(value) or value <= 0
+    }
+    if invalid:
+        raise ValueError(
+            "TiDAR temperature contract failed: all temperatures must be "
+            f"finite and positive; invalid={invalid}."
+        )
+
+    reference = values["VLLM_TIDAR_AR_TEMPERATURE"]
+    mismatched = {
+        name: value
+        for name, value in values.items()
+        if not math.isclose(value, reference, rel_tol=1e-6, abs_tol=1e-8)
+    }
+    if mismatched:
+        raise ValueError(
+            "TiDAR temperature contract failed: draft, AR verifier, and "
+            f"returned-score temperatures must match; values={values}."
         )
 
 

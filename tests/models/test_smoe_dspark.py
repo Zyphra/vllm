@@ -6,6 +6,7 @@ import torch
 from vllm.utils.dspark import (
     validate_dspark_load_format,
     validate_dspark_target_contract,
+    validate_tidar_temperature_contract,
 )
 
 
@@ -96,3 +97,33 @@ def test_dspark_target_contract_rejects_missing_markov_head() -> None:
 
     with pytest.raises(RuntimeError, match="missing a required AR/draft head"):
         validate_dspark_target_contract(target)
+
+
+def test_tidar_temperature_contract_accepts_one_shared_temperature() -> None:
+    validate_tidar_temperature_contract(
+        draft_temperature=0.6,
+        ar_temperature=0.6,
+        configured_ar_temperature="0.6",
+    )
+
+
+@pytest.mark.parametrize(
+    ("draft_temperature", "ar_temperature", "configured_ar_temperature"),
+    [
+        (0.7, 0.6, "0.6"),
+        (0.6, 1.0, "0.6"),
+        (0.6, 0.6, None),
+        (0.6, 0.6, "nan"),
+    ],
+)
+def test_tidar_temperature_contract_rejects_drift(
+    draft_temperature,
+    ar_temperature,
+    configured_ar_temperature,
+) -> None:
+    with pytest.raises(ValueError, match="TiDAR temperature contract failed"):
+        validate_tidar_temperature_contract(
+            draft_temperature=draft_temperature,
+            ar_temperature=ar_temperature,
+            configured_ar_temperature=configured_ar_temperature,
+        )
