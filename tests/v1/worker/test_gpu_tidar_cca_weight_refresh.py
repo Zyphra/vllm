@@ -205,3 +205,50 @@ def test_smoe_runtime_loader_refreshes_cca_caches(monkeypatch) -> None:
         rtol=0,
         atol=0,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_smoe_runtime_loader_refreshes_inference_mode_caches(
+        monkeypatch) -> None:
+    """Match V2 warmup followed by the first live parameter sync.
+
+    V2 creates the lazy FP32 CCA caches under inference mode.  PyTorch then
+    requires every later in-place update of those tensors to run under
+    inference mode as well, including model.load_weights() during version-0
+    synchronization.
+    """
+    device = torch.device("cuda")
+    cca = _make_lightweight_cca(device)
+    with torch.inference_mode():
+        _materialize_derived_caches(cca)
+    assert any(
+        tensor.is_inference() for tensor in _derived_cache_tensors(cca)
+    )
+
+    model = SMoEForCausalLM.__new__(SMoEForCausalLM)
+    nn.Module.__init__(model)
+    model.cca = cca
+    monkeypatch.setattr(smoe, "get_tensor_model_parallel_rank", lambda: 1)
+
+    new_values = {
+        "cca.conv_qk.0.weight": torch.full_like(
+            cca.conv_qk[0].weight, 0.5),
+        "cca.conv_qk.0.bias": torch.full_like(
+            cca.conv_qk[0].bias, 0.75),
+        "cca.conv_qk.1.weight": torch.full_like(
+            cca.conv_qk[1].weight, -0.25),
+        "cca.conv_qk.1.bias": torch.full_like(
+            cca.conv_qk[1].bias, 1.25),
+        "cca.temp": torch.full_like(cca.temp, 0.5),
+    }
+    loaded = model.load_weights(new_values.items())
+
+    assert loaded == set(new_values)
+    actual = torch.empty(9, device=device, dtype=torch.float32)
+    _write_cache_signature(cca, actual)
+    torch.testing.assert_close(
+        actual,
+        _expected_signature_from_parameters(cca),
+        rtol=0,
+        atol=0,
+    )

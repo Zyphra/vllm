@@ -360,7 +360,7 @@ class CCA(MambaBase, CustomOp):
                 self.conv_qk[0], self._conv_qk_fp32_cache[0], x_fp32),
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def refresh_runtime_weight_views(self) -> None:
         """Refresh derived CCA weights after an in-place runtime reload.
 
@@ -369,7 +369,10 @@ class CCA(MambaBase, CustomOp):
         fast paths also retain FP32/transposed copies that may be inputs to a
         captured CUDA graph.  Replacing those tensors after graph capture
         leaves replay reading the old storage, so every existing derived
-        tensor must be updated in place.
+        tensor must be updated in place.  V2 materializes these graph inputs
+        while the model runner is in inference mode, so the refresh must also
+        run in inference mode; ``no_grad`` alone cannot mutate an inference
+        tensor during live parameter synchronization.
         """
         dim, _, kernel_width = self.conv_qk[0].weight.shape
         groups = self.num_k_heads + self.num_q_heads
