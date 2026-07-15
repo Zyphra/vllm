@@ -89,7 +89,12 @@ def test_ar_logprob_snapshot_is_temperature_scaled_and_pre_filters(monkeypatch) 
         lambda *args, **kwargs: sampled.clone(),
     )
 
-    actual_sampled, filtered_logits, ar_logprob_logits = sampler.sample(
+    (
+        actual_sampled,
+        filtered_logits,
+        ar_logprob_logits,
+        *_unused,
+    ) = sampler.sample(
         raw_logits,
         torch.tensor([0]),
         np.array([0]),
@@ -115,9 +120,7 @@ def test_ar_logprob_override_changes_scores_not_sampled_tokens(monkeypatch) -> N
     captured_logprobs: list[torch.Tensor] = []
 
     def fake_compute_topk_logprobs(logits, _num_logprobs, token_ids, _cu_num_logits):
-        selected = torch.log_softmax(logits, dim=-1).gather(
-            1, token_ids.view(-1, 1)
-        )
+        selected = torch.log_softmax(logits, dim=-1).gather(1, token_ids.view(-1, 1))
         captured_logprobs.append(selected)
         return selected
 
@@ -129,8 +132,16 @@ def test_ar_logprob_override_changes_scores_not_sampled_tokens(monkeypatch) -> N
     for return_ar_logprobs in (False, True):
         sampler = _bare_sampler(return_ar_logprobs=return_ar_logprobs)
 
-        def fake_sample(self, *args):
-            return sampled.clone(), ar_logits.clone(), ar_logits.clone()
+        def fake_sample(self, *args, **kwargs):
+            return (
+                sampled.clone(),
+                ar_logits.clone(),
+                ar_logits.clone(),
+                None,
+                None,
+                None,
+                None,
+            )
 
         sampler.sample = MethodType(fake_sample, sampler)
         outputs.append(
@@ -151,6 +162,57 @@ def test_ar_logprob_override_changes_scores_not_sampled_tokens(monkeypatch) -> N
     torch.testing.assert_close(captured_logprobs[1], expected_scaled)
     assert not torch.equal(captured_logprobs[0], captured_logprobs[1])
     assert torch.equal(outputs[0].sampled_token_ids, outputs[1].sampled_token_ids)
+
+
+def test_deferred_ar_logprob_stats_use_pre_filter_snapshot(monkeypatch) -> None:
+    sampler = _bare_sampler(return_ar_logprobs=True, top_k=True)
+    sampler.sampling_states.max_num_logprobs = lambda _idx_mapping_np: 1
+    raw_logits = torch.tensor([[2.0, 1.0, -1.0]])
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_apply_temperature(logits, _idx_mapping, _temperatures) -> None:
+        logits.div_(0.6)
+
+    def fake_apply_top_k_top_p(logits, _top_k, _top_p):
+        logits[:, 1:] = -torch.inf
+        return logits
+
+    def fake_tidar_target_stats(target_logits, _prob_token_ids, logprob_logits=None):
+        assert logprob_logits is not None
+        captured["target"] = target_logits.clone()
+        captured["logprob"] = logprob_logits.clone()
+        return (
+            torch.tensor([0.5]),
+            torch.tensor([1.0]),
+            torch.tensor([2.0]),
+            torch.tensor([0], dtype=torch.int64),
+        )
+
+    monkeypatch.setattr(sampler_module, "apply_temperature", fake_apply_temperature)
+    monkeypatch.setattr(sampler_module, "apply_top_k_top_p", fake_apply_top_k_top_p)
+    monkeypatch.setattr(sampler_module, "tidar_target_stats", fake_tidar_target_stats)
+    monkeypatch.setattr(
+        sampler_module,
+        "tidar_sample_bonus_tokens",
+        lambda *args, **kwargs: torch.tensor([0], dtype=torch.int64),
+    )
+
+    result = sampler.sample(
+        raw_logits,
+        torch.tensor([0]),
+        np.array([0]),
+        torch.tensor([0]),
+        torch.tensor([0]),
+        torch.tensor([0]),
+        prob_token_ids=torch.tensor([1]),
+        tidar_cu_num_logits=torch.tensor([0, 1]),
+        collect_tidar_logprob_stats=True,
+    )
+
+    torch.testing.assert_close(result[2], raw_logits / 0.6)
+    assert torch.isneginf(captured["target"][0, 1])
+    assert torch.isfinite(captured["logprob"][0, 1])
+    torch.testing.assert_close(captured["logprob"], raw_logits / 0.6)
 
 
 def test_strict_mode_requires_ar_logprobs(monkeypatch) -> None:

@@ -27,7 +27,6 @@ from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 
-
 logger = init_logger(__name__)
 
 
@@ -171,9 +170,7 @@ class Sampler:
             expanded_local_pos,
             prob_token_ids,
             tidar_cu_num_logits,
-            collect_tidar_logprob_stats=(
-                defer_logprobs and max_num_logprobs == 1
-            ),
+            collect_tidar_logprob_stats=(defer_logprobs and max_num_logprobs == 1),
         )
 
         if max_num_logprobs != NO_LOGPROBS and not defer_logprobs:
@@ -214,9 +211,7 @@ class Sampler:
             num_nans=num_nans,
             prob_token_probs=prob_token_probs,
             logsumexp=logsumexp,
-            processed_logits=(
-                processed_logits if prob_token_ids is not None else None
-            ),
+            processed_logits=(processed_logits if prob_token_ids is not None else None),
             ar_logprob_logits=(
                 ar_logprob_logits if prob_token_ids is not None else None
             ),
@@ -257,13 +252,13 @@ class Sampler:
             and not self.sampling_states.do_min_p(idx_mapping_np)
             and not self.sampling_states.do_top_k(idx_mapping_np)
             and not self.sampling_states.do_top_p(idx_mapping_np)
-            and self.sampling_states.max_num_logprobs(idx_mapping_np)
-            == NO_LOGPROBS
+            and self.sampling_states.max_num_logprobs(idx_mapping_np) == NO_LOGPROBS
             and prob_token_ids is None
         )
         if simple_sampling:
-            use_fp32_gumbel = os.environ.get(
-                "VLLM_SIMPLE_SAMPLER_FP32_GUMBEL", "0") == "1"
+            use_fp32_gumbel = (
+                os.environ.get("VLLM_SIMPLE_SAMPLER_FP32_GUMBEL", "0") == "1"
+            )
             if use_fp32_gumbel:
                 sampled = gumbel_sample(
                     logits,
@@ -278,9 +273,7 @@ class Sampler:
 
             if logits.dtype != torch.float32:
                 logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
-            apply_temperature(
-                logits, idx_mapping, self.sampling_states.temperature.gpu
-            )
+            apply_temperature(logits, idx_mapping, self.sampling_states.temperature.gpu)
             sampled = gumbel_sample(
                 logits,
                 idx_mapping,
