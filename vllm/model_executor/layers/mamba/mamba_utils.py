@@ -216,8 +216,8 @@ class MambaStateShapeCalculator:
         head_dim: int,
         recurrent_state_size: int,
     ) -> tuple[tuple[int, int], tuple[int]]:
-        latent_k_dim = num_k_heads * head_dim
-        latent_q_dim = num_q_heads * head_dim
+        latent_k_dim = divide(num_k_heads, tp_world_size) * head_dim
+        latent_q_dim = divide(num_q_heads, tp_world_size) * head_dim
         in_out_ch = latent_k_dim + latent_q_dim
         conv_states_shape = (in_out_ch, conv_kernel_size)
 
