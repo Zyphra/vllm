@@ -49,10 +49,29 @@ def test_tidar_full_verify_population_uses_graph() -> None:
         544, CudaGraphBatchType.TIDAR_VERIFY)
 
 
-def test_tidar_partial_or_mixed_batches_stay_eager() -> None:
+def test_tidar_partial_or_mixed_batches_use_piecewise_fallback() -> None:
     manager = _manager()
     assert manager.get_cudagraph_size(16, [16]) is None
     assert manager.get_cudagraph_size(18, [1, 17]) is None
+    assert manager.get_non_full_runtime_mode() == CUDAGraphMode.PIECEWISE
+
+
+def test_tidar_prefill_uses_piecewise_fallback() -> None:
+    manager = _manager()
+    assert manager.get_cudagraph_size(257, [257]) is None
+    assert manager.get_non_full_runtime_mode() == CUDAGraphMode.PIECEWISE
+
+
+def test_non_full_runtime_mode_respects_full_only_configuration() -> None:
+    manager = _manager()
+    manager.cudagraph_mode = CUDAGraphMode.FULL
+    assert manager.get_non_full_runtime_mode() == CUDAGraphMode.NONE
+
+
+def test_non_full_runtime_mode_respects_none_configuration() -> None:
+    manager = _manager()
+    manager.cudagraph_mode = CUDAGraphMode.NONE
+    assert manager.get_non_full_runtime_mode() == CUDAGraphMode.NONE
 
 
 def test_tidar_capture_keys_distinguish_same_token_count() -> None:
@@ -65,10 +84,11 @@ def test_tidar_capture_keys_distinguish_same_token_count() -> None:
     assert manager.get_padded_cudagraph_key(17, verify_key) == verify_key
 
 
-def test_tidar_dp_verify_graphs_stay_disabled() -> None:
+def test_tidar_dp_verify_full_graphs_stay_disabled() -> None:
     manager = _manager()
     manager.dp_size = 2
     assert manager.get_cudagraph_key(34, [17, 17]) is None
+    assert manager.get_non_full_runtime_mode() == CUDAGraphMode.PIECEWISE
     assert all(
         key.batch_type != CudaGraphBatchType.TIDAR_VERIFY
         for key in manager._get_capture_keys()

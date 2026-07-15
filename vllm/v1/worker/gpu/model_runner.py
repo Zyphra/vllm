@@ -1478,7 +1478,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._dp_debug("main_forward_end runtime_dummy=%s",
                            runtime_dummy_run)
         else:
-            # Run PyTorch model in eager mode.
+            # Geometry-sensitive batches that cannot select a safe full graph
+            # still use piecewise CUDA graphs when configured. Attention and
+            # CCA metadata remain dynamic while surrounding compiled model
+            # partitions are captured and replayed.
+            fallback_cudagraph_mode = (
+                self.cudagraph_manager.get_non_full_runtime_mode()
+            )
             positions = input_batch.positions
             if self.uses_mrope:
                 assert input_batch.mrope_positions is not None
@@ -1487,8 +1493,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 input_batch.attn_metadata,
                 self.vllm_config,
                 num_tokens=input_batch.num_tokens_after_padding,
-                # TODO(woosuk): Support piecewise CUDA graph.
-                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                cudagraph_runtime_mode=fallback_cudagraph_mode,
                 num_tokens_across_dp=num_tokens_across_dp,
                 slot_mapping=input_batch.slot_mappings,
             ):
@@ -1496,7 +1501,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     "main_forward_begin runtime_dummy=%s tokens=%d cg=%s",
                     runtime_dummy_run,
                     input_batch.num_tokens_after_padding,
-                    use_cudagraph,
+                    fallback_cudagraph_mode,
                 )
                 self.kv_connector.pre_forward(scheduler_output)
                 hidden_states = self.model(

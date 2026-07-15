@@ -69,6 +69,18 @@ class CudaGraphManager:
         self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
 
+    def get_non_full_runtime_mode(self) -> CUDAGraphMode:
+        """Select the safe runtime mode when a full graph is unavailable.
+
+        Geometry-keyed verifier batches use full graphs when available.
+        Prefill, mixed batches, and verifier configurations excluded from
+        full capture can still graph compiler partitions around dynamic
+        attention and CCA metadata.
+        """
+        if self.cudagraph_mode.has_piecewise_cudagraphs():
+            return CUDAGraphMode.PIECEWISE
+        return CUDAGraphMode.NONE
+
     def needs_capture(self) -> bool:
         return bool(self._get_capture_keys())
 
@@ -87,8 +99,9 @@ class CudaGraphManager:
                 return None
             if verify_only:
                 # DP padding currently carries token counts, not synthetic
-                # verifier request rows. Keep that configuration eager until
-                # its cross-rank metadata includes request geometry.
+                # verifier request rows. Keep that configuration out of full
+                # graphs until its cross-rank metadata includes request
+                # geometry; piecewise graphs remain available.
                 if self.dp_size > 1:
                     return None
                 size = self.cudagraph_sizes.get(num_tokens_after_padding)
