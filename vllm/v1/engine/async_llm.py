@@ -726,6 +726,46 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request(s) %s.", ",".join(request_ids))
 
+    async def prepare_for_sync_generation(
+        self,
+        *,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 0.1,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        """Freeze a DP1 EngineCore at an async-scheduling-safe boundary.
+
+        The frontend is closed to new requests before the EngineCore pause is
+        requested. The EngineCore client returns only after futures already
+        submitted by async scheduling have been consumed. Requests and their
+        KV cache remain resident and resume in place.
+
+        Multi-rank data-parallel engines need a collective boundary protocol
+        and intentionally fail closed here. Fully-async PPO uses one
+        independent DP1 engine per rollout replica.
+        """
+        dp_size = self.vllm_config.parallel_config.data_parallel_size
+        if dp_size != 1:
+            raise NotImplementedError(
+                "prepare_for_sync_generation requires data_parallel_size=1; "
+                f"got {dp_size}"
+            )
+
+        async with self._pause_cond:
+            self._paused = True
+        try:
+            return await self.engine_core.prepare_for_sync_async(
+                timeout_s=timeout_s,
+                poll_interval_s=poll_interval_s,
+                reason=reason,
+            )
+        except BaseException:
+            async with self._pause_cond:
+                await self.engine_core.resume_scheduler_async()
+                self._paused = False
+                self._pause_cond.notify_all()
+            raise
+
     async def pause_generation(
         self,
         *,

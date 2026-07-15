@@ -340,6 +340,31 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def get_sync_quiescence_state(self, reason: str = "") -> dict[str, Any]:
+        """Return DP1 freeze readiness without disturbing resident requests."""
+        batch_queue = getattr(self, "batch_queue", None)
+        batch_queue_size = len(batch_queue) if batch_queue is not None else 0
+        try:
+            scheduler_request_counts = list(self.scheduler.get_request_counts())
+        except Exception:
+            scheduler_request_counts = None
+        try:
+            scheduler_has_unfinished = self.scheduler.has_unfinished_requests()
+        except Exception:
+            scheduler_has_unfinished = None
+        paused = bool(self._scheduler_paused)
+        return {
+            "engine_index": getattr(self, "engine_index", None),
+            "data_parallel_size": self.vllm_config.parallel_config.data_parallel_size,
+            "scheduler_paused": paused,
+            "scheduler_has_unfinished_requests": scheduler_has_unfinished,
+            "scheduler_request_counts": scheduler_request_counts,
+            "batch_queue_size": batch_queue_size,
+            "sync_drain_requested": paused,
+            "sync_drain_quiesced": paused and batch_queue_size == 0,
+            "sync_drain_reason": reason,
+        }
+
     def pause_scheduler(self) -> None:
         """Pause the scheduler, keeping requests frozen in queue.
 
@@ -464,12 +489,14 @@ class EngineCore:
         batch in the job queue is finished.
         3. Update the scheduler from the output.
         """
-        # If paused, don't schedule any work.
-        if self._scheduler_paused:
-            return {}, False
-
         batch_queue = self.batch_queue
         assert batch_queue is not None
+
+        # Stop submitting new work once paused, but first consume futures that
+        # async scheduling submitted before the pause utility RPC was handled.
+        # Freeze acknowledgement waits for this queue to become empty.
+        if self._scheduler_paused and not batch_queue:
+            return {}, False
 
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
@@ -479,7 +506,7 @@ class EngineCore:
         model_executed = False
         deferred_scheduler_output = None
         self._executor_called_this_step = False
-        if self.scheduler.has_requests():
+        if not self._scheduler_paused and self.scheduler.has_requests():
             scheduler_output = self.scheduler.schedule()
             self._executor_called_this_step = True
             exec_future = self.model_executor.execute_model(

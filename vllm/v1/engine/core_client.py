@@ -199,6 +199,14 @@ class EngineCoreClient(ABC):
         running state."""
         raise NotImplementedError
 
+    async def prepare_for_sync_async(
+        self,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 0.1,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
     async def scale_elastic_ep(self, new_data_parallel_size: int) -> None:
         raise NotImplementedError
 
@@ -352,6 +360,16 @@ class InprocClient(EngineCoreClient):
 
     def dp_engines_running(self) -> bool:
         return False
+
+    async def prepare_for_sync_async(
+        self,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 0.1,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        del timeout_s, poll_interval_s
+        self.engine_core.pause_scheduler()
+        return [self.engine_core.get_sync_quiescence_state(reason)]
 
 
 @dataclass
@@ -986,6 +1004,33 @@ class AsyncMPClient(MPClient):
     async def resume_scheduler_async(self) -> None:
         """Resume the scheduler after a pause."""
         await self.call_utility_async("resume_scheduler")
+
+    async def prepare_for_sync_async(
+        self,
+        timeout_s: float = 60.0,
+        poll_interval_s: float = 0.1,
+        reason: str = "",
+    ) -> list[dict[str, Any]]:
+        """Pause a DP1 EngineCore and wait for async futures to drain."""
+        if timeout_s <= 0:
+            raise ValueError(f"timeout_s must be positive, got {timeout_s}")
+        poll_interval_s = max(float(poll_interval_s), 0.001)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        await asyncio.wait_for(self.pause_scheduler_async(), timeout=timeout_s)
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    "Timed out waiting for DP1 EngineCore to quiesce for sync"
+                )
+            state = await asyncio.wait_for(
+                self.call_utility_async("get_sync_quiescence_state", reason),
+                timeout=remaining,
+            )
+            if state.get("sync_drain_quiesced"):
+                return [state]
+            await asyncio.sleep(min(poll_interval_s, remaining))
 
     async def profile_async(self, is_start: bool = True) -> None:
         await self.call_utility_async("profile", is_start)
