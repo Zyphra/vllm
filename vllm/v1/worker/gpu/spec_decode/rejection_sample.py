@@ -77,10 +77,11 @@ def _stochastic_accept_kernel(
     sampled_stride,
     num_sampled_ptr,
     rejected_pos_ptr,
-    target_sampled_ptr,
+    bonus_sampled_ptr,
     input_ids_ptr,
     cu_num_logits_ptr,
     idx_mapping_ptr,
+    draft_batch_indices_ptr,
     positions_ptr,
     seeds_ptr,
     draft_token_probs_ptr,
@@ -90,6 +91,7 @@ def _stochastic_accept_kernel(
 ):
     req_idx = tl.program_id(0)
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    draft_batch_idx = tl.load(draft_batch_indices_ptr + req_state_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
     num_draft_tokens = end_idx - start_idx - 1
@@ -103,7 +105,7 @@ def _stochastic_accept_kernel(
             draft_token_id = tl.load(input_ids_ptr + start_idx + pos + 1)
             draft_prob = tl.load(
                 draft_token_probs_ptr
-                + req_state_idx * draft_token_probs_stride
+                + draft_batch_idx * draft_token_probs_stride
                 + pos
             )
             target_prob = tl.load(target_token_probs_ptr + start_idx + pos)
@@ -122,7 +124,7 @@ def _stochastic_accept_kernel(
                 num_sampled += 1
 
     if not rejected:
-        bonus_token = tl.load(target_sampled_ptr + end_idx - 1)
+        bonus_token = tl.load(bonus_sampled_ptr + req_idx)
         tl.store(
             sampled_ptr + req_idx * sampled_stride + num_draft_tokens,
             bonus_token,
@@ -142,6 +144,7 @@ def _residual_sample_blocks_kernel(
     rejected_pos_ptr,
     cu_num_logits_ptr,
     idx_mapping_ptr,
+    draft_batch_indices_ptr,
     positions_ptr,
     seeds_ptr,
     target_logits_ptr,
@@ -167,6 +170,7 @@ def _residual_sample_blocks_kernel(
         return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
+    draft_batch_idx = tl.load(draft_batch_indices_ptr + req_state_idx)
     start_idx = tl.load(cu_num_logits_ptr + req_idx)
     target_row = start_idx + rejected_pos
 
@@ -182,7 +186,7 @@ def _residual_sample_blocks_kernel(
 
     draft_logits = tl.load(
         draft_logits_ptr
-        + req_state_idx * draft_logits_req_stride
+        + draft_batch_idx * draft_logits_req_stride
         + rejected_pos * draft_logits_pos_stride
         + block,
         mask=mask,
@@ -190,7 +194,7 @@ def _residual_sample_blocks_kernel(
     ).to(tl.float32)
     draft_logsumexp = tl.load(
         draft_logsumexp_ptr
-        + req_state_idx * draft_logsumexp_stride
+        + draft_batch_idx * draft_logsumexp_stride
         + rejected_pos
     ).to(tl.float32)
     draft_probs = tl.exp(draft_logits / draft_temperature - draft_logsumexp)
@@ -253,10 +257,11 @@ def _residual_sample_reduce_kernel(
 
 
 def stochastic_rejection_sample(
-    target_sampled: torch.Tensor,
+    bonus_sampled: torch.Tensor,
     input_ids: torch.Tensor,
     cu_num_logits: torch.Tensor,
     idx_mapping: torch.Tensor,
+    draft_batch_indices: torch.Tensor,
     positions: torch.Tensor,
     seeds: torch.Tensor,
     num_speculative_steps: int,
@@ -268,16 +273,15 @@ def stochastic_rejection_sample(
     target_logits: torch.Tensor,
     target_logsumexp: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Exact rejection sampling from compact per-request draft state."""
+    """Exact rejection sampling from batch-ordered compact draft state."""
     num_reqs = cu_num_logits.shape[0] - 1
     vocab_size = target_logits.shape[1]
     assert draft_temperature > 0.0
-    assert target_sampled.shape == input_ids.shape == target_token_probs.shape
-    assert target_logsumexp.shape == target_sampled.shape
-    assert draft_token_probs.shape[:2] == (
-        seeds.shape[0],
-        num_speculative_steps,
-    )
+    assert bonus_sampled.shape == (num_reqs,)
+    assert input_ids.shape == target_token_probs.shape
+    assert target_logsumexp.shape == input_ids.shape
+    assert draft_batch_indices.shape == seeds.shape
+    assert draft_token_probs.shape[1] == num_speculative_steps
     assert draft_logsumexp.shape == draft_token_probs.shape
     assert draft_logits.shape[:2] == draft_token_probs.shape
     assert draft_logits.shape[2] == vocab_size
@@ -285,8 +289,8 @@ def stochastic_rejection_sample(
     sampled = torch.full(
         (num_reqs, num_speculative_steps + 1),
         -1,
-        dtype=target_sampled.dtype,
-        device=target_sampled.device,
+        dtype=bonus_sampled.dtype,
+        device=bonus_sampled.device,
     )
     num_sampled = torch.empty(num_reqs, dtype=torch.int32, device=sampled.device)
     rejected_pos = torch.empty_like(num_sampled)
@@ -295,10 +299,11 @@ def stochastic_rejection_sample(
         sampled.stride(0),
         num_sampled,
         rejected_pos,
-        target_sampled,
+        bonus_sampled,
         input_ids,
         cu_num_logits,
         idx_mapping,
+        draft_batch_indices,
         positions,
         seeds,
         draft_token_probs,
@@ -324,6 +329,7 @@ def stochastic_rejection_sample(
         rejected_pos,
         cu_num_logits,
         idx_mapping,
+        draft_batch_indices,
         positions,
         seeds,
         target_logits,

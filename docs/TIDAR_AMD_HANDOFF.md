@@ -61,12 +61,13 @@ Complete for single GPU. The implementation uses a self-draft
 Target verification is causal; drafting is bidirectional. Prefix rejection,
 the bonus token, accepted-state commit, and mask-token handling are wired.
 
-The stochastic DSpark path now uses real rejection sampling. The V2 runner
-persists request-indexed `q(draft_token)`, draft log-normalizers, and draft
-logits; acceptance uses `min(1, p(x) / q(x))`, and the first rejection samples
-from the exact residual `max(p - q, 0)`. Previously, V2 only accepted when an
-independently sampled target token equaled the draft token, even though the
-compact proposal state was available.
+The stochastic DSpark path now uses real rejection sampling. Draft
+`q(draft_token)`, log-normalizers, and logits remain in proposal-batch order;
+a stable-request-to-row map handles scheduler reordering without copying the
+full `[B,K,V]` logits cache. Acceptance uses `min(1, p(x) / q(x))`, and the
+first rejection samples from the exact residual `max(p - q, 0)`. Previously,
+V2 only accepted when an independently sampled target token equaled the draft
+token, even though the compact proposal state was available.
 
 ### M4: Validate and Measure
 
@@ -74,6 +75,31 @@ Complete for the EOS-enabled, thinking-on single-GPU matrix above. MI300X's
 observed TF/AR gain matches or exceeds H100 at b1-b16. The lower b32-b64 ratios
 need a matched-context profile because AR and TF sampled different output
 lengths.
+
+The separate DSpark+Markov production workload (`iter_0005600`,
+`T_d=T_AR=0.6`) also passes with exact stochastic rejection on one H100. In
+the latest 32K natural-EOS run, verifier/drafter hot-path changes raise strict
+B32 throughput from 2,686.5 to 2,843.5 tok/s (+5.85%). An effectively full
+180-second window (31-32 active, mean 31.84, zero waiting) reaches 3,372.0
+tok/s, 2.025x the 1,665.5 AR reference. Its mean acceptance is lower than the
+pre-optimization window, so the gain comes from reduced work rather than
+acceptance inflation.
+
+A subsequent same-node profile found that the target and draft forwards were
+89.8% of GPU time, with FA3 attention about 40%. Restoring captured FA3
+split-KV for the stochastic path reduces target/draft forward time from
+33.63/31.97 ms to 25.69/25.31 ms. A matched generated-context tranche reaches
+3,884.6 tok/s versus 3,062.7 with split-KV disabled; request-block throughput
+rises 19.3%. The best near-full 180-second window is now **3,895.9 tok/s** at
+mean acceptance 7.845, or **2.339x** the 1,665.5 AR reference. Keep
+`VLLM_TIDAR_FA_NO_SPLITS=1` only for the historical argmax-draft compatibility
+path; stochastic `T_d=0.6` should leave it unset or set it to zero.
+
+The earlier complete finite-batch rate remains about 2,209.5 tok/s because its
+long B1 drain dominates; split-KV has not yet been run to full finite-batch
+completion. This supersedes the misleading 4K-only acceptance comparison;
+implementation details and raw-artifact paths are in
+`docs/tidar_dspark_markov_tp1_throughput.md`.
 
 ### M5-M6: Distributed Smoke
 

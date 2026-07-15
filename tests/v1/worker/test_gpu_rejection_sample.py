@@ -28,7 +28,7 @@ def test_stochastic_rejection_sample_compact_draft_state() -> None:
 
     generator = torch.Generator(device=device).manual_seed(7)
     draft_logits = torch.randn(
-        max_num_reqs,
+        2,
         num_speculative_steps,
         vocab_size,
         generator=generator,
@@ -37,32 +37,34 @@ def test_stochastic_rejection_sample_compact_draft_state() -> None:
     scaled_draft_logits = draft_logits / draft_temperature
     draft_logsumexp = torch.logsumexp(scaled_draft_logits, dim=-1)
     draft_token_probs = torch.zeros(
-        max_num_reqs,
+        2,
         num_speculative_steps,
         dtype=torch.float32,
         device=device,
     )
     draft_ids = input_ids[1:4]
-    draft_token_probs[2] = torch.softmax(
-        scaled_draft_logits[2], dim=-1
+    draft_token_probs[0] = torch.softmax(
+        scaled_draft_logits[0], dim=-1
     ).gather(1, draft_ids[:, None]).squeeze(1)
 
     target_logits = torch.randn(
         5, vocab_size, generator=generator, device=device
     )
-    target_logits[:3] = scaled_draft_logits[2]
+    target_logits[:3] = scaled_draft_logits[0]
     target_logsumexp = torch.logsumexp(target_logits, dim=-1)
     target_token_probs = torch.zeros(5, dtype=torch.float32, device=device)
-    target_token_probs[:3] = draft_token_probs[2]
-    target_sampled = torch.tensor(
-        [10, 11, 12, 7, 6], dtype=torch.int64, device=device
+    target_token_probs[:3] = draft_token_probs[0]
+    bonus_sampled = torch.tensor([7, 6], dtype=torch.int64, device=device)
+    draft_batch_indices = torch.tensor(
+        [1, -1, 0, -1], dtype=torch.int64, device=device
     )
 
     sampled, num_sampled = stochastic_rejection_sample(
-        target_sampled,
+        bonus_sampled,
         input_ids,
         cu_num_logits,
         idx_mapping,
+        draft_batch_indices,
         positions,
         seeds,
         num_speculative_steps,
@@ -102,10 +104,11 @@ def test_stochastic_rejection_sample_recovers_from_residual() -> None:
     target_logits[1, 4] = 0.0
 
     sampled, num_sampled = stochastic_rejection_sample(
-        target_sampled=torch.tensor([1, 4], dtype=torch.int64, device=device),
+        bonus_sampled=torch.tensor([4], dtype=torch.int64, device=device),
         input_ids=torch.tensor([9, 0], dtype=torch.int64, device=device),
         cu_num_logits=torch.tensor([0, 2], dtype=torch.int32, device=device),
         idx_mapping=torch.tensor([0], dtype=torch.int64, device=device),
+        draft_batch_indices=torch.tensor([0], dtype=torch.int64, device=device),
         positions=torch.tensor([300, 301], dtype=torch.int64, device=device),
         seeds=torch.tensor([31], dtype=torch.int64, device=device),
         num_speculative_steps=num_speculative_steps,

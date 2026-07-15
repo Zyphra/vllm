@@ -5,6 +5,7 @@ import torch
 
 from vllm.v1.worker.gpu.sample.logprob import (
     compute_top1_logprobs,
+    compute_top1_logprobs_from_stats,
     compute_topk_logprobs,
 )
 
@@ -53,4 +54,37 @@ def test_compute_topk_logprobs_uses_top1_fast_path() -> None:
 
     assert torch.equal(actual.logprob_token_ids, expected.logprob_token_ids)
     assert torch.equal(actual.logprobs, expected.logprobs)
+    assert torch.equal(actual.selected_token_ranks, expected.selected_token_ranks)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compute_top1_logprobs_from_stats(dtype: torch.dtype) -> None:
+    generator = torch.Generator(device="cuda").manual_seed(4321)
+    logits = torch.randn(
+        33,
+        32001,
+        dtype=dtype,
+        device="cuda",
+        generator=generator,
+    )
+    sampled_token_ids = torch.randint(
+        logits.shape[1],
+        (logits.shape[0],),
+        dtype=torch.int64,
+        device="cuda",
+        generator=generator,
+    )
+    logsumexp = torch.logsumexp(logits.float(), dim=-1)
+    top1_token_ids = logits.argmax(dim=-1)
+
+    expected = compute_top1_logprobs(logits, sampled_token_ids)
+    actual = compute_top1_logprobs_from_stats(
+        logits,
+        sampled_token_ids,
+        logsumexp,
+        top1_token_ids,
+    )
+
+    assert torch.equal(actual.logprob_token_ids, expected.logprob_token_ids)
+    torch.testing.assert_close(actual.logprobs, expected.logprobs)
     assert torch.equal(actual.selected_token_ranks, expected.selected_token_ranks)

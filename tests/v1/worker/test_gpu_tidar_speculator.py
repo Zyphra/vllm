@@ -102,3 +102,33 @@ def test_dspark_stochastic_keeps_compact_draft_distribution(monkeypatch) -> None
     )
     assert torch.allclose(speculator.last_draft_logsumexp, expected_logsumexp)
     assert torch.allclose(speculator.last_draft_token_probs, expected_probs)
+
+
+def test_compact_draft_state_stays_in_batch_order() -> None:
+    speculator = object.__new__(TiDARSpeculator)
+    speculator.num_speculative_steps = 2
+    speculator.draft_batch_index_cache = torch.full(
+        (4,), -1, dtype=torch.int64
+    )
+    speculator.last_draft_logits = torch.arange(24).view(4, 6)
+    speculator.last_draft_token_probs = torch.arange(4, dtype=torch.float32)
+    speculator.last_draft_logsumexp = torch.arange(4, dtype=torch.float32) + 10
+
+    speculator._cache_compact_draft_state(
+        torch.tensor([2, 0], dtype=torch.int64), batch_size=2
+    )
+
+    assert speculator.draft_batch_index_cache.tolist() == [1, -1, 0, -1]
+    assert speculator.draft_logits_cache.shape == (2, 2, 6)
+    assert torch.equal(
+        speculator.draft_logits_cache,
+        speculator.last_draft_logits.view(2, 2, 6),
+    )
+    assert torch.equal(
+        speculator.draft_token_probs_cache,
+        speculator.last_draft_token_probs.view(2, 2),
+    )
+    assert torch.equal(
+        speculator.draft_logsumexp_cache,
+        speculator.last_draft_logsumexp.view(2, 2),
+    )

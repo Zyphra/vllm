@@ -57,6 +57,175 @@ Raw H100 artifacts are under:
 Relevant commits are `80147f94b` (fused stochastic draft sampling),
 `825a38dfc` (exact V2 rejection), and `51a2de6c6` (fused top-1 logprobs).
 
+### Latest verifier and drafter hot-path optimization
+
+The next optimization pass removed work that was still scaling with K or the
+full vocabulary even though exact rejection did not need it:
+
+1. The verifier now Gumbel-samples only one bonus row per request instead of
+   all K+1 rows. Draft-row target probabilities and log-normalizers still use
+   every required row.
+2. One Triton reduction computes target `p(draft)`, target log-normalizers,
+   and deferred raw/processed top-1 statistics. Deferred `logprobs=1` then
+   scans logits only for rank.
+3. Draft logits remain in proposal-batch order. A small stable-request-to-row
+   map replaces the per-step copy into a `[max_reqs,K,V]` cache.
+4. The DSpark loop no longer materializes a separate FP32 `[B,V]` tensor for
+   each of 16 positions. It also reuses row, temperature, and Markov
+   workspaces and stacks compact outputs once.
+
+Focused H100 tests matched the prior all-row Gumbel samples on bonus rows,
+matched target probabilities/log-normalizers and top-1 logprobs, exercised
+request reordering in exact rejection, and passed the optimized DSpark loop.
+The full server then passed every draft-graph size used during a natural-EOS
+run without an error, preemption, or recomputation.
+
+The same 32K production contract was rerun after these changes. For the most
+robust saturated comparison, strict B32 includes only telemetry intervals
+whose two endpoints both report 32 running requests. The near-full window is
+an interpolated 180-second window with 31-32 running, zero waiting, and mean
+occupancy 31.84; the baseline's equivalent window remained at 32 throughout.
+
+| Saturated metric | Pre-optimization | Latest | Change |
+|---|---:|---:|---:|
+| Strict B32 output tok/s | 2,686.47 | **2,843.54** | **+5.85%** |
+| Strict B32 mean accept, +1 | 7.194 | 7.065 | -0.129 |
+| Near-full 180-second tok/s | 3,077.13 | **3,372.00** | **+9.58%** |
+| Near-full 180-second mean accept, +1 | 7.784 | 7.098 | -0.686 |
+
+The lower acceptance in both faster windows rules out acceptance inflation as
+the source of the gain. At the historical AR reference of 1,665.47 tok/s, the
+latest near-full TF window is **2.025x** AR.
+
+The complete finite batch generated 3,308,106 tokens in 1,497.23 seconds:
+2,209.48 tok/s, mean acceptance 7.23, and 38.92% draft-token acceptance. That
+whole-run rate is only 0.23% above the earlier 2,204.39 tok/s because the long
+low-batch terminal drain dominates it; it is not a saturation measurement.
+The 4K regression screen was also within the prior run-to-run range at
+2,315.71 tok/s and mean acceptance 5.17.
+
+Raw latest-run artifacts are on `vp-dgx-86` under:
+
+```text
+/tmp/jinzhao_tidar_opt_4k/
+/tmp/jinzhao_tidar_opt_32k_full/
+/tmp/jinzhao_tidar_opt_32k_full_metrics.tsv
+```
+
+### FA3 split-KV optimization
+
+A delayed, pass-separated H100 profile at B32 showed that sampler work was no
+longer the limiting factor. The target and draft model forwards accounted for
+89.8% of GPU time, while the complete DSpark Markov loop was 3.94%. Flash
+Attention kernels alone accounted for about 40%.
+
+The production launcher had retained `VLLM_TIDAR_FA_NO_SPLITS=1` from the
+historical argmax-draft path. That setting preserves a particular BF16
+reduction order, but prevents FA3 from parallelizing long KV sequences. The
+stochastic production path was rerun with FA3's captured split-KV scheduler
+enabled. Both profiles started after 1,800 engine iterations and captured 100
+iterations.
+
+| GPU time per B32 iteration | No split | Split-KV | Change |
+|---|---:|---:|---:|
+| Target forward | 33.627 ms | **25.687 ms** | **-23.6%** |
+| Draft forward | 31.970 ms | **25.313 ms** | **-20.8%** |
+| DSpark Markov loop | 2.880 ms | 2.877 ms | -0.1% |
+| Target sampler | 1.289 ms | 1.292 ms | +0.2% |
+| Total self CUDA time | 73.060 ms | **58.200 ms** | **-20.3%** |
+
+The throughput A/B used the same `vp-dgx-49` H100, source revision,
+checkpoint, ordered 128-request workload, concurrency 32, natural EOS,
+32,768-token cap, BF16, `T_d=T_AR=0.6`, exact rejection, `logprobs=1`, routed
+experts, `gpu_memory_utilization=0.75`, and `FULL_AND_PIECEWISE`. The only
+configuration difference was `VLLM_TIDAR_FA_NO_SPLITS`.
+
+To control for the different stochastic trajectories, the primary comparison
+uses nearly the same cumulative generated-token tranche in each run:
+
+| FA3 mode | Generated-token tranche | Output tok/s | Mean accept, +1 | Request-blocks/s |
+|---|---:|---:|---:|---:|
+| No split | 209,541 to 823,257 | 3,062.65 | 7.370 | 415.58 |
+| Split-KV | 206,815 to 829,531 | **3,884.63** | **7.838** | **495.69** |
+| Change | matched context | **+26.8%** | +6.3% | **+19.3%** |
+
+The acceptance-independent request-block rate confirms that this is a kernel
+speedup, not only a favorable sampled trajectory. The best near-full
+180-second split-KV window reaches **3,895.88 tok/s**, mean acceptance 7.845,
+and 496.67 request-blocks/s at mean occupancy 31.84. Against the matched
+1,665.47 tok/s AR reference, that is **2.339x**.
+
+Split-KV changes BF16 attention reduction order, so output tokens are not
+bitwise identical. Exact rejection and sampling distributions are unchanged,
+and this stochastic run improved rather than reduced acceptance. The older
+argmax-draft path previously showed an acceptance penalty from split-KV and
+should retain `VLLM_TIDAR_FA_NO_SPLITS=1` until it is independently
+revalidated. The checked-in stochastic reproducer defaults the variable to
+zero:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 \
+  benchmarks/tidar/run_stochastic_tp1_dspark.sh serve
+
+# In a second terminal after /health is ready:
+benchmarks/tidar/run_stochastic_tp1_dspark.sh bench
+```
+
+Raw artifacts on `vp-dgx-49`:
+
+```text
+/tmp/jinzhao_tidar_fa_nosplit/
+/tmp/jinzhao_tidar_fa_split/
+/tmp/jinzhao_tidar_opt_profile_ranges_nosplit/
+/tmp/jinzhao_tidar_opt_profile_ranges_split/
+```
+
+### Matched 32K production-contract baseline
+
+The 4,096-token comparison above overweights early decode, where this workload
+has lower acceptance. A follow-up restored the original production contract:
+128 requests from the same thinking-on `workload_16x8.jsonl`, concurrency 32,
+natural EOS, a 32,768-token safety cap, `T_d=T_AR=0.6`, K16,
+`gpu_memory_utilization=0.75`, `FULL_AND_PIECEWISE`, `logprobs=1`, routed
+experts, TP1, and no DP on one H100.
+
+The pre-hot-path exact-rejection TF run completed all 128 requests without an
+error, OOM, or preemption:
+
+| Phase | Duration | Output tokens | Output tok/s | Mean accept, +1 |
+|---|---:|---:|---:|---:|
+| Strict B32 intervals | 1,012.47 s | 2,719,969 | **2,686.47** | **7.194** |
+| Refill prefix through last B32 sample | 1,072.57 s | 2,879,729 | **2,684.89** | **7.209** |
+| Terminal drain | 470.69 s | 442,210 | 939.50 | 6.914 |
+| Complete finite batch | 1,510.58 s | 3,329,906 | **2,204.39** | **7.161** |
+
+Mean output length was 26,014.9 tokens; 82 of 128 requests reached the 32,768
+cap. The complete-run draft-token acceptance rate was 38.51%.
+
+For the historical steady-window comparison, apply the same selection to both
+modes: the best 180-second interval for which every telemetry sample reports
+32 running requests.
+
+| Mode | 180-second B32 tok/s | Mean accept, +1 | TF/AR |
+|---|---:|---:|---:|
+| TiDAR TF, exact rejection | **3,076.60** | **7.783** | **1.847x** |
+| AR | **1,665.47** | n/a | 1.000x |
+
+The exact sampler therefore does exceed the previously quoted 6.73 acceptance
+when the 32K context distribution and steady-window definition are restored.
+The 4K whole-run result of 5.29 was not a sampler regression. It measured a
+different, early-context distribution. The AR control was stopped after 521
+seconds of strict B32 telemetry: its stochastic trajectory then reached 99%
+KV use and moved to 27 running / 5 waiting, which is cache-admission goodput
+rather than a saturated B32 comparison.
+
+Raw artifacts are on `vp-dgx-86` under:
+
+```text
+/tmp/jinzhao_tidar_exact_32k_20260714/
+/tmp/jinzhao_ar_32k_20260714/
+```
+
 ### Original 32K live result
 
 The run completed all 128 requests without an error, OOM, or

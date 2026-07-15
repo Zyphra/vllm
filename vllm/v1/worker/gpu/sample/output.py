@@ -15,3 +15,6 @@ class SamplerOutput:
     prob_token_probs: torch.Tensor | None = None
     logsumexp: torch.Tensor | None = None
     processed_logits: torch.Tensor | None = None
+    ar_logprob_logits: torch.Tensor | None = None
+    logprob_logsumexp: torch.Tensor | None = None
+    logprob_top1_token_ids: torch.Tensor | None = None

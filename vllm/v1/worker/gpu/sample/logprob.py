@@ -174,6 +174,85 @@ def compute_top1_logprobs(
     )
 
 
+@triton.jit
+def _top1_logprobs_from_stats_kernel(
+    logprob_token_ids_ptr,
+    logprobs_ptr,
+    token_ranks_ptr,
+    logits_ptr,
+    logits_stride,
+    sampled_token_ids_ptr,
+    logsumexp_ptr,
+    top1_token_ids_ptr,
+    vocab_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    row_ptr = logits_ptr + row_idx * logits_stride
+    sampled_token_id = tl.load(sampled_token_ids_ptr + row_idx)
+    top1_token_id = tl.load(top1_token_ids_ptr + row_idx)
+    sampled_logit = tl.load(row_ptr + sampled_token_id).to(tl.float32)
+    top1_logit = tl.load(row_ptr + top1_token_id).to(tl.float32)
+    logsumexp = tl.load(logsumexp_ptr + row_idx).to(tl.float32)
+
+    rank = 0
+    for i in range(0, vocab_size, BLOCK_SIZE):
+        block = i + tl.arange(0, BLOCK_SIZE)
+        mask = block < vocab_size
+        logits = tl.load(
+            row_ptr + block, mask=mask, other=float("-inf")
+        ).to(tl.float32)
+        rank += tl.sum((mask & (logits >= sampled_logit)).to(tl.int32))
+
+    output_offset = row_idx * 2
+    tl.store(logprob_token_ids_ptr + output_offset, sampled_token_id)
+    tl.store(logprob_token_ids_ptr + output_offset + 1, top1_token_id)
+    tl.store(logprobs_ptr + output_offset, sampled_logit - logsumexp)
+    tl.store(logprobs_ptr + output_offset + 1, top1_logit - logsumexp)
+    tl.store(token_ranks_ptr + row_idx, rank)
+
+
+def compute_top1_logprobs_from_stats(
+    logits: torch.Tensor,
+    sampled_token_ids: torch.Tensor,
+    logsumexp: torch.Tensor,
+    top1_token_ids: torch.Tensor,
+    cu_num_logits: list[int] | None = None,
+) -> LogprobsTensors:
+    """Finish top-1 logprobs using reduction statistics already computed."""
+    batch_size, vocab_size = logits.shape
+    assert sampled_token_ids.shape == (batch_size,)
+    assert logsumexp.shape == (batch_size,)
+    assert top1_token_ids.shape == (batch_size,)
+    logprob_token_ids = torch.empty(
+        (batch_size, 2), dtype=torch.int64, device=logits.device
+    )
+    logprobs = torch.empty(
+        (batch_size, 2), dtype=torch.float32, device=logits.device
+    )
+    token_ranks = torch.empty(
+        batch_size, dtype=torch.int64, device=logits.device
+    )
+    _top1_logprobs_from_stats_kernel[(batch_size,)](
+        logprob_token_ids,
+        logprobs,
+        token_ranks,
+        logits,
+        logits.stride(0),
+        sampled_token_ids,
+        logsumexp,
+        top1_token_ids,
+        vocab_size,
+        BLOCK_SIZE=8192,
+    )
+    return LogprobsTensors(
+        logprob_token_ids=logprob_token_ids,
+        logprobs=logprobs,
+        selected_token_ranks=token_ranks,
+        cu_num_generated_tokens=cu_num_logits,
+    )
+
+
 def compute_topk_logprobs(
     logits: torch.Tensor,
     num_logprobs: int,

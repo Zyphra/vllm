@@ -30,6 +30,7 @@ from vllm.utils.dspark import (
 
 logger = init_logger(__name__)
 
+
 DEFAULT_TIDAR_MASK_TOKEN_ID = 4
 
 
@@ -99,6 +100,12 @@ class TiDARSpeculator:
         self.draft_logits_cache: torch.Tensor | None = None
         self.draft_token_probs_cache: torch.Tensor | None = None
         self.draft_logsumexp_cache: torch.Tensor | None = None
+        self.draft_batch_index_cache = torch.full(
+            (self.max_num_reqs,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
 
     def _get_draft_cudagraph_sizes(self) -> set[int]:
         if os.environ.get("VLLM_TIDAR_V2_DISABLE_DRAFT_CUDAGRAPH") == "1":
@@ -170,25 +177,7 @@ class TiDARSpeculator:
             raise RuntimeError(
                 "TiDAR requires at least one attention layer in the target model.")
         if self.diff_temperature != 0.0 and self._dspark_active():
-            draft_weight = target_model.diffusion_output_layer.weight
-            vocab_size = draft_weight.shape[0]
-            cache_shape = (
-                self.max_num_reqs,
-                self.num_speculative_steps,
-                vocab_size,
-            )
-            self.draft_logits_cache = torch.empty(
-                cache_shape,
-                dtype=draft_weight.dtype,
-                device=self.device,
-            )
-            compact_shape = cache_shape[:2]
-            self.draft_token_probs_cache = torch.empty(
-                compact_shape, dtype=torch.float32, device=self.device
-            )
-            self.draft_logsumexp_cache = torch.empty_like(
-                self.draft_token_probs_cache
-            )
+            self.draft_batch_index_cache.fill_(-1)
         logger.info(
             "Initialized V2 TiDAR two-forward self-speculator%s.",
             " with DSpark+Markov drafting" if self._dspark_active() else "",
@@ -205,6 +194,8 @@ class TiDARSpeculator:
         logits: torch.Tensor,
         sample_positions: torch.Tensor,
         sampling_seeds: torch.Tensor,
+        row_indices: torch.Tensor,
+        temperatures: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample DSpark logits without constructing their probability matrix.
 
@@ -214,13 +205,9 @@ class TiDARSpeculator:
         reconstruct q(v) only if that position needs residual recovery.
         """
         batch_size = logits.shape[0]
-        device = logits.device
         assert sample_positions.shape == (batch_size,)
         assert sampling_seeds.shape == (batch_size,)
-        row_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
-        temperatures = torch.full(
-            (batch_size,), self.diff_temperature, dtype=torch.float32, device=device
-        )
+        assert row_indices.shape == temperatures.shape == (batch_size,)
         # Use the same request-local seed and absolute position scheme as the
         # target sampler. Global CUDA RNG would make drafts depend on scheduling
         # order, refills, and KV-cache pressure.
@@ -253,51 +240,84 @@ class TiDARSpeculator:
         base_logits = torch.matmul(hidden_states, draft_weight.t()).view(
             batch_size, K, -1
         )
-        tokens = torch.empty(
-            batch_size, K, dtype=torch.long, device=base_logits.device
+        token_steps: list[torch.Tensor] = []
+        prob_steps: list[torch.Tensor] = []
+        logsumexp_steps: list[torch.Tensor] = []
+        row_indices = torch.arange(
+            batch_size, dtype=torch.int64, device=base_logits.device
         )
-        token_probs = None
-        logsumexp = None
+        temperatures = torch.full(
+            (batch_size,),
+            self.diff_temperature,
+            dtype=torch.float32,
+            device=base_logits.device,
+        )
+        sample_positions = mask_positions.to(torch.int64)
         if self.diff_temperature != 0.0:
-            token_probs = torch.empty(
-                batch_size,
-                K,
-                dtype=torch.float32,
-                device=base_logits.device,
-            )
-            logsumexp = torch.empty_like(token_probs)
+            assert self.diff_temperature > 0.0
 
         use_global_reset = os.environ.get("VLLM_DSPARK_GLOBAL_RESET", "1") != "0"
+        use_markov = os.environ.get("VLLM_DSPARK_NO_MARKOV", "0") != "1"
+        reset_mask = (
+            mask_positions.remainder(block_len).eq(0)
+            if use_global_reset
+            else None
+        )
         prev = (
             prev_token.to(torch.long).clone()
             if use_global_reset
             else torch.zeros(batch_size, dtype=torch.long, device=base_logits.device)
         )
+        markov_rows = None
+        markov_bias = None
+        if use_markov:
+            markov_rows = torch.empty(
+                (batch_size, markov_w1.shape[1]),
+                dtype=markov_w1.dtype,
+                device=base_logits.device,
+            )
+            markov_bias = torch.empty(
+                (batch_size, markov_w2.shape[1]),
+                dtype=base_logits.dtype,
+                device=base_logits.device,
+            )
         for k in range(K):
             if use_global_reset:
-                at_boundary = mask_positions[:, k] % block_len == 0
-                prev = torch.where(at_boundary, torch.zeros_like(prev), prev)
+                assert reset_mask is not None
+                prev = torch.where(reset_mask[:, k], 0, prev)
             elif k > 0 and k % block_len == 0:
-                prev.zero_()
-            bias = torch.matmul(markov_w1.index_select(0, prev), markov_w2)
-            if os.environ.get("VLLM_DSPARK_NO_MARKOV", "0") == "1":
-                bias.zero_()
-            base_logits[:, k].add_(bias)
-            logits_k = base_logits[:, k].to(torch.float32)
+                prev = torch.zeros_like(prev)
+            if use_markov:
+                assert markov_rows is not None and markov_bias is not None
+                torch.index_select(markov_w1, 0, prev, out=markov_rows)
+                torch.mm(markov_rows, markov_w2, out=markov_bias)
+                base_logits[:, k].add_(markov_bias)
+            logits_k = base_logits[:, k]
             if self.diff_temperature == 0.0:
                 sampled = logits_k.argmax(dim=-1)
             else:
                 sampled, selected_probs, row_logsumexp = \
                     self._sample_dspark_stochastic(
                         logits_k,
-                        mask_positions[:, k].to(torch.int64),
+                        sample_positions[:, k],
                         sampling_seeds,
+                        row_indices,
+                        temperatures,
                     )
-                assert token_probs is not None and logsumexp is not None
-                token_probs[:, k] = selected_probs
-                logsumexp[:, k] = row_logsumexp
-            tokens[:, k] = sampled
+                prob_steps.append(selected_probs)
+                logsumexp_steps.append(row_logsumexp)
+            token_steps.append(sampled)
             prev = sampled
+
+        tokens = torch.stack(token_steps, dim=1)
+        token_probs = (
+            torch.stack(prob_steps, dim=1) if prob_steps else None
+        )
+        logsumexp = (
+            torch.stack(logsumexp_steps, dim=1)
+            if logsumexp_steps
+            else None
+        )
 
         self.last_draft_logits = base_logits.view(
             batch_size * K, base_logits.shape[-1]
@@ -322,27 +342,22 @@ class TiDARSpeculator:
             return
         assert self.last_draft_logits is not None
         assert self.last_draft_logsumexp is not None
-        assert self.draft_logits_cache is not None
-        assert self.draft_token_probs_cache is not None
-        assert self.draft_logsumexp_cache is not None
-
         K = self.num_speculative_steps
         state_indices = idx_mapping[:batch_size].to(torch.long)
-        self.draft_logits_cache.index_copy_(
-            0,
-            state_indices,
-            self.last_draft_logits.view(batch_size, K, -1),
+        batch_indices = torch.arange(
+            batch_size, dtype=torch.int64, device=state_indices.device
         )
-        self.draft_token_probs_cache.index_copy_(
-            0,
-            state_indices,
-            self.last_draft_token_probs.view(batch_size, K),
+        self.draft_batch_index_cache.index_copy_(
+            0, state_indices, batch_indices
         )
-        self.draft_logsumexp_cache.index_copy_(
-            0,
-            state_indices,
-            self.last_draft_logsumexp.view(batch_size, K),
+        # Verification runs before the next proposal on the same stream, so
+        # keeping these tensors in proposal-batch order avoids a full-vocabulary
+        # copy while the stable request map preserves scheduler reordering.
+        self.draft_logits_cache = self.last_draft_logits.view(batch_size, K, -1)
+        self.draft_token_probs_cache = self.last_draft_token_probs.view(
+            batch_size, K
         )
+        self.draft_logsumexp_cache = self.last_draft_logsumexp.view(batch_size, K)
 
     def set_attn(
         self,

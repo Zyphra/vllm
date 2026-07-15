@@ -17,6 +17,8 @@ from vllm.v1.worker.gpu.sample.gumbel import (
     apply_temperature,
     gumbel_sample,
     gumbel_sample_with_probs,
+    tidar_sample_bonus_tokens,
+    tidar_target_stats,
 )
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
@@ -145,17 +147,21 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         prob_token_ids: torch.Tensor | None = None,
+        tidar_cu_num_logits: torch.Tensor | None = None,
         defer_logprobs: bool = False,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.compute_nans else None
+        max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
         (
             sampled,
             processed_logits,
             ar_logprob_logits,
             prob_token_probs,
             logsumexp,
+            logprob_logsumexp,
+            logprob_top1_token_ids,
         ) = self.sample(
             logits,
             idx_mapping,
@@ -164,9 +170,12 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             prob_token_ids,
+            tidar_cu_num_logits,
+            collect_tidar_logprob_stats=(
+                defer_logprobs and max_num_logprobs == 1
+            ),
         )
 
-        max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
         if max_num_logprobs != NO_LOGPROBS and not defer_logprobs:
             sampled_before_logprobs = (
                 sampled.clone() if self.assert_ar_logprobs else None
@@ -208,6 +217,11 @@ class Sampler:
             processed_logits=(
                 processed_logits if prob_token_ids is not None else None
             ),
+            ar_logprob_logits=(
+                ar_logprob_logits if prob_token_ids is not None else None
+            ),
+            logprob_logsumexp=logprob_logsumexp,
+            logprob_top1_token_ids=logprob_top1_token_ids,
         )
         return sampler_output
 
@@ -220,13 +234,18 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         prob_token_ids: torch.Tensor | None = None,
+        tidar_cu_num_logits: torch.Tensor | None = None,
+        collect_tidar_logprob_stats: bool = False,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
         torch.Tensor | None,
         torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
     ]:
+        raw_logits = logits
         needs_ar_logprobs = (
             self.return_ar_logprobs
             and self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
@@ -255,7 +274,7 @@ class Sampler:
                     apply_temperature=True,
                     use_fp64_noise=False,
                 )
-                return sampled, logits, None, None, None
+                return sampled, logits, None, None, None, None, None
 
             if logits.dtype != torch.float32:
                 logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -270,7 +289,7 @@ class Sampler:
                 pos,
                 apply_temperature=False,
             )
-            return sampled, logits, None, None, None
+            return sampled, logits, None, None, None, None, None
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -327,6 +346,38 @@ class Sampler:
             )
             prob_token_probs = None
             logsumexp = None
+            logprob_logsumexp = None
+            logprob_top1_token_ids = None
+        elif tidar_cu_num_logits is not None:
+            logprob_logits = None
+            if collect_tidar_logprob_stats:
+                if self.return_ar_logprobs:
+                    if ar_logprob_logits is None:
+                        raise RuntimeError(
+                            "V2 AR logprobs were requested but the "
+                            "temperature-scaled verifier-logit snapshot was "
+                            "not produced"
+                        )
+                    logprob_logits = ar_logprob_logits
+                elif self.logprobs_mode == "raw_logprobs":
+                    logprob_logits = raw_logits
+            (
+                prob_token_probs,
+                logsumexp,
+                logprob_logsumexp,
+                logprob_top1_token_ids,
+            ) = tidar_target_stats(
+                logits,
+                prob_token_ids,
+                logprob_logits=logprob_logits,
+            )
+            sampled = tidar_sample_bonus_tokens(
+                logits,
+                tidar_cu_num_logits,
+                idx_mapping,
+                self.sampling_states.seeds.gpu,
+                pos,
+            )
         else:
             sampled, prob_token_probs, logsumexp = gumbel_sample_with_probs(
                 logits,
@@ -337,4 +388,14 @@ class Sampler:
                 apply_temperature=False,
                 prob_token_ids=prob_token_ids,
             )
-        return sampled, logits, ar_logprob_logits, prob_token_probs, logsumexp
+            logprob_logsumexp = None
+            logprob_top1_token_ids = None
+        return (
+            sampled,
+            logits,
+            ar_logprob_logits,
+            prob_token_probs,
+            logsumexp,
+            logprob_logsumexp,
+            logprob_top1_token_ids,
+        )

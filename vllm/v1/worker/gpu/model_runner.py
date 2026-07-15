@@ -69,7 +69,10 @@ from vllm.v1.worker.gpu.kv_connector import (
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.mm.mrope_utils import MRopeState
-from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
+from vllm.v1.worker.gpu.sample.logprob import (
+    compute_top1_logprobs_from_stats,
+    compute_topk_logprobs,
+)
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -933,6 +936,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_ids,
             input_batch.expanded_local_pos,
             prob_token_ids=prob_token_ids,
+            tidar_cu_num_logits=(
+                input_batch.cu_num_logits if use_stochastic_tidar else None
+            ),
             defer_logprobs=use_stochastic_tidar,
         )
 
@@ -956,6 +962,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_ids,
                     input_batch.cu_num_logits,
                     input_batch.idx_mapping,
+                    self.speculator.draft_batch_index_cache,
                     sample_pos,
                     self.sampler.sampling_states.seeds.gpu,
                     self.num_speculative_steps,
@@ -987,21 +994,41 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     input_batch.cu_num_logits,
                     input_ids.shape[0],
                 )
-                logprob_logits = (
-                    sampler_output.processed_logits
-                    if self.sampler.logprobs_mode == "processed_logprobs"
-                    else logits
-                )
+                if self.sampler.return_ar_logprobs:
+                    logprob_logits = sampler_output.ar_logprob_logits
+                elif self.sampler.logprobs_mode == "processed_logprobs":
+                    logprob_logits = sampler_output.processed_logits
+                else:
+                    logprob_logits = logits
                 assert logprob_logits is not None
-                sampler_output.logprobs_tensors = compute_topk_logprobs(
-                    logprob_logits,
-                    max_num_logprobs,
-                    logprob_token_ids,
-                    input_batch.cu_num_logits_np.tolist(),
-                )
+                cu_num_logits = input_batch.cu_num_logits_np.tolist()
+                if (
+                    max_num_logprobs == 1
+                    and sampler_output.logprob_logsumexp is not None
+                    and sampler_output.logprob_top1_token_ids is not None
+                ):
+                    sampler_output.logprobs_tensors = (
+                        compute_top1_logprobs_from_stats(
+                            logprob_logits,
+                            logprob_token_ids,
+                            sampler_output.logprob_logsumexp,
+                            sampler_output.logprob_top1_token_ids,
+                            cu_num_logits,
+                        )
+                    )
+                else:
+                    sampler_output.logprobs_tensors = compute_topk_logprobs(
+                        logprob_logits,
+                        max_num_logprobs,
+                        logprob_token_ids,
+                        cu_num_logits,
+                    )
             sampler_output.prob_token_probs = None
             sampler_output.logsumexp = None
             sampler_output.processed_logits = None
+            sampler_output.ar_logprob_logits = None
+            sampler_output.logprob_logsumexp = None
+            sampler_output.logprob_top1_token_ids = None
 
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.
