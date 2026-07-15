@@ -383,7 +383,7 @@ collapsed to constant `47599`, and output was incoherent. With
 corrected `mean_accept_len=2.913`; the matching NVIDIA H100 trace was `2.870`.
 Logs: `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_054222_amd_cnode107_gpu1_b1_eager_trace.log`,
 `/shared/home/jinzhao/tfscope/accept_parity_logs/20260707_055619_amd_cnode107_gpu1_b1_eager_trace_tfpaged.log`,
-`/data/home/jinzhao/nv_v2_tidar_logs/accept_parity/20260706_233626_nv_b1_eager_trace_gpu7_nomproc.log`.
+`/data/groups/rl/jinzhao/nv_v2_tidar_logs/accept_parity/20260706_233626_nv_b1_eager_trace_gpu7_nomproc.log`.
 
 2026-07-07 AMD long-config follow-up: ran the NVIDIA apple-style prompt/window/capture
 setup on MI300X (`ibm-cnode-107` GPU1): AIME25 thinking-off, `MT=2000`, K=16,
@@ -413,8 +413,8 @@ throughput is lower. Matched b16 profile (`n_sample=1`, `MT=512`) shows why:
 NVIDIA full-shape target/draft/reject is `20.067/17.579/0.989 ms`; AMD is
 `28.821/26.314/1.175 ms`. The gap is mainly target/draft forward latency on
 `ROCM_AITER_FA`, not rejection-sampler logic. Logs:
-`/data/home/jinzhao/nv_v2_tidar_logs/iter12600_matched/`,
-`/data/home/jinzhao/nv_v2_tidar_logs/iter12600_profile/20260707_014246_nv_gpu6_iter12600_fp_profile_b16_mt512.log`,
+`/data/groups/rl/jinzhao/nv_v2_tidar_logs/iter12600_matched/`,
+`/data/groups/rl/jinzhao/nv_v2_tidar_logs/iter12600_profile/20260707_014246_nv_gpu6_iter12600_fp_profile_b16_mt512.log`,
 `/shared/home/jinzhao/tfscope/amd_iter12600_matched/20260707_075944_*_warmimg.log`,
 `/shared/home/jinzhao/tfscope/amd_iter12600_profile/20260707_081033_amd_cnode107_gpu4_iter12600_fp_profile_b16_mt512_warmimg.log`.
 
@@ -437,8 +437,8 @@ Captured AR baselines on `iter_0012600` (`n_sample=1`,
 `MT=2000`, V2 async, `FULL_AND_PIECEWISE`, no spec) measured NVIDIA H100
 `82.649/552.746/1035.511/3420.864 tok/s` for b1/b8/b16/b64 and AMD MI300X
 `53.369/419.094/774.441/2622.038 tok/s`. Logs:
-`/data/home/jinzhao/nv_v2_tidar_logs/iter12000_vs_12600_backtoback_20260707_030645/`,
-`/data/home/jinzhao/nv_v2_tidar_logs/ar_v2_iter12600_captured_20260707_034419/`,
+`/data/groups/rl/jinzhao/nv_v2_tidar_logs/iter12000_vs_12600_backtoback_20260707_030645/`,
+`/data/groups/rl/jinzhao/nv_v2_tidar_logs/ar_v2_iter12600_captured_20260707_034419/`,
 `/shared/home/jinzhao/tfscope/amd_ar_v2_iter12600_captured_20260707_091143/`.
 
 Conclusion after M5: the implementation is past the perf/correctness gate for this

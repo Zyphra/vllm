@@ -64,7 +64,7 @@ from vllm import LLM, SamplingParams
 
 def main():
     CKPT  = os.environ.get("CKPT",  "/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012600")
-    TEXTS = os.environ.get("TEXTS", "/data/home/jinzhao/workspace/tidar/aime25_zpo_texts.json")
+    TEXTS = os.environ.get("TEXTS", "/data/groups/rl/jinzhao/workspace/tidar/aime25_zpo_texts.json")
     kwargs = dict(
         model=CKPT, dtype="bfloat16", gpu_memory_utilization=0.85,
         max_model_len=10000, max_num_seqs=16,          # b=16

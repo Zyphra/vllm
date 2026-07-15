@@ -23,7 +23,7 @@ like base.
 | label | path |
 |-------|------|
 | base  | `/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012000` |
-| OPD   | `/data/home/jinzhao/workspace/ckpts/OPD-fsdp2-async-TEACHER-sparse-kl-NLOGPROBS-128-muon-R5-T2-NN1-LR2e-5-N_8-MBsz_16-T_1.0-L_61440-iter_0012000-opd-diffusion-60K-math-rsa-step32-hf/` |
+| OPD   | `/data/groups/rl/jinzhao/workspace/ckpts/OPD-fsdp2-async-TEACHER-sparse-kl-NLOGPROBS-128-muon-R5-T2-NN1-LR2e-5-N_8-MBsz_16-T_1.0-L_61440-iter_0012000-opd-diffusion-60K-math-rsa-step32-hf/` |
 
 OPD = on-policy distillation against the dense teacher. `step_32` is early —
 small step count chosen to look at whether OPD is *stable*, not converged.
@@ -192,13 +192,13 @@ tokens at the same rate as base.
 ## Reproducing
 
 ```bash
-cd /data/home/jinzhao/workspace/tidar/Zvllm-kp1
+cd /data/groups/rl/jinzhao/workspace/tidar/Zvllm-kp1
 git checkout jinzhao/tidar_SF
 
 export VLLM_TIDAR_SINGLE_FORWARD=1
 export VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 export VLLM_ATTENTION_BACKEND=FLEX_ATTENTION
-PYBIN=/data/home/jinzhao/workspace/tidar/.venv/bin/python
+PYBIN=/data/groups/rl/jinzhao/workspace/tidar/.venv/bin/python
 
 # AIME26 8k thinking-on, T=0.05, base
 CUDA_VISIBLE_DEVICES=0 $PYBIN scripts/_sf_mmlu_sweep.py \

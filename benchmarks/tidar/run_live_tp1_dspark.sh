@@ -4,8 +4,8 @@ set -euo pipefail
 
 ACTION=${1:-serve}
 MODEL=${MODEL:-/data/checkpoints/SMOE_DIFFUSION_sftv2_tv_dspark+markov-hf/iter_0005600}
-WORKLOAD=${WORKLOAD:-/data/home/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl}
-LOG_DIR=${LOG_DIR:-/data/home/jinzhao/tidar_live_tp1_20260713}
+WORKLOAD=${WORKLOAD:-/data/groups/rl/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl}
+LOG_DIR=${LOG_DIR:-/data/groups/rl/jinzhao/tidar_live_tp1_20260713}
 PORT=${PORT:-8107}
 SERVED_MODEL=${SERVED_MODEL:-dspark-markov-iter5600}
 PYTHON=${PYTHON:-python3}

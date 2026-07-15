@@ -4,9 +4,9 @@ set -euo pipefail
 
 CKPT=${CKPT:-/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012600}
 DATA=${DATA:-benchmarks/tidar/aime25_zpo_texts.json}
-LOGROOT=${LOGROOT:-/data/home/jinzhao/nv_v2_tidar_logs/lockstep_steady}
+LOGROOT=${LOGROOT:-/data/groups/rl/jinzhao/nv_v2_tidar_logs/lockstep_steady}
 CONTAINER=${CONTAINER:-}
-WORKDIR=${WORKDIR:-/data/home/jinzhao/workspace/vllm-smoe-amd-v024-mt10k}
+WORKDIR=${WORKDIR:-/data/groups/rl/jinzhao/workspace/vllm-smoe-amd-v024-mt10k}
 PYTHON=${PYTHON:-python}
 MAX_TOKENS=${MAX_TOKENS:-10000}
 WARMUP_TOKENS=${WARMUP_TOKENS:-64}

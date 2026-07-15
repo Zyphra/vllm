@@ -22,7 +22,7 @@ holds the K+1 baseline plus the docs (`handoff.md` and this file).
 - Voltage Park cluster, shared NFS at `/data`.
 - Worktrees: `Zvllm-sf-fixed` (rishi K-mask base + TFNA0 + VERIFY_NO_ANCHOR);
   `Zvllm-kp1` (kmask 162ea4aa6 K+1 base + NOSLOT0 ablation).
-- Python: `/data/home/jinzhao/workspace/tidar/.venv/bin/python` (torch 2.9.1+cu128).
+- Python: `/data/groups/rl/jinzhao/workspace/tidar/.venv/bin/python` (torch 2.9.1+cu128).
 - Bench: `scripts/_sf_mmlu_sweep.py --dataset aime25 --thinking off --max-tokens 2000`
   `--max-model-len 8192 --batch 1 --K 16 --n 8 --mode tidar --eager`.
 - Env vars always set: `VLLM_ATTENTION_BACKEND=FLEX_ATTENTION`,
@@ -449,8 +449,8 @@ Not resolved in this session.
 
 ```bash
 git checkout jinzhao/tidar_SF
-cd /data/home/jinzhao/workspace/tidar/Zvllm-kp1     # or fresh checkout of this branch
-PY=/data/home/jinzhao/workspace/tidar/.venv/bin/python
+cd /data/groups/rl/jinzhao/workspace/tidar/Zvllm-kp1     # or fresh checkout of this branch
+PY=/data/groups/rl/jinzhao/workspace/tidar/.venv/bin/python
 CKPT=/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012000
 LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16
 COMMON='--ckpt $CKPT --dataset aime25 --thinking off --max-tokens 2000 \

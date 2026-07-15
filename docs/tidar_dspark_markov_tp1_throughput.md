@@ -450,7 +450,7 @@ The checked-in entry point contains the complete TP1 server and client flags:
 ```bash
 export MODEL=/data/checkpoints/SMOE_DIFFUSION_sftv2_tv_dspark+markov-hf/iter_0005600
 export DATASET=/data/datasets/zpo/training_datasets/zpo_math_rsa_only_geq0_no_skywork_no_dapo_no_explicit_images_puzzle_math_cont_step_116_instruct_with_pass_rate_filtered_geq_0.25.parquet
-export WORKLOAD=/data/home/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl
+export WORKLOAD=/data/groups/rl/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl
 
 python3 benchmarks/tidar/build_live_workload.py \
   --dataset "$DATASET" \
@@ -471,7 +471,7 @@ KV saturation, refill, and terminal drain can be analyzed separately.
 Raw artifacts from this run are retained on `vp-dgx-85` under:
 
 ```text
-/data/home/jinzhao/tidar_live_tp1_20260713/
+/data/groups/rl/jinzhao/tidar_live_tp1_20260713/
 ```
 
 The important files are `result.json`, `server.log`, `client.log`,

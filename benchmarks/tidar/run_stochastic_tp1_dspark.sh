@@ -5,7 +5,7 @@ set -euo pipefail
 ACTION=${1:-serve}
 ROOT=${ROOT:-$(git rev-parse --show-toplevel)}
 MODEL=${MODEL:-/data/checkpoints/SMOE_DIFFUSION_sftv2_tv_dspark+markov-hf/iter_0005600}
-WORKLOAD=${WORKLOAD:-/data/home/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl}
+WORKLOAD=${WORKLOAD:-/data/groups/rl/jinzhao/tidar_live_tp1_20260713/workload_16x8.jsonl}
 LOG_DIR=${LOG_DIR:-/tmp/tidar_stochastic_tp1_dspark}
 PORT=${PORT:-8136}
 SERVED_MODEL=${SERVED_MODEL:-dspark-markov-stochastic}

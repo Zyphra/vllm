@@ -30,7 +30,7 @@ from vllm.v1.worker.gpu.spec_decode import tidar as tidar_v2
 
 
 DEFAULT_CKPT = "/data/checkpoints/smoediffusion_128k_64node-hf/iter_0012600"
-DEFAULT_DATASET = "/data/home/jinzhao/aime26_thinkon.json"
+DEFAULT_DATASET = "/data/groups/rl/jinzhao/aime26_thinkon.json"
 
 
 class AcceptStats:

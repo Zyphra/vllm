@@ -581,7 +581,7 @@ Base: `f272b37c9` (`jinzhao/tidar`).
 
 ```bash
 # Sanity TF (no SF)
-CUDA_VISIBLE_DEVICES=2 /data/home/jinzhao/workspace/tidar/.venv/bin/python \
+CUDA_VISIBLE_DEVICES=2 /data/groups/rl/jinzhao/workspace/tidar/.venv/bin/python \
   scripts/smoediffusion_eval.py \
   --ckpt /data/checkpoints/smoediffusion_128k_64node-hf/iter_0012000 \
   --dataset aime26 --no-thinking --t-ar 0.05 --K 16 --n 16 --n-samples 1 \
@@ -592,7 +592,7 @@ CUDA_VISIBLE_DEVICES=2 /data/home/jinzhao/workspace/tidar/.venv/bin/python \
 VLLM_TIDAR_SINGLE_FORWARD=1 VLLM_TIDAR_SF_TRITON=1 \
 VLLM_TIDAR_PROPOSAL_ACC_LEVELS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16 \
 VLLM_ATTENTION_BACKEND=FLEX_ATTENTION \
-CUDA_VISIBLE_DEVICES=2 /data/home/jinzhao/workspace/tidar/.venv/bin/python \
+CUDA_VISIBLE_DEVICES=2 /data/groups/rl/jinzhao/workspace/tidar/.venv/bin/python \
   scripts/_sf_mmlu_sweep.py \
   --ckpt /data/checkpoints/smoediffusion_128k_64node-hf/iter_0012000 \
   --dataset aime25 --thinking off --batch 1 --K 16 --n 16 \

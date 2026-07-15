@@ -192,8 +192,8 @@ also report both paged-attention causal signatures and exact capture size
 
 ## Source Logs
 
-- NVIDIA TF: `/data/home/jinzhao/nv_v2_tidar_logs/eos_thinkon_tf_iter12600_20260713/`
-- NVIDIA AR: `/data/home/jinzhao/nv_v2_tidar_logs/eos_thinkon_ar_iter12600_20260713/`
+- NVIDIA TF: `/data/groups/rl/jinzhao/nv_v2_tidar_logs/eos_thinkon_tf_iter12600_20260713/`
+- NVIDIA AR: `/data/groups/rl/jinzhao/nv_v2_tidar_logs/eos_thinkon_ar_iter12600_20260713/`
 - AMD AR: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271771/`
 - AMD adaptive TF: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271809/`
 - AMD b1 no-splits control: `/shared/home/jinzhao/tfscope/amd_lockstep_steady_271810/`

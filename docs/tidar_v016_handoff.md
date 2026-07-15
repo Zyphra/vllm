@@ -2,7 +2,7 @@
 
 **Branch:** `jinzhao/tidar_v016` @ `819b27dc2`
 **Repo:** `git@github.com:Zyphra/Zvllm.git`
-**Env:** `/data/home/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
+**Env:** `/data/groups/rl/jinzhao/workspace/tidar/Zvllm-v016/.venv-v016`
 **Bench node:** idle GPU on vp-dgx-89 (147.68.0.89)
 **Date:** 2026-06-03
 
@@ -60,7 +60,7 @@ not structural.
 
 ```bash
 ssh vp-dgx-89  # or any idle node
-cd /data/home/jinzhao/workspace/tidar/Zvllm-v016
+cd /data/groups/rl/jinzhao/workspace/tidar/Zvllm-v016
 git checkout jinzhao/tidar_v016 && git pull --ff-only
 source .venv-v016/bin/activate
 ```
