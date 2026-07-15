@@ -1,8 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import pytest
+import torch
 
-from vllm.utils.dspark import validate_dspark_load_format
+from vllm.utils.dspark import (
+    validate_dspark_load_format,
+    validate_dspark_target_contract,
+)
+
+
+def _contract_target(
+    *,
+    tied: bool = True,
+    trainable_draft: bool = False,
+    alias_draft: bool = False,
+):
+    from types import SimpleNamespace
+
+    embedding = torch.nn.Parameter(torch.empty(4, 2))
+    lm_head = embedding if tied else torch.nn.Parameter(torch.empty(4, 2))
+    draft = (
+        lm_head
+        if alias_draft
+        else torch.nn.Parameter(
+            torch.empty(4, 2), requires_grad=trainable_draft
+        )
+    )
+    return SimpleNamespace(
+        config=SimpleNamespace(
+            tie_word_embeddings=True,
+            vocab_size=4,
+            hidden_size=2,
+        ),
+        model=SimpleNamespace(
+            embed_tokens=SimpleNamespace(weight=embedding),
+        ),
+        lm_head=SimpleNamespace(weight=lm_head),
+        diffusion_output_layer=SimpleNamespace(weight=draft),
+        diffusion_markov_head=SimpleNamespace(
+            w1=torch.nn.Parameter(torch.empty(4, 3), requires_grad=False),
+            w2=torch.nn.Parameter(torch.empty(3, 4), requires_grad=False),
+        ),
+    )
 
 
 def test_dspark_rejects_dummy_load_format(monkeypatch) -> None:
@@ -22,3 +61,38 @@ def test_disabled_dspark_allows_dummy_loader(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_TIDAR_DSPARK", "0")
 
     validate_dspark_load_format(True, "dummy")
+
+
+def test_dspark_target_contract_accepts_tied_ar_and_frozen_draft_heads() -> None:
+    target = _contract_target()
+
+    validate_dspark_target_contract(target, retained_target_model=target)
+
+
+def test_dspark_target_contract_rejects_untied_ar_head() -> None:
+    target = _contract_target(tied=False)
+
+    with pytest.raises(RuntimeError, match="not the same Parameter"):
+        validate_dspark_target_contract(target)
+
+
+def test_dspark_target_contract_rejects_trainable_draft_head() -> None:
+    target = _contract_target(trainable_draft=True)
+
+    with pytest.raises(RuntimeError, match="must be frozen"):
+        validate_dspark_target_contract(target)
+
+
+def test_dspark_target_contract_rejects_ar_draft_alias() -> None:
+    target = _contract_target(alias_draft=True)
+
+    with pytest.raises(RuntimeError, match="aliases regular lm_head"):
+        validate_dspark_target_contract(target)
+
+
+def test_dspark_target_contract_rejects_missing_markov_head() -> None:
+    target = _contract_target()
+    del target.diffusion_markov_head
+
+    with pytest.raises(RuntimeError, match="missing a required AR/draft head"):
+        validate_dspark_target_contract(target)
