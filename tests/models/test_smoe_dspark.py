@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -10,14 +12,25 @@ from vllm.utils.dspark import (
 )
 
 
+class _ContractTarget(SimpleNamespace):
+    def compute_logits(self, hidden_states):
+        return self.logits_processor(self.lm_head, hidden_states)
+
+
+class _BadContractTarget(_ContractTarget):
+    def compute_logits(self, hidden_states):
+        return self.logits_processor(
+            self.diffusion_output_layer,
+            hidden_states,
+        )
+
+
 def _contract_target(
     *,
     tied: bool = True,
     trainable_draft: bool = False,
     alias_draft: bool = False,
 ):
-    from types import SimpleNamespace
-
     embedding = torch.nn.Parameter(torch.empty(4, 2))
     lm_head = embedding if tied else torch.nn.Parameter(torch.empty(4, 2))
     draft = (
@@ -27,7 +40,7 @@ def _contract_target(
             torch.empty(4, 2), requires_grad=trainable_draft
         )
     )
-    return SimpleNamespace(
+    return _ContractTarget(
         config=SimpleNamespace(
             tie_word_embeddings=True,
             vocab_size=4,
@@ -96,6 +109,14 @@ def test_dspark_target_contract_rejects_missing_markov_head() -> None:
     del target.diffusion_markov_head
 
     with pytest.raises(RuntimeError, match="missing a required AR/draft head"):
+        validate_dspark_target_contract(target)
+
+
+def test_dspark_target_contract_rejects_draft_verifier_head() -> None:
+    target = _contract_target()
+    target.__class__ = _BadContractTarget
+
+    with pytest.raises(RuntimeError, match="target compute_logits must"):
         validate_dspark_target_contract(target)
 
 

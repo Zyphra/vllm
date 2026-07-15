@@ -118,6 +118,29 @@ def validate_dspark_target_contract(
             "not the same Parameter as model.embed_tokens.weight."
         )
 
+    compute_logits = getattr(target_model, "compute_logits", None)
+    compute_logits_function = getattr(
+        compute_logits, "__func__", compute_logits
+    )
+    compute_logits_code = getattr(compute_logits_function, "__code__", None)
+    compute_logits_names = (
+        set(compute_logits_code.co_names) if compute_logits_code is not None else set()
+    )
+    required_compute_names = {"logits_processor", "lm_head"}
+    forbidden_compute_names = {
+        "diffusion_output_layer",
+        "diffusion_markov_head",
+    }
+    if not required_compute_names.issubset(compute_logits_names) or (
+        forbidden_compute_names & compute_logits_names
+    ):
+        raise RuntimeError(
+            "TiDAR AR-verifier contract failed: target compute_logits must "
+            "use logits_processor with the regular lm_head and may not read "
+            "DSpark/Markov draft heads; "
+            f"observed_names={sorted(compute_logits_names)}."
+        )
+
     draft_parameters = {
         "diffusion_output_layer.weight": draft_weight,
         "diffusion_markov_head.w1": markov_w1,
