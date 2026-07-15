@@ -4,7 +4,7 @@
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.worker.gpu import dp_utils
+from vllm.v1.worker.gpu import cudagraph_utils, dp_utils
 from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphBatchType,
     CudaGraphKey,
@@ -54,13 +54,22 @@ def test_tidar_partial_or_mixed_batches_use_piecewise_fallback() -> None:
     assert manager.get_cudagraph_size(16, [16]) is None
     assert manager.get_cudagraph_size(18, [1, 17]) is None
     assert manager.get_non_full_runtime_mode(
-        has_spec_decode_tokens=True) == CUDAGraphMode.PIECEWISE
+        has_spec_decode_tokens=True
+    ) == CUDAGraphMode.PIECEWISE
 
 
 def test_tidar_prefill_stays_eager() -> None:
     manager = _manager()
     assert manager.get_cudagraph_size(257, [257]) is None
     assert manager.get_non_full_runtime_mode() == CUDAGraphMode.NONE
+
+
+def test_non_tidar_non_full_batch_uses_piecewise_fallback() -> None:
+    manager = _manager()
+    manager._tidar_tokens_per_verify_req = None
+    assert manager.get_non_full_runtime_mode(
+        has_spec_decode_tokens=True
+    ) == CUDAGraphMode.PIECEWISE
 
 
 def test_non_full_runtime_mode_respects_full_only_configuration() -> None:
@@ -85,6 +94,24 @@ def test_non_full_runtime_mode_keeps_model_dummy_runs_eager() -> None:
     ) == CUDAGraphMode.NONE
 
 
+def test_piecewise_captures_reuse_one_stream_context(monkeypatch) -> None:
+    manager = _manager()
+    manager.device = torch.device("cuda")
+    capture_context = object()
+    manager.piecewise_capture_context = capture_context
+    calls = []
+
+    def _graph_capture(*, device, graph_capture_context):
+        calls.append((device, graph_capture_context))
+        return "capture"
+
+    monkeypatch.setattr(cudagraph_utils, "graph_capture", _graph_capture)
+
+    assert manager.piecewise_graph_capture() == "capture"
+    assert manager.piecewise_graph_capture() == "capture"
+    assert calls == [(manager.device, capture_context)] * 2
+
+
 def test_tidar_capture_keys_distinguish_same_token_count() -> None:
     manager = _manager()
     decode_key = CudaGraphKey(17)
@@ -100,7 +127,8 @@ def test_tidar_dp_verify_full_graphs_stay_disabled() -> None:
     manager.dp_size = 2
     assert manager.get_cudagraph_key(34, [17, 17]) is None
     assert manager.get_non_full_runtime_mode(
-        has_spec_decode_tokens=True) == CUDAGraphMode.PIECEWISE
+        has_spec_decode_tokens=True
+    ) == CUDAGraphMode.PIECEWISE
     assert all(
         key.batch_type != CudaGraphBatchType.TIDAR_VERIFY
         for key in manager._get_capture_keys()

@@ -1489,20 +1489,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.cudagraph_manager.get_non_full_runtime_mode(
                     model_dummy_run=model_dummy_run,
                     has_spec_decode_tokens=bool(
-                        scheduler_output.scheduled_spec_decode_tokens),
+                        scheduler_output.scheduled_spec_decode_tokens
+                    ),
                 )
+            )
+            piecewise_capture_ctx = (
+                self.cudagraph_manager.piecewise_graph_capture()
+                if fallback_cudagraph_mode == CUDAGraphMode.PIECEWISE
+                else nullcontext()
             )
             positions = input_batch.positions
             if self.uses_mrope:
                 assert input_batch.mrope_positions is not None
                 positions = input_batch.mrope_positions
-            with set_forward_context(
-                input_batch.attn_metadata,
-                self.vllm_config,
-                num_tokens=input_batch.num_tokens_after_padding,
-                cudagraph_runtime_mode=fallback_cudagraph_mode,
-                num_tokens_across_dp=num_tokens_across_dp,
-                slot_mapping=input_batch.slot_mappings,
+            with (
+                piecewise_capture_ctx as capture_ctx,
+                set_forward_context(
+                    input_batch.attn_metadata,
+                    self.vllm_config,
+                    num_tokens=input_batch.num_tokens_after_padding,
+                    cudagraph_runtime_mode=fallback_cudagraph_mode,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    slot_mapping=input_batch.slot_mappings,
+                ),
             ):
                 self._dp_debug(
                     "main_forward_begin runtime_dummy=%s tokens=%d cg=%s",
@@ -1516,8 +1525,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     positions=positions,
                     inputs_embeds=input_batch.inputs_embeds,
                 )
-                self._dp_debug("main_forward_end runtime_dummy=%s",
-                               runtime_dummy_run)
+                self._dp_debug(
+                    "main_forward_end runtime_dummy=%s", runtime_dummy_run
+                )
+            if capture_ctx is not None:
+                torch.cuda.current_stream(self.device).wait_stream(
+                    capture_ctx.stream
+                )
 
         if not model_dummy_run:
             self._build_tidar_cca_commit_ctx(input_batch, scheduler_output)

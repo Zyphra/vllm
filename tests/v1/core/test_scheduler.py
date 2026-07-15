@@ -960,6 +960,39 @@ def test_v2_tidar_wave_refill_can_be_disabled(
     assert waiting.request_id not in output.num_scheduled_tokens
 
 
+def test_v2_tidar_wave_refill_falls_back_when_prefill_cannot_allocate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(SpeculativeConfig, "use_tidar", lambda self: True)
+    monkeypatch.delenv("VLLM_TIDAR_DECODE_FIRST_REFILL", raising=False)
+    monkeypatch.delenv(
+        "VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", raising=False
+    )
+    monkeypatch.delenv("VLLM_TIDAR_PREFILL_WAVE_REFILL", raising=False)
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        num_speculative_tokens=3,
+    )
+    warm, waiting = _prepare_warm_spec_request_with_waiter(scheduler)
+    allocate_slots = scheduler.kv_cache_manager.allocate_slots
+
+    def _allocate_slots(request, *args, **kwargs):
+        if request.request_id == waiting.request_id:
+            return None
+        return allocate_slots(request, *args, **kwargs)
+
+    monkeypatch.setattr(
+        scheduler.kv_cache_manager, "allocate_slots", _allocate_slots
+    )
+
+    output = scheduler.schedule()
+
+    assert warm.request_id in output.scheduled_spec_decode_tokens
+    assert waiting.request_id not in output.num_scheduled_tokens
+    assert scheduler._tidar_skip_prefill_wave_once is False
+
+
 def test_v2_tidar_explicit_opt_out_retains_mixed_scheduling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

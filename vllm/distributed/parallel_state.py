@@ -1157,7 +1157,10 @@ def is_in_graph_capture_context() -> bool:
 
 
 @contextmanager
-def graph_capture(device: torch.device):
+def graph_capture(
+    device: torch.device,
+    graph_capture_context: GraphCaptureContext | None = None,
+):
     """
     `graph_capture` is a context manager which should surround the code that
     is capturing the CUDA graph. Its main purpose is to ensure that some
@@ -1172,10 +1175,15 @@ def graph_capture(device: torch.device):
     from other kernels possibly launched on background in the default stream.
     """
     global _GRAPH_CAPTURE_DEPTH
-    context = GraphCaptureContext(torch.cuda.Stream(device=device))
+    context = graph_capture_context or GraphCaptureContext(
+        torch.cuda.Stream(device=device)
+    )
     _GRAPH_CAPTURE_DEPTH += 1
     try:
-        with get_tp_group().graph_capture(context), get_pp_group().graph_capture(context):
+        with (
+            get_tp_group().graph_capture(context),
+            get_pp_group().graph_capture(context),
+        ):
             yield context
     finally:
         _GRAPH_CAPTURE_DEPTH -= 1

@@ -189,6 +189,7 @@ class Scheduler(SchedulerInterface):
         self.tidar_prefill_wave_refill = (
             wave_refill_env == "1" and self.tidar_decode_first_refill
         )
+        self._tidar_skip_prefill_wave_once = False
         if (
             self.tidar_prefill_wave_refill
             and not self.tidar_require_prefill_verify_segregation
@@ -489,14 +490,17 @@ class Scheduler(SchedulerInterface):
         )
         can_admit_tidar_refill = (
             self.tidar_prefill_wave_refill
+            and not self._tidar_skip_prefill_wave_once
             and bool(self.waiting)
             and len(self.running) < self.max_num_running_reqs
         )
         # A TiDAR target step must never mix prompt rows with verifier rows.
         # Pause the warm wave for a prefill-only iteration whenever prompt
         # chunks are already running or free slots can admit waiting prompts.
-        tidar_prefill_only_step = has_running_tidar_verify and (
-            has_running_tidar_prefill or can_admit_tidar_refill
+        tidar_prefill_only_step = (
+            not self._tidar_skip_prefill_wave_once
+            and has_running_tidar_verify
+            and (has_running_tidar_prefill or can_admit_tidar_refill)
         )
 
         # For logging.
@@ -977,6 +981,21 @@ class Scheduler(SchedulerInterface):
         # Put back any skipped requests at the head of the waiting queue
         if skipped_waiting_requests:
             self.waiting.prepend_requests(skipped_waiting_requests)
+
+        # KV or encoder pressure can prevent a waiting prompt from being
+        # admitted after the warm verifier wave has already been paused. Do
+        # not return an empty schedule in that case: let verifiers make
+        # progress until a later turn has enough capacity for the refill.
+        if (
+            tidar_prefill_only_step
+            and not num_scheduled_tokens
+            and not preempted_reqs
+        ):
+            self._tidar_skip_prefill_wave_once = True
+            try:
+                return self.schedule()
+            finally:
+                self._tidar_skip_prefill_wave_once = False
 
         if (
             self.tidar_require_prefill_verify_segregation

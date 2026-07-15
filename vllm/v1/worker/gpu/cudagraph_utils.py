@@ -12,7 +12,11 @@ from tqdm import tqdm
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
-from vllm.distributed.parallel_state import graph_capture, is_global_first_rank
+from vllm.distributed.parallel_state import (
+    GraphCaptureContext,
+    graph_capture,
+    is_global_first_rank,
+)
 from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backend import AttentionMetadataBuilder
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -68,6 +72,11 @@ class CudaGraphManager:
         self.graphs: dict[CudaGraphKey, torch.cuda.CUDAGraph] = {}
         self.pool = torch.cuda.graph_pool_handle()
         self.hidden_states: torch.Tensor | None = None
+        # Piecewise wrappers share one global graph memory pool. Keep every
+        # lazy capture and replay on the same stream to preserve its ordering.
+        self.piecewise_capture_context = GraphCaptureContext(
+            torch.cuda.Stream(device=self.device)
+        )
 
     def get_non_full_runtime_mode(
         self,
@@ -83,7 +92,8 @@ class CudaGraphManager:
         Prompt prefills and model dummy runs stay eager.
         """
         # Piecewise graphs are lazily captured. Dummy/profile and prompt
-        # prefill runs occur on the default stream, where capture is illegal.
+        # prefill runs stay eager; verifier fallbacks use the runner's
+        # persistent non-default capture stream.
         if model_dummy_run or not has_spec_decode_tokens:
             return CUDAGraphMode.NONE
         if self.cudagraph_mode.has_piecewise_cudagraphs():
@@ -92,6 +102,12 @@ class CudaGraphManager:
 
     def needs_capture(self) -> bool:
         return bool(self._get_capture_keys())
+
+    def piecewise_graph_capture(self):
+        return graph_capture(
+            device=self.device,
+            graph_capture_context=self.piecewise_capture_context,
+        )
 
     def get_cudagraph_key(
         self,
