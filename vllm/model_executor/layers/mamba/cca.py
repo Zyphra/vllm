@@ -12,16 +12,24 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    divide,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.cca_attn import CCAAttentionMetadata
@@ -55,6 +63,10 @@ class CCA(MambaBase, CustomOp):
         # Use the model's true hidden size unless explicitly overridden.
         # (In Megatron this is the lane's hidden_size_in.)
         self.hidden_size = int(hidden_size or config.hidden_size)
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_tensor_model_parallel_rank()
+        if self.tp_size not in (1, 2):
+            raise ValueError("Zaya CCA only supports tensor_parallel_size 1 or 2")
 
         self.cca_time0 = cca_time0
         self.cca_time1 = cca_time1
@@ -62,14 +74,20 @@ class CCA(MambaBase, CustomOp):
         self.padding1 = cca_time1 - 1
         self.total_padding = self.padding0 + self.padding1
 
-        self.num_k_heads = int(cca_num_k_heads)
-        self.num_q_heads = int(cca_num_q_heads)
+        self.total_num_k_heads = int(cca_num_k_heads)
+        self.total_num_q_heads = int(cca_num_q_heads)
+        self.num_k_heads = divide(self.total_num_k_heads, self.tp_size)
+        self.num_q_heads = divide(self.total_num_q_heads, self.tp_size)
 
         # Geometry
         self.head_dim = int(head_dim)
         self.latent_k_dim = self.num_k_heads * self.head_dim
         self.latent_q_dim = self.num_q_heads * self.head_dim
-        self.recurrent_v_dim = self.latent_k_dim // 2
+        self.total_latent_k_dim = self.total_num_k_heads * self.head_dim
+        self.total_latent_q_dim = self.total_num_q_heads * self.head_dim
+        self.total_recurrent_v_dim = self.total_latent_k_dim // 2
+        self.recurrent_v_dim = (
+            self.total_recurrent_v_dim if self.tp_size == 1 else self.head_dim)
         self.sqrt_head_dim = np.sqrt(self.head_dim)
         self.gqa_groups = self.num_q_heads // self.num_k_heads
         assert self.num_q_heads % self.num_k_heads == 0, (
@@ -80,38 +98,42 @@ class CCA(MambaBase, CustomOp):
         ) * self.head_dim
 
         # Projections
-        self.q_proj = ReplicatedLinear(
+        self.q_proj = ColumnParallelLinear(
             self.hidden_size,
-            self.latent_q_dim,
+            self.total_latent_q_dim,
             bias=self.config.attention_bias,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.q_proj",
         )
-        self.k_proj = ReplicatedLinear(
+        self.k_proj = ColumnParallelLinear(
             self.hidden_size,
-            self.latent_k_dim,
+            self.total_latent_k_dim,
             bias=self.config.attention_bias,
             quant_config=quant_config,
             return_bias=False,
             prefix=f"{prefix}.k_proj",
         )
-        self.v_proj_current = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_k_dim // 2,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.v_proj_current",
-        )
-        self.v_proj_delayed = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_k_dim // 2,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.v_proj_delayed",
-        )
+        self.v_proj_current: ReplicatedLinear | None = None
+        self.v_proj_delayed: ReplicatedLinear | None = None
+        if self.tp_size == 1 or self.tp_rank == 0:
+            self.v_proj_current = ReplicatedLinear(
+                self.hidden_size,
+                self.total_recurrent_v_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.v_proj_current",
+            )
+        if self.tp_size == 1 or self.tp_rank == 1:
+            self.v_proj_delayed = ReplicatedLinear(
+                self.hidden_size,
+                self.total_recurrent_v_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.v_proj_delayed",
+            )
 
         # Depthwise + grouped conv along sequence (exactly like Megatron)
         in_out_ch = self.latent_k_dim + self.latent_q_dim
@@ -135,12 +157,82 @@ class CCA(MambaBase, CustomOp):
 
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
+        for param in (
+            self.conv_qk_depthwise.weight,
+            self.conv_qk_depthwise.bias,
+            self.conv_qk_grouped.weight,
+            self.conv_qk_grouped.bias,
+        ):
+            set_weight_attrs(param, {"weight_loader": self._load_qk_channel_shard})
+        set_weight_attrs(self.temp, {"weight_loader": self._load_k_head_shard})
 
         compilation_config = get_current_vllm_config().compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
-        self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        self._kv_cache = (torch.tensor([]), torch.tensor([]))
+        self.cache_states = torch.tensor([])
+
+    @property
+    def kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._kv_cache
+
+    @kv_cache.setter
+    def kv_cache(self, kv_cache: tuple[torch.Tensor, torch.Tensor]) -> None:
+        self._kv_cache = kv_cache
+        if len(kv_cache) == 0:
+            self.cache_states = torch.tensor([])
+            return
+        conv_states = kv_cache[0]
+        conv_base = conv_states._base
+        self.cache_states = conv_states if conv_base is None else conv_base
+
+    def _qk_channel_indices(self, device: torch.device) -> torch.Tensor:
+        q_start = self.tp_rank * self.latent_q_dim
+        k_start = self.total_latent_q_dim + self.tp_rank * self.latent_k_dim
+        q_indices = torch.arange(
+            q_start, q_start + self.latent_q_dim, device=device)
+        k_indices = torch.arange(
+            k_start, k_start + self.latent_k_dim, device=device)
+        return torch.cat((q_indices, k_indices))
+
+    def _load_qk_channel_shard(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        if self.tp_size > 1 and loaded_weight.shape[0] != param.data.shape[0]:
+            indices = self._qk_channel_indices(loaded_weight.device)
+            loaded_weight = loaded_weight.index_select(0, indices)
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def _load_k_head_shard(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        if self.tp_size > 1 and loaded_weight.shape[0] != param.data.shape[0]:
+            start = self.tp_rank * self.num_k_heads
+            loaded_weight = loaded_weight.narrow(0, start, self.num_k_heads)
+        if len(loaded_weight.shape) == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        assert param.data.shape == loaded_weight.shape
+        param.data.copy_(loaded_weight)
+
+    def _current_value(self, hs: torch.Tensor) -> torch.Tensor:
+        assert self.v_proj_current is not None
+        return self.v_proj_current(hs)
+
+    def _value_state_projection(self, hs: torch.Tensor) -> torch.Tensor:
+        if self.tp_size == 1 or self.tp_rank == 1:
+            assert self.v_proj_delayed is not None
+            return self.v_proj_delayed(hs)
+        # Rank 0 does not consume the recurrent value state. Reuse its local
+        # current-value projection so each TP rank evaluates exactly one V GEMM.
+        return self._current_value(hs)
 
     def forward_native(
         self,
@@ -194,12 +286,18 @@ class CCA(MambaBase, CustomOp):
         query, key = self._rms_normalize_qk(query.contiguous(),
                                             key.contiguous())
 
-        value_current = self.v_proj_current(hs)
-        delayed_v_state = self.v_proj_delayed(hs)
-        zero_delayed = self.v_proj_delayed(
+        value_state = self._value_state_projection(hs)
+        zero_value_state = self._value_state_projection(
             hidden_states.new_zeros(1, 1, self.hidden_size))
-        value_delayed = torch.cat([zero_delayed, delayed_v_state[:-1]], dim=0)
-        value = torch.cat([value_current, value_delayed], dim=-1).contiguous()
+        value_delayed = torch.cat(
+            [zero_value_state, value_state[:-1]], dim=0)
+        if self.tp_size == 1:
+            value_current = self._current_value(hs)
+            value = torch.cat([value_current, value_delayed], dim=-1).contiguous()
+        elif self.tp_rank == 0:
+            value = value_state.contiguous()
+        else:
+            value = value_delayed.contiguous()
         value = value.view(num_tokens, 1, self.num_k_heads, self.head_dim)
 
         q_end = self.latent_q_dim
@@ -299,30 +397,34 @@ class CCA(MambaBase, CustomOp):
         hidden_states: torch.Tensor,
         output: torch.Tensor,
     ):
+        output.zero_()
         forward_context = get_forward_context()
-
+        attn_metadata_raw = forward_context.attn_metadata
         attn_metadata: AttentionMetadata = forward_context.attn_metadata
-        if attn_metadata is not None:
-            assert isinstance(attn_metadata, dict)
-            attn_metadata = attn_metadata[self.prefix]
+        if attn_metadata_raw is not None:
+            assert isinstance(attn_metadata_raw, dict)
+            attn_metadata = attn_metadata_raw[self.prefix]
             assert isinstance(attn_metadata, CCAAttentionMetadata)
-            conv_states = self.kv_cache[0]
-            recurrent_states = self.kv_cache[1]
-            state_indices_tensor_p = attn_metadata.state_indices_tensor_p
-            state_indices_tensor_d = attn_metadata.state_indices_tensor_d
-            if state_indices_tensor_d is not None and state_indices_tensor_d.dim() > 1:
-                state_indices_tensor_d = state_indices_tensor_d[:, 0]
-            has_initial_states_p = attn_metadata.has_initial_states_p
-            query_start_loc_p = attn_metadata.query_start_loc_p
 
         if attn_metadata is None:
             # V1 profile run
             self._forward_no_cache(hidden_states, output)
             return
 
-        num_prefills = attn_metadata.num_prefills  # request count
-        num_decodes = attn_metadata.num_decode_tokens  # token count (=request)
-        num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
+        conv_states, recurrent_states = self.kv_cache
+        state_indices_tensor_p = attn_metadata.state_indices_tensor_p
+        state_indices_tensor_d = attn_metadata.state_indices_tensor_d
+        if (
+            state_indices_tensor_d is not None
+            and state_indices_tensor_d.dim() > 1
+        ):
+            state_indices_tensor_d = state_indices_tensor_d[:, 0]
+        has_initial_states_p = attn_metadata.has_initial_states_p
+        query_start_loc_p = attn_metadata.query_start_loc_p
+        num_prefills = attn_metadata.num_prefills
+        num_decodes = attn_metadata.num_decode_tokens
+        num_prefill_tokens = attn_metadata.num_prefill_tokens
+
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
         num_actual_tokens = num_decodes + num_prefill_tokens
@@ -362,9 +464,9 @@ class CCA(MambaBase, CustomOp):
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
-        delayed_v_state = self.v_proj_delayed(hs[:num_actual_tokens])
-        delayed_v_state_d, delayed_v_state_p = torch.split(
-            delayed_v_state,
+        value_state = self._value_state_projection(hs[:num_actual_tokens])
+        value_state_d, value_state_p = torch.split(
+            value_state,
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
@@ -381,9 +483,9 @@ class CCA(MambaBase, CustomOp):
         )
         decode_is_pad: torch.Tensor | None = None
         if has_prefill:
-            assert state_indices_tensor_p is not None
-            assert has_initial_states_p is not None
-            assert query_start_loc_p is not None
+            assert state_indices_tensor_p.numel() > 0
+            assert has_initial_states_p.numel() > 0
+            assert query_start_loc_p.numel() > 0
             # Prefill
             prefill_slice = slice(num_decodes, num_decodes + num_prefill_tokens)
             value_delayed_prefill = value_delayed[prefill_slice]
@@ -391,7 +493,7 @@ class CCA(MambaBase, CustomOp):
             for i in range(len(query_start_loc_p) - 1):
                 start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
                 qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]  # [S_cur, B, H]
-                delayed_v_state_cur = delayed_v_state_p[start_i:end_i]
+                value_state_cur = value_state_p[start_i:end_i]
                 qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)  # [1, H, S_cur]
 
                 if has_initial_states_p[i]:
@@ -409,12 +511,12 @@ class CCA(MambaBase, CustomOp):
                         [qk_packed0_cached, qk_packed1_cur], dim=-1
                     )  # [1, H, S_cur + total_padding]
                 else:
-                    value_delayed_cached = self.v_proj_delayed(
+                    value_delayed_cached = self._value_state_projection(
                         hs_p.new_zeros(1, 1, self.hidden_size))
                     qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
 
                 value_delayed_prefill[start_i:end_i] = torch.cat(
-                    [value_delayed_cached, delayed_v_state_cur[:-1]], dim=0)
+                    [value_delayed_cached, value_state_cur[:-1]], dim=0)
 
                 conv_states_cur = nn.functional.pad(
                     qk_packed2_cur,
@@ -430,13 +532,13 @@ class CCA(MambaBase, CustomOp):
                 ).permute(2, 0, 1)  # [S, B, E]
                 qk_packed3_prefill[start_i:end_i] = qk_packed3_cur
 
-            recurrent_states[state_indices_tensor_p] = delayed_v_state_p[
+            recurrent_states[state_indices_tensor_p] = value_state_p[
                 query_start_loc_p[1:] - 1, 0, :].to(
                     device=recurrent_states.device,
                     dtype=recurrent_states.dtype)
 
         if has_decode:
-            assert state_indices_tensor_d is not None
+            assert state_indices_tensor_d.numel() > 0
             # Generation
             # In generation B and S are actually the same in meaning
             # That's why we don't need to transpose qk_packed0
@@ -504,7 +606,7 @@ class CCA(MambaBase, CustomOp):
             if value_delayed_decode.dtype != value_delayed.dtype:
                 value_delayed_decode = value_delayed_decode.to(value_delayed.dtype)
             value_delayed[:num_decodes] = value_delayed_decode
-            new_recurrent_state = delayed_v_state_d[:, 0, :].to(
+            new_recurrent_state = value_state_d[:, 0, :].to(
                 recurrent_states.dtype)
             new_recurrent_state = torch.where(
                 decode_is_pad.view(-1, 1),
@@ -519,12 +621,17 @@ class CCA(MambaBase, CustomOp):
         del qk_packed0_p
         del hs_d
         del hs_p
-        del delayed_v_state_d
-        del delayed_v_state_p
+        del value_state_d
+        del value_state_p
 
         # Values from the two time streams
-        v1 = self.v_proj_current(hs)  # [S, B, latent_k_dim/2]
-        value = torch.cat([v1, value_delayed], dim=-1).contiguous()
+        if self.tp_size == 1:
+            v1 = self._current_value(hs)
+            value = torch.cat([v1, value_delayed], dim=-1).contiguous()
+        elif self.tp_rank == 0:
+            value = value_state.contiguous()
+        else:
+            value = value_delayed.contiguous()
         value = value.view(
             num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
         )  # [S, B, kh, dh]
@@ -579,8 +686,8 @@ class CCA(MambaBase, CustomOp):
         return MambaStateShapeCalculator.cca_state_shape(
             tp_world_size=get_tensor_model_parallel_world_size(),
             conv_kernel_size=self.total_padding,
-            num_k_heads=self.num_k_heads,
-            num_q_heads=self.num_q_heads,
+            num_k_heads=self.total_num_k_heads,
+            num_q_heads=self.total_num_q_heads,
             head_dim=self.head_dim,
             recurrent_state_size=self.recurrent_v_dim,
         )

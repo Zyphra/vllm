@@ -13,6 +13,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, RoutedExperts
@@ -28,11 +29,11 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
-    ParallelLMHead,
     UnquantizedEmbeddingMethod,
-    VocabParallelEmbedding,
+    pad_vocab_size,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+from vllm.model_executor.utils import set_weight_attrs
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.zaya import ZayaConfig
 
@@ -52,6 +53,70 @@ class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
         if bias is not None:
             out = out + bias.to(torch.float32)
         return out
+
+
+class ZayaReplicatedVocabEmbedding(nn.Module):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        org_num_embeddings: int | None = None,
+        padding_size: int = DEFAULT_VOCAB_PADDING_SIZE,
+        bias: bool = False,
+    ):
+        super().__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.org_vocab_size = org_num_embeddings or num_embeddings
+        self.num_embeddings_padded = pad_vocab_size(
+            self.org_vocab_size, padding_size)
+        params_dtype = torch.get_default_dtype()
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.num_embeddings_padded,
+                embedding_dim,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        set_weight_attrs(
+            self.weight,
+            {"output_dim": 0, "weight_loader": self.weight_loader},
+        )
+        if bias:
+            self.bias = nn.Parameter(
+                torch.empty(self.num_embeddings_padded, dtype=params_dtype),
+                requires_grad=False,
+            )
+            set_weight_attrs(
+                self.bias,
+                {"output_dim": 0, "weight_loader": self.weight_loader},
+            )
+        else:
+            self.register_parameter("bias", None)
+        self.quant_method = UnquantizedEmbeddingMethod()
+
+    def weight_loader(self, param: nn.Parameter,
+                      loaded_weight: torch.Tensor) -> None:
+        if loaded_weight.ndim == 0:
+            loaded_weight = loaded_weight.reshape(1)
+        param.data.zero_()
+        if param.data.ndim == loaded_weight.ndim:
+            param.data[:loaded_weight.shape[0]].copy_(loaded_weight)
+        else:
+            param.data.copy_(loaded_weight)
+
+    def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        return self.quant_method.embedding(self, input_.long())
+
+    def get_sharded_to_full_mapping(self) -> None:
+        return None
+
+    def tie_weights(
+        self, embed_tokens: "ZayaReplicatedVocabEmbedding"
+    ) -> "ZayaReplicatedVocabEmbedding":
+        self.weight = embed_tokens.weight
+        return self
 
 
 class ZayaResidualScaling(nn.Module):
@@ -120,15 +185,18 @@ class ZayaAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.num_key_value_heads = config.num_key_value_heads
-        self.num_attention_heads = config.num_attention_heads
+        self.tp_size = get_tensor_model_parallel_world_size()
+        self.total_num_key_value_heads = config.num_key_value_heads
+        self.total_num_attention_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads // self.tp_size
+        self.num_attention_heads = config.num_attention_heads // self.tp_size
         self.head_dim = config.head_dim
         self.scale = self.head_dim**-0.5
 
         self.qkv_proj = CCA(
             config=config,
-            cca_num_k_heads=self.num_key_value_heads,
-            cca_num_q_heads=self.num_attention_heads,
+            cca_num_k_heads=self.total_num_key_value_heads,
+            cca_num_q_heads=self.total_num_attention_heads,
             hidden_size=self.hidden_size,
             head_dim=self.head_dim,
             cca_time0=config.cca_time0,
@@ -140,7 +208,7 @@ class ZayaAttention(nn.Module):
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = ReplicatedLinear(
-            self.num_attention_heads * self.head_dim,
+            self.total_num_attention_heads * self.head_dim,
             self.hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
@@ -187,6 +255,9 @@ class ZayaAttention(nn.Module):
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
         q, k = self.rotary_emb(position_ids, q, k)
         attn_output = self.attn(q, k, v)
+        if self.tp_size == 2:
+            attn_output = tensor_model_parallel_all_gather(
+                attn_output.contiguous())
         return self.o_proj(attn_output)
 
 
@@ -335,6 +406,7 @@ class ZayaSparseMoeBlock(nn.Module):
             custom_routing_function=_custom_routing_fn,
             activation="silu",
             quant_config=quant_config,
+            tp_size=1,
             prefix=f"{prefix}.experts",
         )
 
@@ -427,7 +499,7 @@ class ZayaModel(nn.Module):
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-        self.embed_tokens = VocabParallelEmbedding(
+        self.embed_tokens = ZayaReplicatedVocabEmbedding(
             self.vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
@@ -519,9 +591,8 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
             "Zaya currently does not support prefix caching")
 
         tp_world_size = get_tensor_model_parallel_world_size()
-        if tp_world_size > 1:
-            logger.warning(
-                "TP>1 detected; CCA currently replicates heads on every rank.")
+        if tp_world_size not in (1, 2):
+            raise ValueError("Zaya only supports tensor_parallel_size 1 or 2")
 
         super().__init__()
         self.config = config
@@ -536,14 +607,13 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
         self.unpadded_vocab_size = config.vocab_size
         if lora_config:
             self.unpadded_vocab_size += lora_config.lora_extra_vocab_size
-        self.lm_head = ParallelLMHead(
+        self.lm_head = ZayaReplicatedVocabEmbedding(
             self.unpadded_vocab_size,
             config.hidden_size,
             org_num_embeddings=config.vocab_size,
             padding_size=(
                 DEFAULT_VOCAB_PADDING_SIZE
                 if not lora_config else lora_config.lora_vocab_padding_size),
-            quant_config=None,
             bias=config.lm_head_bias,
         )
         if config.tie_word_embeddings:
@@ -570,7 +640,9 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.lm_head.quant_method.apply(
+            self.lm_head, hidden_states, bias=self.lm_head.bias)
+        return logits[..., :self.config.vocab_size]
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
@@ -587,6 +659,7 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
         loaded_params: set[str] = set()
         tp_rank = get_tensor_model_parallel_rank()
+        tp_world_size = get_tensor_model_parallel_world_size()
         disable_tqdm = tp_rank != 0
 
         import tqdm
@@ -662,6 +735,14 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                 continue
 
             if weight_name not in params_dict:
+                is_remote_value_stream = tp_world_size == 2 and (
+                    (tp_rank == 0
+                     and ".qkv_proj.v_proj_delayed." in weight_name)
+                    or (tp_rank == 1
+                        and ".qkv_proj.v_proj_current." in weight_name)
+                )
+                if is_remote_value_stream:
+                    continue
                 skipped_weights.append(weight_name)
                 continue
             param = params_dict[weight_name]
