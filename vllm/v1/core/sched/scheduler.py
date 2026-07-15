@@ -62,6 +62,46 @@ from vllm.v1.utils import record_function_or_nullcontext
 logger = init_logger(__name__)
 
 
+def _assert_sampled_logprob_rows(
+    req_id: str,
+    new_token_ids: list[int],
+    new_logprobs: Any,
+) -> None:
+    """Fail closed if speculative logprob rows no longer match emitted tokens.
+
+    ``logprob_token_ids[:, 0]`` is the sampled-token identity column.  The
+    scheduler slices expanded speculative rows down to each request's accepted
+    prefix, so checking it here catches request-offset, rejection-compaction,
+    and stop-truncation drift before behavior logprobs reach the caller.
+    """
+    token_ids = np.asarray(new_token_ids, dtype=np.int64)
+    row_token_ids = np.asarray(new_logprobs.logprob_token_ids)
+    row_logprobs = np.asarray(new_logprobs.logprobs)
+    if row_token_ids.ndim != 2 or row_token_ids.shape[0] != token_ids.size:
+        raise RuntimeError(
+            "V2 TiDAR sampled-logprob row-count mismatch for request "
+            f"{req_id}: emitted={token_ids.size}, rows={row_token_ids.shape}"
+        )
+    if row_logprobs.shape != row_token_ids.shape:
+        raise RuntimeError(
+            "V2 TiDAR sampled-logprob tensor-shape mismatch for request "
+            f"{req_id}: token_ids={row_token_ids.shape}, logprobs={row_logprobs.shape}"
+        )
+    if token_ids.size and not np.array_equal(row_token_ids[:, 0], token_ids):
+        mismatch = np.flatnonzero(row_token_ids[:, 0] != token_ids)
+        first = int(mismatch[0])
+        raise RuntimeError(
+            "V2 TiDAR sampled-logprob token identity mismatch for request "
+            f"{req_id} at row {first}: emitted={int(token_ids[first])}, "
+            f"logprob_row={int(row_token_ids[first, 0])}"
+        )
+    if row_logprobs.size and not np.isfinite(row_logprobs[:, 0]).all():
+        raise RuntimeError(
+            "V2 TiDAR sampled-token logprobs are non-finite for request "
+            f"{req_id}"
+        )
+
+
 class Scheduler(SchedulerInterface):
     def __init__(
         self,
@@ -1505,6 +1545,8 @@ class Scheduler(SchedulerInterface):
                 and logprobs
             ):
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
+                if os.environ.get("VLLM_TIDAR_ASSERT_AR_LOGPROBS", "0") == "1":
+                    _assert_sampled_logprob_rows(req_id, new_token_ids, new_logprobs)
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
                 struct_output_request = request.structured_output_request
