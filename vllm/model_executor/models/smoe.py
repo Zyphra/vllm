@@ -1024,6 +1024,25 @@ class SMoEModel(nn.Module):
         return hidden_states
 
 
+def _validate_tidar_cca_backend(
+    vllm_config: VllmConfig,
+    *,
+    use_triton: bool = VLLM_CCA_TRITON,
+) -> None:
+    """Reject a CCA backend that cannot preserve TiDAR recurrent state."""
+    spec = vllm_config.speculative_config
+    use_tidar = (
+        spec is not None
+        and getattr(spec, "use_tidar", lambda: False)()
+    )
+    if use_tidar and not use_triton:
+        raise RuntimeError(
+            "TiDAR requires the Triton CCA backend because the native CCA "
+            "path does not implement draft/verify state isolation or "
+            "accepted-candidate state commit. Set VLLM_CCA_TRITON=1."
+        )
+
+
 class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
 
     @classmethod
@@ -1077,6 +1096,7 @@ class SMoEForCausalLM(nn.Module, HasInnerState, IsHybrid, MixtureOfExperts):
         return MambaStateCopyFuncCalculator.cca_state_copy_func()
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        _validate_tidar_cca_backend(vllm_config)
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         lora_config = vllm_config.lora_config
