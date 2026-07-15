@@ -58,3 +58,23 @@ def test_gumbel_sample_with_probs_matches_reference(batch_size: int) -> None:
     assert torch.equal(tokens, expected_tokens)
     assert torch.allclose(logsumexp, expected_logsumexp, atol=2e-6, rtol=1e-6)
     assert torch.allclose(selected_probs, expected_probs, atol=1e-7, rtol=2e-6)
+
+    prob_token_ids = (expected_tokens + 1) % vocab_size
+    expected_prob_token_probs = torch.softmax(scaled_logits, dim=-1).gather(
+        1, prob_token_ids.unsqueeze(1)
+    ).squeeze(1)
+    tokens, prob_token_probs, logsumexp = gumbel_sample_with_probs(
+        logits,
+        idx_mapping,
+        temperatures,
+        seeds,
+        positions,
+        apply_temperature=True,
+        prob_token_ids=prob_token_ids,
+    )
+
+    assert torch.equal(tokens, expected_tokens)
+    assert torch.allclose(logsumexp, expected_logsumexp, atol=2e-6, rtol=1e-6)
+    assert torch.allclose(
+        prob_token_probs, expected_prob_token_probs, atol=1e-7, rtol=2e-6
+    )

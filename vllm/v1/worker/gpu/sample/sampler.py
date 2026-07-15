@@ -13,7 +13,11 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.worker.gpu.metrics.logits import get_num_nans
-from vllm.v1.worker.gpu.sample.gumbel import apply_temperature, gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import (
+    apply_temperature,
+    gumbel_sample,
+    gumbel_sample_with_probs,
+)
 from vllm.v1.worker.gpu.sample.logit_bias import LogitBiasState
 from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.min_p import apply_min_p
@@ -140,21 +144,30 @@ class Sampler:
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
+        prob_token_ids: torch.Tensor | None = None,
+        defer_logprobs: bool = False,
     ) -> SamplerOutput:
         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
         # that num_nans is computed before applying penalties and temperature.
         num_nans = get_num_nans(logits) if self.compute_nans else None
-        sampled, processed_logits, ar_logprob_logits = self.sample(
+        (
+            sampled,
+            processed_logits,
+            ar_logprob_logits,
+            prob_token_probs,
+            logsumexp,
+        ) = self.sample(
             logits,
             idx_mapping,
             idx_mapping_np,
             pos,
             input_ids,
             expanded_local_pos,
+            prob_token_ids,
         )
 
         max_num_logprobs = self.sampling_states.max_num_logprobs(idx_mapping_np)
-        if max_num_logprobs != NO_LOGPROBS:
+        if max_num_logprobs != NO_LOGPROBS and not defer_logprobs:
             sampled_before_logprobs = (
                 sampled.clone() if self.assert_ar_logprobs else None
             )
@@ -190,6 +203,11 @@ class Sampler:
             sampled_token_ids=sampled.view(-1, 1),
             logprobs_tensors=logprobs_tensors,
             num_nans=num_nans,
+            prob_token_probs=prob_token_probs,
+            logsumexp=logsumexp,
+            processed_logits=(
+                processed_logits if prob_token_ids is not None else None
+            ),
         )
         return sampler_output
 
@@ -201,7 +219,14 @@ class Sampler:
         pos: torch.Tensor,
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        prob_token_ids: torch.Tensor | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         needs_ar_logprobs = (
             self.return_ar_logprobs
             and self.sampling_states.max_num_logprobs(idx_mapping_np) != NO_LOGPROBS
@@ -215,6 +240,7 @@ class Sampler:
             and not self.sampling_states.do_top_p(idx_mapping_np)
             and self.sampling_states.max_num_logprobs(idx_mapping_np)
             == NO_LOGPROBS
+            and prob_token_ids is None
         )
         if simple_sampling:
             use_fp32_gumbel = os.environ.get(
@@ -229,7 +255,7 @@ class Sampler:
                     apply_temperature=True,
                     use_fp64_noise=False,
                 )
-                return sampled, logits, None
+                return sampled, logits, None, None, None
 
             if logits.dtype != torch.float32:
                 logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -244,7 +270,7 @@ class Sampler:
                 pos,
                 apply_temperature=False,
             )
-            return sampled, logits, None
+            return sampled, logits, None, None, None
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -290,12 +316,25 @@ class Sampler:
             logits = apply_top_k_top_p(logits, top_k, top_p)
 
         # Sample the next token.
-        sampled = gumbel_sample(
-            logits,
-            idx_mapping,
-            self.sampling_states.temperature.gpu,
-            self.sampling_states.seeds.gpu,
-            pos,
-            apply_temperature=False,
-        )
-        return sampled, logits, ar_logprob_logits
+        if prob_token_ids is None:
+            sampled = gumbel_sample(
+                logits,
+                idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                apply_temperature=False,
+            )
+            prob_token_probs = None
+            logsumexp = None
+        else:
+            sampled, prob_token_probs, logsumexp = gumbel_sample_with_probs(
+                logits,
+                idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                apply_temperature=False,
+                prob_token_ids=prob_token_ids,
+            )
+        return sampled, logits, ar_logprob_logits, prob_token_probs, logsumexp

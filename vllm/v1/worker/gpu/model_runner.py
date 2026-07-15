@@ -69,11 +69,17 @@ from vllm.v1.worker.gpu.kv_connector import (
 from vllm.v1.worker.gpu.lora_utils import LoraState
 from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.mm.mrope_utils import MRopeState
+from vllm.v1.worker.gpu.sample.logprob import compute_topk_logprobs
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
+from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS
 from vllm.v1.worker.gpu.spec_decode import init_speculator
-from vllm.v1.worker.gpu.spec_decode.rejection_sample import rejection_sample
+from vllm.v1.worker.gpu.spec_decode.rejection_sample import (
+    get_rejection_logprob_token_ids,
+    rejection_sample,
+    stochastic_rejection_sample,
+)
 from vllm.v1.worker.gpu.spec_decode.utils import DraftTokensHandler
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.gpu.structured_outputs import StructuredOutputsWorker
@@ -910,6 +916,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
+        use_stochastic_tidar = (
+            input_batch.num_draft_tokens > 0
+            and self._use_tidar()
+            and getattr(self.speculator, "draft_token_probs_cache", None) is not None
+        )
+        prob_token_ids = input_ids.roll(-1) if use_stochastic_tidar else None
+
         # Sample tokens and compute logprobs (if needed).
         sampler_output = self.sampler(
             logits,
@@ -919,6 +932,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             sample_pos,
             input_ids,
             input_batch.expanded_local_pos,
+            prob_token_ids=prob_token_ids,
+            defer_logprobs=use_stochastic_tidar,
         )
 
         if input_batch.num_draft_tokens == 0:
@@ -928,13 +943,65 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             )
         else:
             # Rejection sampling for spec decoding.
-            sampled_tokens, num_sampled = rejection_sample(
-                sampler_output.sampled_token_ids,
-                input_ids,
-                input_batch.cu_num_logits,
-                self.num_speculative_steps,
-            )
+            if use_stochastic_tidar:
+                assert sampler_output.prob_token_probs is not None
+                assert sampler_output.processed_logits is not None
+                assert sampler_output.logsumexp is not None
+                assert self.speculator is not None
+                assert self.speculator.draft_token_probs_cache is not None
+                assert self.speculator.draft_logits_cache is not None
+                assert self.speculator.draft_logsumexp_cache is not None
+                sampled_tokens, num_sampled = stochastic_rejection_sample(
+                    sampler_output.sampled_token_ids.view(-1),
+                    input_ids,
+                    input_batch.cu_num_logits,
+                    input_batch.idx_mapping,
+                    sample_pos,
+                    self.sampler.sampling_states.seeds.gpu,
+                    self.num_speculative_steps,
+                    self.speculator.draft_token_probs_cache,
+                    self.speculator.draft_logits_cache,
+                    self.speculator.draft_logsumexp_cache,
+                    self.speculator.diff_temperature,
+                    sampler_output.prob_token_probs,
+                    sampler_output.processed_logits,
+                    sampler_output.logsumexp,
+                )
+            else:
+                sampled_tokens, num_sampled = rejection_sample(
+                    sampler_output.sampled_token_ids,
+                    input_ids,
+                    input_batch.cu_num_logits,
+                    self.num_speculative_steps,
+                )
             sampler_output.sampled_token_ids = sampled_tokens
+
+        if use_stochastic_tidar:
+            max_num_logprobs = self.sampler.sampling_states.max_num_logprobs(
+                input_batch.idx_mapping_np
+            )
+            if max_num_logprobs != NO_LOGPROBS:
+                logprob_token_ids = get_rejection_logprob_token_ids(
+                    sampler_output.sampled_token_ids,
+                    num_sampled,
+                    input_batch.cu_num_logits,
+                    input_ids.shape[0],
+                )
+                logprob_logits = (
+                    sampler_output.processed_logits
+                    if self.sampler.logprobs_mode == "processed_logprobs"
+                    else logits
+                )
+                assert logprob_logits is not None
+                sampler_output.logprobs_tensors = compute_topk_logprobs(
+                    logprob_logits,
+                    max_num_logprobs,
+                    logprob_token_ids,
+                    input_batch.cu_num_logits_np.tolist(),
+                )
+            sampler_output.prob_token_probs = None
+            sampler_output.logsumexp = None
+            sampler_output.processed_logits = None
 
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.

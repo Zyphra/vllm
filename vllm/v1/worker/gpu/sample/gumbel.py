@@ -238,9 +238,11 @@ def _reduce_gumbel_sample_with_probs_kernel(
     logits_stride,
     idx_mapping_ptr,
     temp_ptr,
+    prob_token_ids_ptr,
     num_blocks,
     BLOCK_SIZE: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
+    USE_PROB_TOKEN_IDS: tl.constexpr,
 ):
     batch_idx = tl.program_id(0)
     block = tl.arange(0, BLOCK_SIZE)
@@ -266,8 +268,11 @@ def _reduce_gumbel_sample_with_probs_kernel(
         tl.sum(tl.exp(block_logsumexp - max_logsumexp), axis=0)
     )
 
+    prob_token_id = sampled
+    if USE_PROB_TOKEN_IDS:
+        prob_token_id = tl.load(prob_token_ids_ptr + batch_idx)
     selected_logit = tl.load(
-        logits_ptr + batch_idx * logits_stride + sampled
+        logits_ptr + batch_idx * logits_stride + prob_token_id
     ).to(tl.float32)
     if APPLY_TEMPERATURE:
         req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
@@ -287,13 +292,19 @@ def gumbel_sample_with_probs(
     pos: torch.Tensor,
     apply_temperature: bool,
     use_fp64_noise: bool = True,
+    prob_token_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sample logits and return compact probability data in two kernels.
 
     All mapped temperatures must be positive. This helper is for stochastic
     sampling paths that need q(x) and the log-normalizer for rejection sampling.
+    By default q(x) is returned for the sampled token. ``prob_token_ids`` can
+    select a different token per row, such as the draft token under a target
+    distribution.
     """
     num_reqs, vocab_size = logits.shape
+    if prob_token_ids is not None:
+        assert prob_token_ids.shape == (num_reqs,)
     block_size = 1024 if use_fp64_noise else 2048
     num_blocks = triton.cdiv(vocab_size, block_size)
     local_argmax = torch.empty(
@@ -342,8 +353,10 @@ def gumbel_sample_with_probs(
         logits.stride(0),
         idx_mapping,
         temperature,
+        prob_token_ids,
         num_blocks,
         BLOCK_SIZE=triton.next_power_of_2(num_blocks),
         APPLY_TEMPERATURE=apply_temperature,
+        USE_PROB_TOKEN_IDS=prob_token_ids is not None,
     )
     return sampled, selected_probs, logsumexp

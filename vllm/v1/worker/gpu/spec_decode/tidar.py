@@ -96,6 +96,9 @@ class TiDARSpeculator:
         self.last_draft_probs: torch.Tensor | None = None
         self.last_draft_token_probs: torch.Tensor | None = None
         self.last_draft_logsumexp: torch.Tensor | None = None
+        self.draft_logits_cache: torch.Tensor | None = None
+        self.draft_token_probs_cache: torch.Tensor | None = None
+        self.draft_logsumexp_cache: torch.Tensor | None = None
 
     def _get_draft_cudagraph_sizes(self) -> set[int]:
         if os.environ.get("VLLM_TIDAR_V2_DISABLE_DRAFT_CUDAGRAPH") == "1":
@@ -166,6 +169,26 @@ class TiDARSpeculator:
         if not self.attn_layer_names:
             raise RuntimeError(
                 "TiDAR requires at least one attention layer in the target model.")
+        if self.diff_temperature != 0.0 and self._dspark_active():
+            draft_weight = target_model.diffusion_output_layer.weight
+            vocab_size = draft_weight.shape[0]
+            cache_shape = (
+                self.max_num_reqs,
+                self.num_speculative_steps,
+                vocab_size,
+            )
+            self.draft_logits_cache = torch.empty(
+                cache_shape,
+                dtype=draft_weight.dtype,
+                device=self.device,
+            )
+            compact_shape = cache_shape[:2]
+            self.draft_token_probs_cache = torch.empty(
+                compact_shape, dtype=torch.float32, device=self.device
+            )
+            self.draft_logsumexp_cache = torch.empty_like(
+                self.draft_token_probs_cache
+            )
         logger.info(
             "Initialized V2 TiDAR two-forward self-speculator%s.",
             " with DSpark+Markov drafting" if self._dspark_active() else "",
@@ -289,6 +312,37 @@ class TiDARSpeculator:
             None if logsumexp is None else logsumexp.view(-1).contiguous()
         )
         return tokens.view(-1)
+
+    def _cache_compact_draft_state(
+        self,
+        idx_mapping: torch.Tensor,
+        batch_size: int,
+    ) -> None:
+        if self.last_draft_token_probs is None:
+            return
+        assert self.last_draft_logits is not None
+        assert self.last_draft_logsumexp is not None
+        assert self.draft_logits_cache is not None
+        assert self.draft_token_probs_cache is not None
+        assert self.draft_logsumexp_cache is not None
+
+        K = self.num_speculative_steps
+        state_indices = idx_mapping[:batch_size].to(torch.long)
+        self.draft_logits_cache.index_copy_(
+            0,
+            state_indices,
+            self.last_draft_logits.view(batch_size, K, -1),
+        )
+        self.draft_token_probs_cache.index_copy_(
+            0,
+            state_indices,
+            self.last_draft_token_probs.view(batch_size, K),
+        )
+        self.draft_logsumexp_cache.index_copy_(
+            0,
+            state_indices,
+            self.last_draft_logsumexp.view(batch_size, K),
+        )
 
     def set_attn(
         self,
@@ -645,6 +699,7 @@ class TiDARSpeculator:
                 prev_token=next_token_ids,
                 sampling_seeds=sampling_seeds,
             )
+            self._cache_compact_draft_state(idx_mapping, num_reqs)
             self.draft_tokens[:num_reqs].copy_(
                 draft_token_ids.view(num_reqs, K)
             )
