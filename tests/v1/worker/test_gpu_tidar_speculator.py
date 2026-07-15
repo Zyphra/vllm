@@ -35,6 +35,7 @@ def test_dspark_markov_global_reset_and_chain(monkeypatch) -> None:
         batch_size=1,
         mask_positions=torch.tensor([[1, 2, 3]]),
         prev_token=torch.tensor([0]),
+        sampling_seeds=torch.tensor([1234]),
     )
 
     # Position 2 resets to token 0; position 3 chains from position 2's sample.
@@ -48,10 +49,18 @@ def test_dspark_markov_global_reset_and_chain(monkeypatch) -> None:
 def test_dspark_stochastic_keeps_compact_draft_distribution(monkeypatch) -> None:
     monkeypatch.setenv("VLLM_DSPARK_GLOBAL_RESET", "1")
     monkeypatch.delenv("VLLM_DSPARK_NO_MARKOV", raising=False)
+    def fake_gumbel_sample_with_probs(logits, *_args, **_kwargs):
+        sampled = logits.argmax(dim=-1)
+        scaled_logits = logits.float() / 0.7
+        logsumexp = torch.logsumexp(scaled_logits, dim=-1)
+        selected_logits = scaled_logits.gather(
+            1, sampled.unsqueeze(1)).squeeze(1)
+        return sampled, torch.exp(selected_logits - logsumexp), logsumexp
+
     monkeypatch.setattr(
         tidar_module,
-        "gumbel_sample",
-        lambda logits, *_args, **_kwargs: logits.argmax(dim=-1),
+        "gumbel_sample_with_probs",
+        fake_gumbel_sample_with_probs,
     )
 
     speculator = object.__new__(TiDARSpeculator)
@@ -77,6 +86,7 @@ def test_dspark_stochastic_keeps_compact_draft_distribution(monkeypatch) -> None
         batch_size=1,
         mask_positions=torch.tensor([[1, 2, 3]]),
         prev_token=torch.tensor([0]),
+        sampling_seeds=torch.tensor([1234]),
     )
 
     assert draft_tokens.tolist() == [1, 1, 2]

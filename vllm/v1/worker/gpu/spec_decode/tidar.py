@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample_with_probs
 from vllm.utils.dspark import (
     enforce_dspark_target_contract,
     validate_tidar_temperature_contract,
@@ -180,7 +180,8 @@ class TiDARSpeculator:
     def _sample_dspark_stochastic(
         self,
         logits: torch.Tensor,
-        sample_position: int,
+        sample_positions: torch.Tensor,
+        sampling_seeds: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Sample DSpark logits without constructing their probability matrix.
 
@@ -191,35 +192,23 @@ class TiDARSpeculator:
         """
         batch_size = logits.shape[0]
         device = logits.device
+        assert sample_positions.shape == (batch_size,)
+        assert sampling_seeds.shape == (batch_size,)
         row_indices = torch.arange(batch_size, dtype=torch.int64, device=device)
         temperatures = torch.full(
             (batch_size,), self.diff_temperature, dtype=torch.float32, device=device
         )
-        # TiDAR's historical torch.multinomial path used the global CUDA RNG.
-        # Keep that contract while letting the fused gumbel kernel generate one
-        # independent categorical draw per row.
-        seeds = torch.randint(
-            torch.iinfo(torch.int32).max,
-            (batch_size,),
-            dtype=torch.int64,
-            device=device,
-        )
-        positions = torch.full(
-            (batch_size,), sample_position, dtype=torch.int64, device=device
-        )
-        sampled = gumbel_sample(
+        # Use the same request-local seed and absolute position scheme as the
+        # target sampler. Global CUDA RNG would make drafts depend on scheduling
+        # order, refills, and KV-cache pressure.
+        return gumbel_sample_with_probs(
             logits,
             row_indices,
             temperatures,
-            seeds,
-            positions,
+            sampling_seeds,
+            sample_positions,
             apply_temperature=True,
         )
-        scaled_logits = logits.to(torch.float32).div(self.diff_temperature)
-        logsumexp = torch.logsumexp(scaled_logits, dim=-1)
-        selected_logits = scaled_logits.gather(1, sampled.unsqueeze(1)).squeeze(1)
-        selected_probs = torch.exp(selected_logits - logsumexp)
-        return sampled, selected_probs, logsumexp
 
     def _dspark_sample_drafts(
         self,
@@ -227,6 +216,7 @@ class TiDARSpeculator:
         batch_size: int,
         mask_positions: torch.Tensor,
         prev_token: torch.Tensor,
+        sampling_seeds: torch.Tensor,
     ) -> torch.Tensor:
         model = self.model
         draft_weight = model.diffusion_output_layer.weight
@@ -235,6 +225,7 @@ class TiDARSpeculator:
         block_len = int(getattr(model, "dspark_block_len", 16))
         K = self.num_speculative_steps
         assert hidden_states.shape[0] == batch_size * K
+        assert sampling_seeds.shape == (batch_size,)
 
         base_logits = torch.matmul(hidden_states, draft_weight.t()).view(
             batch_size, K, -1
@@ -274,7 +265,11 @@ class TiDARSpeculator:
                 sampled = logits_k.argmax(dim=-1)
             else:
                 sampled, selected_probs, row_logsumexp = \
-                    self._sample_dspark_stochastic(logits_k, k)
+                    self._sample_dspark_stochastic(
+                        logits_k,
+                        mask_positions[:, k].to(torch.int64),
+                        sampling_seeds,
+                    )
                 assert token_probs is not None and logsumexp is not None
                 token_probs[:, k] = selected_probs
                 logsumexp[:, k] = row_logsumexp
@@ -563,7 +558,7 @@ class TiDARSpeculator:
         num_tokens_across_dp: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del last_hidden_states, aux_hidden_states, next_prefill_tokens
-        del temperature, seeds
+        del temperature
 
         num_reqs = input_batch.num_reqs
         K = self.num_speculative_steps
@@ -575,6 +570,7 @@ class TiDARSpeculator:
                 f"V2 input buffer only holds {self.max_num_tokens}.")
 
         idx_mapping = input_batch.idx_mapping[:num_reqs]
+        sampling_seeds = seeds.index_select(0, idx_mapping.to(torch.long))
         next_token_ids = last_sampled.view(-1).gather(
             0, idx_mapping.to(torch.long)).to(torch.int32)
         live_seq_lens = (
@@ -647,6 +643,7 @@ class TiDARSpeculator:
                 num_reqs,
                 mask_positions=positions_2d[:, 1:],
                 prev_token=next_token_ids,
+                sampling_seeds=sampling_seeds,
             )
             self.draft_tokens[:num_reqs].copy_(
                 draft_token_ids.view(num_reqs, K)
@@ -664,6 +661,10 @@ class TiDARSpeculator:
             self.last_draft_probs = None
             draft_token_ids = logits.argmax(dim=-1)
         else:
+            logger.warning_once(
+                "V2 TiDAR draft probabilities are not yet wired into the "
+                "V2 rejection sampler; non-zero tidar_diff_temperature is "
+                "experimental on this path.")
             scaled_logits = logits.to(torch.float32) / self.diff_temperature
             draft_probs = torch.softmax(scaled_logits, dim=-1)
             draft_token_ids = torch.multinomial(
