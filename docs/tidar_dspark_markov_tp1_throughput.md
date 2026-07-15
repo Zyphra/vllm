@@ -8,6 +8,60 @@ distribution are different.
 
 ## Result
 
+### Continuous wave refill and graph-safety follow-up
+
+The V2 scheduler can now keep a production batch full without mixing prompt
+rows into a TiDAR verify forward. When a slot opens, it pauses the warm
+verifiers for one pure-prefill iteration, admits the replacement request, and
+returns to the captured verify geometry. The stochastic proposer preserves
+draft probabilities by stable request ID across that partial refill; the next
+full-batch proposal returns to the compact zero-copy layout.
+
+Two failure cases found during validation are handled explicitly:
+
+1. If KV or encoder pressure prevents the pure-prefill wave from scheduling
+   any tokens, the scheduler retries that turn with the warm verifiers. This
+   avoids a no-work deadlock and lets completed requests free more cache.
+2. TiDAR's variable-shape prompt/refill batches use eager execution. Piecewise
+   replay keys do not encode the changing CCA request-row mappings; a stress
+   run reproduced stale `indexSelect` inputs and a device assertion. Verify-only
+   B1-B32 geometries still use explicit FULL target graphs, and the drafter
+   remains captured. The server configuration is still
+   `FULL_AND_PIECEWISE`; only non-full TiDAR prompt/refill forwards fall back
+   to eager.
+
+The final test used one H100 on `vp-dgx-20`, TP1/PP1/DP1, BF16,
+`iter_0005600`, 128 ordered thinking-on prompts, concurrency 32, natural EOS,
+a 32,768-token safety cap, K16, `T_d=T_AR=0.6`, exact rejection,
+`logprobs=1`, routed experts, FA3 split-KV, Triton MoE/CCA,
+`gpu_memory_utilization=0.75`, async V2, and no data parallelism.
+
+| Refill-controlled metric | Final result |
+|---|---:|
+| Measurement window | 194 s |
+| Generated tokens | 724,967 |
+| Aggregate output throughput | **3,736.94 tok/s** |
+| Mean acceptance length, including bonus | **7.268** |
+| Running / waiting at final sample | **32 / 0** |
+| Completed and replaced during window | 22 |
+| Best observed 10-second output window | **4,158.2 tok/s** |
+
+The run remained at 32 active requests after 22 natural-EOS or length-cap
+completions. A preceding 512-token-cap stress pass completed all 128 requests
+and exercised the repeated prompt shapes without a crash, stall, preemption,
+or sampler-state error. The focused regression suite reports 115 passed and
+one skipped.
+
+Implementation commits are `550a7c460` (wave refill and request-keyed
+stochastic state preservation) and `2c296cc89` (graph-safe TiDAR fallback and
+the no-work scheduler retry). Raw artifacts are on `vp-dgx-20` under:
+
+```text
+/tmp/tidar_wave_refill_rebased6/stress/
+/tmp/tidar_wave_refill_rebased6/production.log
+/tmp/tidar_wave_refill_rebased6/server.log
+```
+
 ### Stochastic V2 production follow-up
 
 A later no-DP H100 run used stochastic DSpark and target sampling
