@@ -340,6 +340,19 @@ class EngineCore:
         # (i.e. client-aborted vs stop criteria met).
         self.scheduler.finish_requests(request_ids, RequestStatus.FINISHED_ABORTED)
 
+    def get_request_routed_experts(self, request_id: str):
+        """Snapshot a live request's KV-slot route history for client-side stop.
+
+        Doom-loop detection runs in AsyncLLM's output processor, outside the
+        EngineCore process.  A detected request is still live here, so read its
+        route history before the client emits a synthetic terminal output and
+        aborts the scheduler request.
+        """
+        request = self.scheduler.requests.get(request_id)
+        if request is None:
+            return None
+        return self.scheduler._get_routed_experts(request)
+
     def get_sync_quiescence_state(self, reason: str = "") -> dict[str, Any]:
         """Return DP1 freeze readiness without disturbing resident requests."""
         batch_queue = getattr(self, "batch_queue", None)
