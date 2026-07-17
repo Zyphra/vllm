@@ -14,6 +14,7 @@ from logging import DEBUG
 from typing import Any, TypeVar, cast
 
 import msgspec
+import numpy as np
 import zmq
 
 from vllm.config import ParallelConfig, VllmConfig
@@ -351,7 +352,23 @@ class EngineCore:
         request = self.scheduler.requests.get(request_id)
         if request is None:
             return None
-        return self.scheduler._get_routed_experts(request)
+        routed_experts = self.scheduler._get_routed_experts(request)
+        if routed_experts is None:
+            return None
+
+        # UtilityResult has no static result type, so returning an ndarray
+        # directly leaves its msgpack wire envelope ``(dtype, shape, data)``
+        # undecoded on the AsyncLLM side.  Use an explicit primitive-only
+        # envelope instead.  Doom-loop stops are rare, and the one-time copy
+        # keeps the payload valid after the utility response decoder releases
+        # its auxiliary ZMQ buffers.
+        routed_experts = np.ascontiguousarray(routed_experts)
+        return {
+            "format": "verl-routed-experts-v1",
+            "dtype": routed_experts.dtype.str,
+            "shape": list(routed_experts.shape),
+            "data": routed_experts.tobytes(order="C"),
+        }
 
     def get_sync_quiescence_state(self, reason: str = "") -> dict[str, Any]:
         """Return DP1 freeze readiness without disturbing resident requests."""
