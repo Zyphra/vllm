@@ -5581,6 +5581,8 @@ class GPUModelRunner(
                 param.copy_(loaded_weight)
                 loaded_weights.add(name)
 
+        getattr(model, "refresh_fp32_lmhead_cache", lambda: None)()
+
         # logging and validation
         counter_after_reloading = time.perf_counter()
         diff_seconds = counter_after_reloading - counter_before_reloading

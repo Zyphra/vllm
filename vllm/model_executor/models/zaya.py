@@ -48,7 +48,14 @@ class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
-        out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
+        if x.dim() == 2 and x.shape[0] > 32:
+            cached = getattr(layer, "_fp32_weight_t", None)
+            if cached is None or cached.shape != (layer.weight.shape[1],
+                                                   layer.weight.shape[0]):
+                cached = layer._fp32_weight_t = layer.weight.t().float()
+            out = torch.mm(x.float(), cached)
+        else:
+            out = torch.mm(x, layer.weight.t(), out_dtype=torch.float32)
         if bias is not None:
             out = out + bias.to(torch.float32)
         return out
@@ -571,6 +578,12 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
+
+    @torch.inference_mode()
+    def refresh_fp32_lmhead_cache(self) -> None:
+        cached = getattr(self.lm_head, "_fp32_weight_t", None)
+        if cached is not None:
+            cached.copy_(self.lm_head.weight.t())
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())
