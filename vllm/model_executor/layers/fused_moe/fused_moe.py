@@ -37,6 +37,10 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 logger = init_logger(__name__)
 
+_PRELOADED_MOE_CONFIGS: dict[
+    tuple[int, int, str | None, int, int], dict[int, Any] | None
+] = {}
+
 
 @triton.jit
 def write_zeros_to_output(
@@ -1118,6 +1122,30 @@ def get_moe_configs(
     return None
 
 
+def _preload_moe_configs(
+    moe_config: "FusedMoEConfig", quant_config: FusedMoEQuantConfig
+) -> None:
+    block_n, block_k = quant_config.block_shape or (0, 0)
+    geometry = (
+        moe_config.num_local_experts,
+        moe_config.intermediate_size_per_partition,
+        quant_config.config_name(moe_config.in_dtype),
+        block_n,
+        block_k,
+    )
+    _PRELOADED_MOE_CONFIGS[geometry] = get_moe_configs(*geometry)
+
+
+@torch._dynamo.assume_constant_result
+def _get_compiled_moe_config(
+    E: int, N: int, dtype: str | None, M: int, block_n: int, block_k: int
+) -> tuple[tuple[str, int], ...]:
+    configs = _PRELOADED_MOE_CONFIGS.get((E, N, dtype, block_n, block_k))
+    if configs is None or M not in configs:
+        return ()
+    return tuple((key, int(value)) for key, value in configs[M].items())
+
+
 @functools.lru_cache
 def _get_moe_config_device_name_eager() -> str:
     return current_platform.get_device_name()
@@ -1398,13 +1426,22 @@ def try_get_optimal_moe_config(
             N = N * 2
         block_n = block_shape[0] if block_shape else 0
         block_k = block_shape[1] if block_shape else 0
-        configs = get_moe_configs(E, N, dtype, block_n, block_k)
+        if torch.compiler.is_compiling():
+            compiled = _get_compiled_moe_config(
+                E, N, dtype, M, block_n, block_k
+            )
+            configs = None
+            config = dict(compiled) if compiled else get_default_config(
+                M, E, N, w1_shape[2], top_k, dtype, block_shape
+            )
+        else:
+            configs = get_moe_configs(E, N, dtype, block_n, block_k)
 
-        if configs:
+        if not torch.compiler.is_compiling() and configs:
             # If an optimal configuration map has been found, look up the
             # optimal config
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
-        else:
+        elif not torch.compiler.is_compiling():
             # Else use the default config
             config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
     return config

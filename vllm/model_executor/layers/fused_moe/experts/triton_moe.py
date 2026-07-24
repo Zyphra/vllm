@@ -16,6 +16,7 @@ from vllm.model_executor.layers.fused_moe.experts.lora_experts_mixin import (
     LoRAExpertsMixin,
 )
 from vllm.model_executor.layers.fused_moe.fused_moe import (
+    _preload_moe_configs,
     _prepare_expert_assignment,
     invoke_fused_moe_triton_kernel,
     invoke_fused_moe_wna16_triton_kernel,
@@ -66,6 +67,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
         # higher-precision + activation QDQ.
         self.quantization_emulation = False
         super().__init__(moe_config, quant_config)
+        _preload_moe_configs(moe_config, quant_config)
 
         self.gemm1_clamp_limit = quant_config.gemm1_clamp_limit
         # Gated-activation params: silu == swigluoai with alpha=1, beta=0.
