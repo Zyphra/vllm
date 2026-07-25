@@ -618,8 +618,23 @@ class CCA(MambaBase, CustomOp):
                 )
                 and output.dtype == qk_packed0_d.dtype
             )
+            dtype_geometry_supported = (
+                self.total_padding == 2
+                and self.head_dim in (64, 128)
+                and self.gqa_groups in (1, 2, 4, 8)
+                and (
+                    qk_packed0_d.dtype == conv_states.dtype
+                    or (
+                        qk_packed0_d.dtype == torch.bfloat16
+                        and conv_states.dtype == torch.float32
+                        and self.head_dim == 128
+                        and self.gqa_groups == 4
+                    )
+                )
+                and output.dtype == qk_packed0_d.dtype
+            )
             if (not has_prefill and cca_decode_fused.requested()
-                    and not decode_qk_fused):
+                    and not dtype_geometry_supported):
                 raise RuntimeError(
                     "fused CCA decode does not support the active geometry or "
                     f"dtypes: input={qk_packed0_d.dtype}, "
