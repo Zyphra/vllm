@@ -604,6 +604,9 @@ class CCA(MambaBase, CustomOp):
                 and self.total_padding == 2
                 and self.head_dim in (64, 128)
                 and self.gqa_groups in (1, 2, 4, 8)
+                # The measured mixed-state kernel has a C16 occupancy hole;
+                # retain the existing graph path for that regime.
+                and (num_decodes <= 8 or num_decodes >= 32)
                 and (
                     qk_packed0_d.dtype == conv_states.dtype
                     or (
