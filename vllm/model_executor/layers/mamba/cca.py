@@ -2,12 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+import os
 from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionBackend
-
-import os
 
 import numpy as np
 import torch
@@ -27,6 +26,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.ops import cca_decode_fused
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
@@ -34,7 +34,6 @@ from vllm.v1.attention.backends.cca_attn import CCAAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 logger = logging.getLogger(__name__)
-
 
 def _cca_qk_add_grouped_means(
     qk_packed3: torch.Tensor,
@@ -71,7 +70,6 @@ def _get_compiled_cca_qk_add_grouped_means() -> Callable:
             _cca_qk_add_grouped_means, fullgraph=True, dynamic=True
         )
     return _compiled_cca_qk_add_grouped_means
-
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
@@ -212,6 +210,35 @@ class CCA(MambaBase, CustomOp):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
         self.kv_cache = (torch.tensor([]), torch.tensor([]))
+        self._cca_fused_gw_weight = None
+        self._cca_fused_gw_version = -1
+        self._cca_fused_logged = False
+
+    def _get_cca_fused_weights(self):
+        """Return live grouped-conv views for the optional fused decode op."""
+        weight = self.conv_qk_grouped.weight
+        version = weight._version
+        if (self._cca_fused_gw_weight is None
+                or self._cca_fused_gw_version != version):
+            groups = self.num_k_heads + self.num_q_heads
+            grouped = weight.reshape(
+                groups, self.head_dim, self.head_dim, self.cca_time1
+            )
+            self._cca_fused_gw_weight = grouped.permute(
+                0, 2, 3, 1
+            ).contiguous().view(groups, self.head_dim * self.cca_time1,
+                                self.head_dim)
+            self._cca_fused_gw_version = version
+        depthwise = self.conv_qk_depthwise.weight.reshape(
+            self.in_out_ch, self.cca_time0
+        )
+        grouped_bias = (
+            None if self.conv_qk_grouped.bias is None
+            else self.conv_qk_grouped.bias.reshape(
+                self.num_k_heads + self.num_q_heads, self.head_dim
+            ).contiguous()
+        )
+        return depthwise, self.conv_qk_depthwise.bias, self._cca_fused_gw_weight, grouped_bias
 
     def _project_all(
         self, hs: torch.Tensor
@@ -466,7 +493,13 @@ class CCA(MambaBase, CustomOp):
             device=hs.device,
             dtype=hs.dtype,
         )
+        decode_qk_fused = False
         decode_is_pad: torch.Tensor | None = None
+        if cca_decode_fused.requested() and not cca_decode_fused.available():
+            raise RuntimeError(
+                "VLLM_CCA_DECODE_FUSED_ENABLED was requested but the "
+                "extension is unavailable"
+            )
         if has_prefill:
             assert state_indices_tensor_p is not None
             assert has_initial_states_p is not None
@@ -565,26 +598,80 @@ class CCA(MambaBase, CustomOp):
                 qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(
                     decode_qk_dtype
                 )
-            qk_packed0_cat = torch.cat(
-                [qk_packed0_cached_for_compute, qk_packed0_d.transpose(1, 2)], dim=-1
-            )  # [S, H, total_padding + 1]
-            qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(
-                1, 2
-            )  # [S, 1, E]
-            qk_packed3[:num_decodes] = qk_packed3_d
+            decode_qk_fused = (
+                not has_prefill
+                and cca_decode_fused.available()
+                and self.total_padding == 2
+                and self.head_dim in (64, 128)
+                and self.gqa_groups in (1, 2, 4, 8)
+                and (
+                    qk_packed0_d.dtype == conv_states.dtype
+                    or (
+                        qk_packed0_d.dtype == torch.bfloat16
+                        and conv_states.dtype == torch.float32
+                        and self.head_dim == 128
+                        and self.gqa_groups == 4
+                    )
+                )
+                and output.dtype == qk_packed0_d.dtype
+            )
+            if (not has_prefill and cca_decode_fused.requested()
+                    and not decode_qk_fused):
+                raise RuntimeError(
+                    "fused CCA decode does not support the active geometry or "
+                    f"dtypes: input={qk_packed0_d.dtype}, "
+                    f"state={conv_states.dtype}, output={output.dtype}"
+                )
+            if decode_qk_fused:
+                if not self._cca_fused_logged:
+                    logger.info(
+                        "Using fused CCA decode for %s: B=%d, Q=%d, KV=%d, D=%d",
+                        self.prefix,
+                        num_decodes,
+                        self.num_q_heads,
+                        self.num_k_heads,
+                        self.head_dim,
+                    )
+                    self._cca_fused_logged = True
+                dw_weight, dw_bias, gw_weight, gw_bias = (
+                    self._get_cca_fused_weights()
+                )
+                decode_args = (
+                    qk_packed0_d[:, 0, :], dw_weight, dw_bias, conv_states,
+                    state_indices_tensor_d, gw_weight, gw_bias, self.temp.data,
+                    self.num_q_heads, self.head_dim, self.gqa_groups,
+                    PAD_SLOT_ID, self.sqrt_head_dim, self.config.clamp_temp,
+                    qk_packed3[:num_decodes, 0, :],
+                )
+                if (qk_packed0_d.dtype == torch.bfloat16
+                        and conv_states.dtype == torch.float32):
+                    cca_decode_fused.decode_mixed_state(*decode_args)
+                else:
+                    cca_decode_fused.decode(*decode_args)
+            else:
+                qk_packed0_cat = torch.cat(
+                    [qk_packed0_cached_for_compute,
+                     qk_packed0_d.transpose(1, 2)], dim=-1
+                )  # [S, H, total_padding + 1]
+                qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(
+                    1, 2
+                )  # [S, 1, E]
+                qk_packed3[:num_decodes] = qk_packed3_d
 
-            new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
-            new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
-                new_qk_packed0_cache.dtype
-            )
-            new_qk_packed0_cache = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                new_qk_packed0_cache.new_zeros(()),
-                new_qk_packed0_cache,
-            )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
-                device=conv_states.device, dtype=conv_states.dtype
-            )
+                new_qk_packed0_cache = qk_packed0_cached.roll(
+                    shifts=-1, dims=-1
+                )
+                new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
+                    new_qk_packed0_cache.dtype
+                )
+                new_qk_packed0_cache = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    new_qk_packed0_cache.new_zeros(()),
+                    new_qk_packed0_cache,
+                )
+                conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype
+                )
 
             value_delayed_decode = recurrent_states[safe_decode_indices].unsqueeze(1)
             value_delayed_decode = torch.where(
@@ -620,8 +707,23 @@ class CCA(MambaBase, CustomOp):
         )  # [S, B, kh, dh]
         del value_delayed
 
-        # Build queries/keys from conv output + means.
-        if use_compiled_qk_postprocess:
+        # The fused decode boundary has already formed the exact Q/K means and
+        # RMS-normalized Q/K.  Keep the existing compiled preparation only for
+        # the unfused path so both audit arms retain their original semantics.
+        if decode_qk_fused:
+            query = (
+                qk_packed3[..., : self.latent_q_dim]
+                .view(num_actual_tokens, batch_size, self.num_q_heads, self.head_dim)
+                .float()
+            )
+            key = (
+                qk_packed3[..., self.latent_q_dim :]
+                .view(num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)
+                .float()
+            )
+            query = query.reshape(num_actual_tokens, self.latent_q_dim)
+            key = key.reshape(num_actual_tokens, self.latent_k_dim)
+        elif use_compiled_qk_postprocess:
             if not self._compiled_qk_postprocess_logged:
                 logger.info("Using compiled CCA Q/K mean preparation for %s", self.prefix)
                 self._compiled_qk_postprocess_logged = True
@@ -653,7 +755,6 @@ class CCA(MambaBase, CustomOp):
             del key_base
         del qk_packed0
         del qk_packed3
-
         # Flatten the singleton batch dimension without transpose/cat copies and
         # write directly into the preallocated output buffer.
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
