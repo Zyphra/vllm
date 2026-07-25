@@ -48,7 +48,7 @@ class _FP32EmbeddingMethod(UnquantizedEmbeddingMethod):
     def apply(self, layer, x, bias=None):
         if not torch.is_floating_point(x):
             return super().apply(layer, x, bias)
-        if x.dim() == 2 and x.shape[0] > 32:
+        if x.dim() == 2 and x.shape[0] > 32 and x.dtype != layer.weight.dtype:
             cached = getattr(layer, "_fp32_weight_t", None)
             if cached is None or cached.shape != (layer.weight.shape[1],
                                                    layer.weight.shape[0]):
