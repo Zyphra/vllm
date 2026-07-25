@@ -524,11 +524,6 @@ class CCA(MambaBase, CustomOp):
 
         # Values from the two time streams
         v1 = self.v_proj_current(hs)  # [S, B, latent_k_dim/2]
-        value = torch.cat([v1, value_delayed], dim=-1).contiguous()
-        value = value.view(
-            num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
-        )  # [S, B, kh, dh]
-        del value_delayed
 
         # Build queries/keys from conv output + means
         query = (
@@ -549,16 +544,20 @@ class CCA(MambaBase, CustomOp):
         del qk_packed3
 
         query, key = self._rms_normalize_qk(query.contiguous(), key.contiguous())
-        # Flatten the singleton batch dimension without transpose/cat copies and
-        # write directly into the preallocated output buffer.
+        # Flatten the singleton batch dimension and write every projection
+        # directly into the preallocated output buffer.
         query = query.reshape(num_actual_tokens, self.latent_q_dim)
         key = key.reshape(num_actual_tokens, self.latent_k_dim)
-        value = value.reshape(num_actual_tokens, self.latent_k_dim)
+        v1 = v1.reshape(num_actual_tokens, self.recurrent_v_dim)
+        value_delayed = value_delayed.reshape(
+            num_actual_tokens, self.recurrent_v_dim)
         q_end = self.latent_q_dim
         k_end = q_end + self.latent_k_dim
+        v_mid = k_end + self.recurrent_v_dim
         output[:num_actual_tokens, :q_end] = query
         output[:num_actual_tokens, q_end:k_end] = key
-        output[:num_actual_tokens, k_end:] = value
+        output[:num_actual_tokens, k_end:v_mid] = v1
+        output[:num_actual_tokens, v_mid:] = value_delayed
         if decode_is_pad is not None:
             decode_output = output[:num_decodes]
             output[:num_decodes] = torch.where(
