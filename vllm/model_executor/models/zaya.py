@@ -293,9 +293,7 @@ class ZayaRouter(nn.Module):
                 router_hidden_states
                 + prev_router_hidden_states * self.router_states_scale)
 
-        # The slice is only carried to the next decoder layer and is never
-        # mutated in-place; avoid a per-layer decode copy.
-        router_hidden_states_next = router_hidden_states[-seq_length:]
+        router_hidden_states_next = router_hidden_states[-seq_length:].clone()
         router_logits = self.router_mlp(router_hidden_states)
         router_probs = torch.softmax(router_logits, dim=-1)
         biased_router_probs = (
