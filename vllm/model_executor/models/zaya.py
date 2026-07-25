@@ -185,7 +185,7 @@ class ZayaAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
     ) -> torch.Tensor:
-        output_qkv = torch.zeros(
+        output_qkv = torch.empty(
             (hidden_states.shape[0], self.qkv_dim),
             device=hidden_states.device,
             dtype=hidden_states.dtype,
