@@ -7,6 +7,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionBackend
 
 import logging
+import os
 
 import numpy as np
 import torch
@@ -17,7 +18,10 @@ from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.model_executor.custom_op import CustomOp
-from vllm.model_executor.layers.linear import ReplicatedLinear
+from vllm.model_executor.layers.linear import (
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+)
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
@@ -90,39 +94,55 @@ class CCA(MambaBase, CustomOp):
             self.num_k_heads + self.num_q_heads
         ) * self.head_dim
 
-        # Projections
-        self.q_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_q_dim,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.q_proj",
-        )
-        self.k_proj = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_k_dim,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.k_proj",
-        )
-        self.v_proj_current = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_k_dim // 2,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.v_proj_current",
-        )
-        self.v_proj_delayed = ReplicatedLinear(
-            self.hidden_size,
-            self.latent_k_dim // 2,
-            bias=self.config.attention_bias,
-            quant_config=quant_config,
-            return_bias=False,
-            prefix=f"{prefix}.v_proj_delayed",
-        )
+        self._packed_in_proj = os.getenv("VLLM_CCA_PACKED_INPROJ_ENABLED", "0") == "1"
+        if self._packed_in_proj:
+            self.in_proj = MergedColumnParallelLinear(
+                self.hidden_size,
+                [
+                    self.latent_q_dim,
+                    self.latent_k_dim,
+                    self.recurrent_v_dim,
+                    self.recurrent_v_dim,
+                ],
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                disable_tp=True,
+                prefix=f"{prefix}.in_proj",
+            )
+        else:
+            self.q_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.latent_q_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.q_proj",
+            )
+            self.k_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.latent_k_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.k_proj",
+            )
+            self.v_proj_current = ReplicatedLinear(
+                self.hidden_size,
+                self.recurrent_v_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.v_proj_current",
+            )
+            self.v_proj_delayed = ReplicatedLinear(
+                self.hidden_size,
+                self.recurrent_v_dim,
+                bias=self.config.attention_bias,
+                quant_config=quant_config,
+                return_bias=False,
+                prefix=f"{prefix}.v_proj_delayed",
+            )
 
         # Depthwise + grouped conv along sequence (exactly like Megatron)
         in_out_ch = self.latent_k_dim + self.latent_q_dim
@@ -155,6 +175,26 @@ class CCA(MambaBase, CustomOp):
         self._cca_fused_gw_weight = None
         self._cca_fused_gw_version = -1
         self._cca_fused_logged = False
+
+    def _project_all(
+        self, hs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self._packed_in_proj:
+            packed = self.in_proj(hs)
+            qk_end = self.latent_q_dim + self.latent_k_dim
+            v1_end = qk_end + self.recurrent_v_dim
+            return (
+                packed[..., :qk_end],
+                packed[..., qk_end:v1_end],
+                packed[..., v1_end:],
+            )
+        q = self.q_proj(hs)
+        k = self.k_proj(hs)
+        return (
+            torch.cat([q, k], dim=-1),
+            self.v_proj_current(hs),
+            self.v_proj_delayed(hs),
+        )
 
     def _get_cca_fused_weights(self):
         """Return live grouped-conv views for the optional fused decode op."""
@@ -209,11 +249,7 @@ class CCA(MambaBase, CustomOp):
         num_tokens = hidden_states.shape[0]
         hs = hidden_states.unsqueeze(1)  # [S, 1, H]
 
-        q = self.q_proj(hs)
-        k = self.k_proj(hs)
-        qk_packed0 = torch.cat([q, k], dim=-1)
-        del q
-        del k
+        qk_packed0, value_current, delayed_v_state = self._project_all(hs)
 
         query_pre = qk_packed0[..., :self.latent_q_dim].view(
             *qk_packed0.shape[:2], self.num_q_heads, self.head_dim)
@@ -234,10 +270,11 @@ class CCA(MambaBase, CustomOp):
         query, key = self._rms_normalize_qk(query.contiguous(),
                                             key.contiguous())
 
-        value_current = self.v_proj_current(hs)
-        delayed_v_state = self.v_proj_delayed(hs)
-        zero_delayed = self.v_proj_delayed(
-            hidden_states.new_zeros(1, 1, self.hidden_size))
+        if self.config.attention_bias:
+            _, _, zero_delayed = self._project_all(
+                hidden_states.new_zeros(1, 1, self.hidden_size))
+        else:
+            zero_delayed = delayed_v_state.new_zeros(1, 1, self.recurrent_v_dim)
         value_delayed = torch.cat([zero_delayed, delayed_v_state[:-1]], dim=0)
         value = torch.cat([value_current, value_delayed], dim=-1).contiguous()
         value = value.view(num_tokens, 1, self.num_k_heads, self.head_dim)
@@ -374,11 +411,7 @@ class CCA(MambaBase, CustomOp):
         hs = hidden_states.unsqueeze(1)  # [S, 1, H]
         batch_size = hs.shape[1]
 
-        q = self.q_proj(hs)  # [S, B, latent_q_dim]
-        k = self.k_proj(hs)  # [S, B, latent_k_dim]
-        qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
-        del q
-        del k
+        qk_packed0, v1, delayed_v_state = self._project_all(hs)
 
         # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
         query_pre = qk_packed0[..., : self.latent_q_dim].view(
@@ -402,9 +435,8 @@ class CCA(MambaBase, CustomOp):
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
-        delayed_v_state = self.v_proj_delayed(hs[:num_actual_tokens])
         delayed_v_state_d, delayed_v_state_p = torch.split(
-            delayed_v_state,
+            delayed_v_state[:num_actual_tokens],
             [num_decodes, num_prefill_tokens],
             dim=0,
         )
@@ -455,8 +487,12 @@ class CCA(MambaBase, CustomOp):
                         [qk_packed0_cached, qk_packed1_cur], dim=-1
                     )  # [1, H, S_cur + total_padding]
                 else:
-                    value_delayed_cached = self.v_proj_delayed(
-                        hs_p.new_zeros(1, 1, self.hidden_size))
+                    if self.config.attention_bias:
+                        _, _, value_delayed_cached = self._project_all(
+                            hs_p.new_zeros(1, 1, self.hidden_size))
+                    else:
+                        value_delayed_cached = delayed_v_state_p.new_zeros(
+                            1, 1, self.recurrent_v_dim)
                     qk_packed2_cur = F.pad(qk_packed1_cur, (self.total_padding, 0))
 
                 value_delayed_prefill[start_i:end_i] = torch.cat(
@@ -641,7 +677,6 @@ class CCA(MambaBase, CustomOp):
         del delayed_v_state_p
 
         # Values from the two time streams
-        v1 = self.v_proj_current(hs)  # [S, B, latent_k_dim/2]
         value = torch.cat([v1, value_delayed], dim=-1).contiguous()
         value = value.view(
             num_actual_tokens, batch_size, self.num_k_heads, self.head_dim

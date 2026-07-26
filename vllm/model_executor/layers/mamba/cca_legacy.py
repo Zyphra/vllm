@@ -48,11 +48,7 @@ def forward_cuda_legacy(self, hidden_states: torch.Tensor,
     hs = hidden_states.unsqueeze(1)
     batch_size = hs.shape[1]
 
-    q = self.q_proj(hs)
-    k = self.k_proj(hs)
-    qk_packed0 = torch.cat([q, k], dim=-1)
-    del q
-    del k
+    qk_packed0, v1, delayed_v_state = self._project_all(hs)
 
     query_pre = qk_packed0[..., :self.latent_q_dim].view(
         *qk_packed0.shape[:2], self.num_q_heads, self.head_dim)
@@ -69,9 +65,8 @@ def forward_cuda_legacy(self, hidden_states: torch.Tensor,
         [num_decodes, num_prefill_tokens],
         dim=0,
     )
-    delayed_v_state = self.v_proj_delayed(hs[:num_actual_tokens])
     delayed_v_state_d, delayed_v_state_p = torch.split(
-        delayed_v_state,
+        delayed_v_state[:num_actual_tokens],
         [num_decodes, num_prefill_tokens],
         dim=0,
     )
@@ -114,8 +109,12 @@ def forward_cuda_legacy(self, hidden_states: torch.Tensor,
                 qk_packed2_cur = torch.cat(
                     [qk_packed0_cached, qk_packed1_cur], dim=-1)
             else:
-                value_delayed_cached = self.v_proj_delayed(
-                    hs_p.new_zeros(1, 1, self.hidden_size))
+                if self.config.attention_bias:
+                    _, _, value_delayed_cached = self._project_all(
+                        hs_p.new_zeros(1, 1, self.hidden_size))
+                else:
+                    value_delayed_cached = delayed_v_state_p.new_zeros(
+                        1, 1, self.recurrent_v_dim)
                 qk_packed2_cur = F.pad(
                     qk_packed1_cur, (self.total_padding, 0))
 
@@ -212,7 +211,6 @@ def forward_cuda_legacy(self, hidden_states: torch.Tensor,
     del delayed_v_state_d
     del delayed_v_state_p
 
-    v1 = self.v_proj_current(hs)
     value = torch.cat([v1, value_delayed], dim=-1).contiguous()
     value = value.view(
         num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)
