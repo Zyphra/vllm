@@ -52,6 +52,10 @@ def requested() -> bool:
     return _enabled
 
 
+def enabled() -> bool:
+    return _enabled
+
+
 def decode(
     first_input: torch.Tensor,
     dw_weight: torch.Tensor,

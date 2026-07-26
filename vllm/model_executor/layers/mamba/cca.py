@@ -26,6 +26,9 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.mamba.cca_legacy import (
+    forward_cuda_legacy,
+)
 from vllm.model_executor.layers.mamba.ops import cca_decode_fused
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -73,6 +76,9 @@ def _get_compiled_cca_qk_add_grouped_means() -> Callable:
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
+    forward_cuda_legacy = forward_cuda_legacy
+    forward_cuda = forward_cuda_legacy
+
     def __init__(
         self,
         config,
@@ -410,7 +416,7 @@ class CCA(MambaBase, CustomOp):
             out = out + b1.view(1, g, d, 1)
         return out.reshape(x.shape[0], g * d, out.shape[-1])
 
-    def forward_cuda(
+    def forward_cuda_fused(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
@@ -824,7 +830,20 @@ def cca(
 ) -> None:
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    self.forward_cuda(hidden_states=hidden_states, output=output)
+    metadata = forward_context.attn_metadata
+    if isinstance(metadata, dict):
+        metadata = metadata[self.prefix]
+    use_fused = (
+        metadata is not None
+        and not metadata.num_prefills
+        and (metadata.num_decode_tokens <= 8
+             or metadata.num_decode_tokens >= 32)
+        and cca_decode_fused.enabled()
+    )
+    if use_fused:
+        self.forward_cuda_fused(hidden_states=hidden_states, output=output)
+    else:
+        self.forward_cuda(hidden_states=hidden_states, output=output)
 
 
 def cca_fake(
