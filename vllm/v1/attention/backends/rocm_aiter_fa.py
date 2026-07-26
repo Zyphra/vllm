@@ -509,7 +509,7 @@ class AiterFlashAttentionMetadataBuilder(
         decode_metadata = None
         if num_decodes > 0:
             decode_metadata = AiterFlashAttentionDecodeMetadata(
-                max_query_len=query_lens_cpu[:num_decodes].max().item(),
+                max_query_len=int(query_lens_cpu[:num_decodes].numpy().max()),
             )
 
         prefill_metadata = None
