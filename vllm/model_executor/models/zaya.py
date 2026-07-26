@@ -605,6 +605,12 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
         import tqdm
 
         skipped_weights: list[str] = []
+        cca_in_proj_mapping = {
+            ".qkv_proj.q_proj": (".qkv_proj.in_proj", 0),
+            ".qkv_proj.k_proj": (".qkv_proj.in_proj", 1),
+            ".qkv_proj.v_proj_current": (".qkv_proj.in_proj", 2),
+            ".qkv_proj.v_proj_delayed": (".qkv_proj.in_proj", 3),
+        }
         for chkpt_weight_name, loaded_weight in tqdm.tqdm(
             weights,
             desc="Loading weights",
@@ -624,6 +630,18 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
                     weight_name = weight_name.replace("_A.weight", ".A.weight")
                 elif "_B.weight" in weight_name:
                     weight_name = weight_name.replace("_B.weight", ".B.weight")
+
+            for source, (target, shard_id) in cca_in_proj_mapping.items():
+                packed_name = weight_name.replace(source, target)
+                if source in weight_name and packed_name in params_dict:
+                    param = params_dict[packed_name]
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(packed_name)
+                    break
+            else:
+                packed_name = None
+            if packed_name is not None:
+                continue
 
             if weight_name.endswith(".mlp.experts.gate_up_proj"):
                 fused_moe_prefix = weight_name.removesuffix(".gate_up_proj")
