@@ -17,7 +17,6 @@ import triton.language as tl
 from vllm.utils.torch_utils import direct_register_custom_op
 
 ZAYA_FUSED_ROUTER = os.getenv("VLLM_ZAYA_FUSED_ROUTER", "0") == "1"
-_SQRT_HALF = 0.7071067811865476
 
 
 @triton.jit
@@ -40,7 +39,7 @@ def _matvec_gelu(src, weight, bias, dst, src_row, dst_row,
             acc += tl.sum(w * x[None, :], axis=1)
         acc = _bf16_round(acc + tl.load(bias + j).to(tl.float32))
         acc = _bf16_round(
-            0.5 * acc * (1.0 + tl.math.erf(acc * _SQRT_HALF)))
+            0.5 * acc * (1.0 + tl.math.erf(acc * 0.7071067811865476)))
         tl.store(dst + dst_row * dim + j, acc)
 
 
