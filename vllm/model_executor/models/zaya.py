@@ -584,6 +584,9 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cached = getattr(self.lm_head, "_fp32_weight_t", None)
         if cached is not None:
             cached.copy_(self.lm_head.weight.t())
+        for module in self.modules():
+            if isinstance(module, CCA):
+                module.invalidate_fused_weight_cache()
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params_dict = dict(self.named_parameters())

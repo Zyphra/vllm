@@ -182,6 +182,10 @@ class CCA(MambaBase, CustomOp):
         )
         return depthwise, self.conv_qk_depthwise.bias, self._cca_fused_gw_weight, grouped_bias
 
+    def invalidate_fused_weight_cache(self) -> None:
+        self._cca_fused_gw_weight = None
+        self._cca_fused_gw_version = -1
+
     def forward_native(
         self,
         hidden_states: torch.Tensor,
