@@ -24,6 +24,10 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
+from vllm.model_executor.layers.zaya_fused_router import (
+    ZAYA_FUSED_ROUTER,
+    fused_router_into,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -280,6 +284,10 @@ class ZayaRouter(nn.Module):
         self.register_buffer(
             "balancing_biases", torch.zeros(self.num_experts, dtype=torch.float32))
         self.balancing_biases[-1] = -1.0
+        # Resolve this once before compilation so the custom op is retained in
+        # FULL graphs rather than specialized away by a Python environment test.
+        self._fused_router_ok: bool | None = None
+        self._fused_router_logged = False
 
     def forward(
         self,
@@ -288,18 +296,75 @@ class ZayaRouter(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         seq_length = hidden_states.shape[0]
         router_hidden_states = self.down_proj(hidden_states)
-        if self.use_eda and prev_router_hidden_states is not None:
-            router_hidden_states = (
-                router_hidden_states
-                + prev_router_hidden_states * self.router_states_scale)
+        use_eda = bool(self.use_eda and prev_router_hidden_states is not None)
 
-        router_hidden_states_next = router_hidden_states[-seq_length:].clone()
-        router_logits = self.router_mlp(router_hidden_states)
-        router_probs = torch.softmax(router_logits, dim=-1)
-        biased_router_probs = (
-            router_probs.detach().to(torch.float32) + self.balancing_biases)
-        _, router_indices = torch.topk(biased_router_probs, self.topk, dim=-1)
-        router_probs = torch.gather(router_probs, dim=1, index=router_indices)
+        if self._fused_router_ok is None:
+            self._fused_router_ok = bool(
+                ZAYA_FUSED_ROUTER
+                and self.topk == 1
+                and self.router_mlp.fc1.weight.dtype == torch.bfloat16
+                and self.router_mlp.fc2.weight.dtype == torch.bfloat16
+                and self.router_mlp.out_proj.weight.dtype == torch.bfloat16)
+
+        if self._fused_router_ok and router_hidden_states.dtype == torch.bfloat16:
+            if not self._fused_router_logged:
+                logger.info("Using fused Zaya router for layer %s", self.layer_idx)
+                self._fused_router_logged = True
+            previous = (
+                prev_router_hidden_states
+                if use_eda else router_hidden_states)
+            eda_scale = (
+                self.router_states_scale
+                if use_eda else self.router_mlp.norm.weight)
+            router_probs = torch.empty(
+                (seq_length, 1),
+                device=hidden_states.device,
+                dtype=router_hidden_states.dtype,
+            )
+            router_indices = torch.empty(
+                (seq_length, 1),
+                device=hidden_states.device,
+                dtype=torch.int64,
+            )
+            router_hidden_states_next = torch.empty_like(router_hidden_states)
+            scratch = torch.empty(
+                (seq_length, 2 * self.router_hidden_size),
+                device=hidden_states.device,
+                dtype=torch.float32,
+            )
+            fused_router_into(
+                router_hidden_states,
+                previous,
+                eda_scale,
+                self.router_mlp.norm.weight,
+                self.router_mlp.fc1.weight,
+                self.router_mlp.fc1.bias,
+                self.router_mlp.fc2.weight,
+                self.router_mlp.fc2.bias,
+                self.router_mlp.out_proj.weight,
+                self.balancing_biases,
+                router_probs,
+                router_indices,
+                router_hidden_states_next,
+                scratch,
+                float(self.router_mlp.norm.variance_epsilon),
+                use_eda,
+            )
+        else:
+            if use_eda:
+                router_hidden_states = (
+                    router_hidden_states
+                    + prev_router_hidden_states * self.router_states_scale)
+            router_hidden_states_next = router_hidden_states[-seq_length:].clone()
+            router_logits = self.router_mlp(router_hidden_states)
+            router_probs = torch.softmax(router_logits, dim=-1)
+            biased_router_probs = (
+                router_probs.detach().to(torch.float32)
+                + self.balancing_biases)
+            _, router_indices = torch.topk(
+                biased_router_probs, self.topk, dim=-1)
+            router_probs = torch.gather(
+                router_probs, dim=1, index=router_indices)
 
         skip_expert = router_indices == self.config.num_experts
         router_probs = router_probs.masked_fill(skip_expert, 0)
