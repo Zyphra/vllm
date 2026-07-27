@@ -137,11 +137,18 @@ def test_python_wrappers_and_fakes_use_mutation_only_abis():
 
 def test_native_ops_are_built_and_registered_with_explicit_mutations():
     cmake = _read("CMakeLists.txt")
+    cmake_utils = _read("cmake", "utils.cmake")
     header = _read("csrc", "rocm", "ops.h")
     bindings = _read("csrc", "rocm", "torch_bindings.cpp")
     custom_ops = _read("vllm", "_custom_ops.py")
 
     assert '"csrc/rocm/cca_decode_state_io.cu"' in cmake
+    assert (
+        'list(FILTER SRCS EXCLUDE REGEX "[.](cc|cpp|hip)$")' in cmake_utils
+    )
+    assert (
+        'list(FILTER CXX_SRCS INCLUDE REGEX "[.](cc|cpp|hip)$")' in cmake_utils
+    )
     assert "void cca_decode_state_prepare(" in header
     assert "void cca_decode_state_commit(" in header
     assert '"Tensor(a!) conv_window, Tensor(b!) conv_tail, "' in bindings
