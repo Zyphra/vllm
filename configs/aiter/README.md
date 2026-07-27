@@ -55,4 +55,10 @@ The durable directional reducer is
 `/shared/home/rob/research/zaya_profile_20260725/aiter_retuned_on_native_cca_${SLURM_JOB_ID}/summary.json`.
 The promoted cumulative receipt is
 `/shared/home/rob/research/zaya_profile_20260725/native_cca_aiter_cumulative_runs/run_324584/FINAL_RECEIPT.json`.
+Independent build/runtime canary job `324616` rebuilt exact source
+`074542cf111eeea004de58a765e93dc4bf6b93b8`, returned 32/32 finite API
+tokens, captured FULL and PIECEWISE graphs, activated native CCA in all 40
+layers, and hit the intended AITER rows. Its receipt SHA-256 is
+`24bbec1bd1972f54463f184fa3ea03cd8432dbc68de4c9659c459dae276794a3`;
+it is activation evidence, not an additional performance result.
 The older `85a5` overlay remains rejected on this image.
