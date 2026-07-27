@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from vllm import _custom_ops as ops
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -130,11 +131,31 @@ class CCA(MambaBase, CustomOp):
         self._compiled_qk_postprocess = (
             os.getenv("VLLM_CCA_COMPILED_QK_POSTPROCESS", "0") == "1"
         )
+        self._native_qk_postprocess = (
+            os.getenv("VLLM_CCA_NATIVE_QK_POSTPROCESS", "0") == "1"
+        )
         if self._compiled_qk_postprocess and (
             self.num_q_heads, self.num_k_heads, self.head_dim, self.gqa_groups
         ) != (8, 2, 128, 4):
             raise RuntimeError("compiled CCA Q/K postprocess only supports Zaya Q8/K2/D128")
+        if self._native_qk_postprocess:
+            if not self._packed_in_proj or not self._compiled_qk_postprocess:
+                raise RuntimeError(
+                    "native CCA Q/K postprocess requires packed projection "
+                    "and compiled Q/K preparation"
+                )
+            if self.config.clamp_temp:
+                raise RuntimeError(
+                    "native CCA Q/K postprocess requires clamp_temp=False"
+                )
+            if not hasattr(torch.ops, "_rocm_C") or not hasattr(
+                torch.ops._rocm_C, "cca_qk_postprocess"
+            ):
+                raise RuntimeError(
+                    "native CCA Q/K postprocess was requested but unavailable"
+                )
         self._compiled_qk_postprocess_logged = False
+        self._native_qk_postprocess_logged = False
         if self._packed_in_proj:
             self.in_proj = MergedColumnParallelLinear(
                 self.hidden_size,
@@ -425,6 +446,12 @@ class CCA(MambaBase, CustomOp):
         use_compiled_qk_postprocess = (
             self._compiled_qk_postprocess and batch_size == 1
         )
+        use_native_qk_postprocess = (
+            self._native_qk_postprocess
+            and use_compiled_qk_postprocess
+            and has_decode
+            and not has_prefill
+        )
 
         qk_packed0, v1, delayed_v_state = self._project_all(hs)
 
@@ -620,8 +647,26 @@ class CCA(MambaBase, CustomOp):
         )  # [S, B, kh, dh]
         del value_delayed
 
+        q_end = self.latent_q_dim
+        k_end = q_end + self.latent_k_dim
+
         # Build queries/keys from conv output + means.
-        if use_compiled_qk_postprocess:
+        if use_native_qk_postprocess:
+            grouped = qk_packed3[:, 0, :]
+            first = qk_packed0[:, 0, :]
+            qk_out = output[:num_actual_tokens, :k_end]
+            if (
+                grouped.dtype != torch.bfloat16
+                or first.dtype != torch.bfloat16
+                or self.temp.dtype != torch.bfloat16
+                or qk_out.dtype != torch.bfloat16
+            ):
+                raise RuntimeError("native CCA Q/K postprocess requires BF16 tensors")
+            if not self._native_qk_postprocess_logged:
+                logger.info("Using native CCA Q/K postprocess for %s", self.prefix)
+                self._native_qk_postprocess_logged = True
+            ops.cca_qk_postprocess(grouped, first, self.temp, qk_out)
+        elif use_compiled_qk_postprocess:
             if not self._compiled_qk_postprocess_logged:
                 logger.info("Using compiled CCA Q/K mean preparation for %s", self.prefix)
                 self._compiled_qk_postprocess_logged = True
@@ -657,10 +702,9 @@ class CCA(MambaBase, CustomOp):
         # Flatten the singleton batch dimension without transpose/cat copies and
         # write directly into the preallocated output buffer.
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
-        q_end = self.latent_q_dim
-        k_end = q_end + self.latent_k_dim
-        output[:num_actual_tokens, :q_end] = query
-        output[:num_actual_tokens, q_end:k_end] = key
+        if not use_native_qk_postprocess:
+            output[:num_actual_tokens, :q_end] = query
+            output[:num_actual_tokens, q_end:k_end] = key
         output[:num_actual_tokens, k_end:] = value
         if decode_is_pad is not None:
             decode_output = output[:num_decodes]
