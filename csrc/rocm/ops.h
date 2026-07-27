@@ -52,3 +52,19 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+void cca_decode_state_prepare(const torch::Tensor& qk0,
+                              const torch::Tensor& v_current,
+                              const torch::Tensor& conv_state,
+                              const torch::Tensor& recurrent_state,
+                              const torch::Tensor& state_idx,
+                              torch::Tensor& conv_window,
+                              torch::Tensor& conv_tail, torch::Tensor& qkv_out);
+
+void cca_decode_state_commit(const torch::Tensor& qk0,
+                             const torch::Tensor& v_delayed_current,
+                             const torch::Tensor& state_idx,
+                             const torch::Tensor& conv_tail,
+                             torch::Tensor& conv_state,
+                             torch::Tensor& recurrent_state,
+                             torch::Tensor& qkv_out);

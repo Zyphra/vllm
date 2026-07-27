@@ -47,6 +47,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+  rocm_ops.def(
+      "cca_decode_state_prepare(Tensor qk0, Tensor v_current, "
+      "Tensor conv_state, Tensor recurrent_state, Tensor state_idx, "
+      "Tensor(a!) conv_window, Tensor(b!) conv_tail, "
+      "Tensor(c!) qkv_out) -> ()");
+  rocm_ops.impl("cca_decode_state_prepare", torch::kCUDA,
+                &cca_decode_state_prepare);
+
+  rocm_ops.def(
+      "cca_decode_state_commit(Tensor qk0, Tensor v_delayed_current, "
+      "Tensor state_idx, Tensor conv_tail, Tensor(a!) conv_state, "
+      "Tensor(b!) recurrent_state, Tensor(c!) qkv_out) -> ()");
+  rocm_ops.impl("cca_decode_state_commit", torch::kCUDA,
+                &cca_decode_state_commit);
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(
