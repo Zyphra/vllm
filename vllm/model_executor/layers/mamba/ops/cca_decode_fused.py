@@ -20,10 +20,18 @@ _enabled = os.environ.get("VLLM_CCA_DECODE_FUSED_ENABLED", "0").lower() in (
     "true",
     "yes",
 )
+_load_only = os.environ.get("VLLM_CCA_DECODE_FUSED_LOAD_ONLY", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_force_fallback = os.environ.get(
+    "VLLM_CCA_DECODE_FUSED_FORCE_FALLBACK", "0"
+).lower() in ("1", "true", "yes")
 _fn = None
 _mixed_state_fn = None
 
-if _enabled and torch.version.hip is not None:
+if (_enabled or _load_only) and torch.version.hip is not None:
     try:
         from torch.utils.cpp_extension import load
 
@@ -43,6 +51,16 @@ if _enabled and torch.version.hip is not None:
     except Exception:
         logger.exception("Fused CCA decode requested but failed to load")
 
+if _enabled or _load_only:
+    logger.info(
+        "CCA fused decode audit state: requested=%s load_only=%s "
+        "force_fallback=%s available=%s",
+        _enabled,
+        _load_only,
+        _force_fallback,
+        _fn is not None,
+    )
+
 
 def available() -> bool:
     return _fn is not None
@@ -54,6 +72,16 @@ def requested() -> bool:
 
 def enabled() -> bool:
     return _enabled
+
+
+def selectable() -> bool:
+    """Whether the loaded extension may own a decode invocation.
+
+    ``LOAD_ONLY`` and ``FORCE_FALLBACK`` are audit-only controls. They let the
+    four-arm package separate import/build/graph effects from the fused kernel
+    itself without changing default or requested production behavior.
+    """
+    return _enabled and available() and not _force_fallback
 
 
 def decode(

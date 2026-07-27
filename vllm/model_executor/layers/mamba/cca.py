@@ -219,6 +219,7 @@ class CCA(MambaBase, CustomOp):
         self._cca_fused_gw_weight = None
         self._cca_fused_gw_version = -1
         self._cca_fused_logged = False
+        self._cca_fused_route_logged_batches: set[int] = set()
 
     def _get_cca_fused_weights(self):
         """Return live grouped-conv views for the optional fused decode op."""
@@ -610,7 +611,7 @@ class CCA(MambaBase, CustomOp):
                 )
             decode_qk_fused = (
                 not has_prefill
-                and cca_decode_fused.available()
+                and cca_decode_fused.selectable()
                 and self.total_padding == 2
                 and self.head_dim in (64, 128)
                 and self.gqa_groups in (1, 2, 4, 8)
@@ -650,6 +651,18 @@ class CCA(MambaBase, CustomOp):
                     f"dtypes: input={qk_packed0_d.dtype}, "
                     f"state={conv_states.dtype}, output={output.dtype}"
                 )
+            if num_decodes not in self._cca_fused_route_logged_batches:
+                logger.info(
+                    "CCA fused decode selector for %s: route=%s B=%d "
+                    "requested=%s available=%s selectable=%s",
+                    self.prefix,
+                    "fused" if decode_qk_fused else "fallback",
+                    num_decodes,
+                    cca_decode_fused.requested(),
+                    cca_decode_fused.available(),
+                    cca_decode_fused.selectable(),
+                )
+                self._cca_fused_route_logged_batches.add(num_decodes)
             if decode_qk_fused:
                 if not self._cca_fused_logged:
                     logger.info(
