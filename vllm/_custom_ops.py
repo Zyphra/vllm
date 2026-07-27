@@ -163,6 +163,27 @@ def paged_attention_rocm(
     )
 
 
+def cca_qk_postprocess(
+    grouped: torch.Tensor,
+    first: torch.Tensor,
+    temp: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.cca_qk_postprocess(grouped, first, temp, out)
+
+
+if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "cca_qk_postprocess"):
+
+    @register_fake("_rocm_C::cca_qk_postprocess")
+    def _cca_qk_postprocess_fake(
+        grouped: torch.Tensor,
+        first: torch.Tensor,
+        temp: torch.Tensor,
+        out: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def mla_decode_kvcache_cpu(
     out: torch.Tensor,
     query: torch.Tensor,

@@ -63,8 +63,8 @@ function (hipify_sources_target OUT_SRCS NAME ORIG_SRCS)
   #
   set(SRCS ${ORIG_SRCS})
   set(CXX_SRCS ${ORIG_SRCS})
-  list(FILTER SRCS EXCLUDE REGEX "\.(cc)|(cpp)|(hip)$")
-  list(FILTER CXX_SRCS INCLUDE REGEX "\.(cc)|(cpp)|(hip)$")
+  list(FILTER SRCS EXCLUDE REGEX "\\.(cc|cpp|hip)$")
+  list(FILTER CXX_SRCS INCLUDE REGEX "\\.(cc|cpp|hip)$")
 
   #
   # Generate ROCm/HIP source file names from CUDA file names.

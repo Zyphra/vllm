@@ -47,6 +47,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, rocm_ops) {
       "          Tensor scale_b, int CuCount) -> ()");
   rocm_ops.impl("wvSplitKQ", torch::kCUDA, &wvSplitKQ);
 
+  rocm_ops.def(
+      "cca_qk_postprocess(Tensor grouped, Tensor first, Tensor temp, "
+      "Tensor(a!) out) -> ()");
+  rocm_ops.impl("cca_qk_postprocess", torch::kCUDA, &cca_qk_postprocess);
+
 #ifdef VLLM_ROCM_GFX1100
   // W4A16 GPTQ kernels for AMD RDNA3 (gfx1100).
   rocm_ops.def(

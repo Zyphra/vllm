@@ -52,3 +52,7 @@ void paged_attention(
     const std::string& kv_cache_dtype, torch::Tensor& k_scale,
     torch::Tensor& v_scale, const std::optional<torch::Tensor>& fp8_out_scale,
     const std::string& mfma_type);
+
+void cca_qk_postprocess(const torch::Tensor& grouped,
+                        const torch::Tensor& first, const torch::Tensor& temp,
+                        torch::Tensor& out);
