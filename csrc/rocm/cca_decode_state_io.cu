@@ -11,6 +11,7 @@
 #include <initializer_list>
 #include <limits>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -221,6 +222,27 @@ void check_gfx942(const torch::Tensor& anchor, int64_t rows, const char* op) {
               ": M exceeds the device grid-x limit");
 }
 
+bool byte_ranges_overlap(const torch::Tensor& left,
+                         const torch::Tensor& right) {
+  const auto byte_range = [](const torch::Tensor& tensor) {
+    uintptr_t begin = reinterpret_cast<uintptr_t>(tensor.data_ptr());
+    uint64_t last_element_offset = 0;
+    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+      TORCH_INTERNAL_ASSERT(tensor.size(dim) > 0);
+      TORCH_INTERNAL_ASSERT(tensor.stride(dim) >= 0);
+      last_element_offset += static_cast<uint64_t>(tensor.size(dim) - 1) *
+                             static_cast<uint64_t>(tensor.stride(dim));
+    }
+    const uintptr_t end =
+        begin + (last_element_offset + 1) * tensor.element_size();
+    return std::pair<uintptr_t, uintptr_t>{begin, end};
+  };
+
+  const auto [left_begin, left_end] = byte_range(left);
+  const auto [right_begin, right_end] = byte_range(right);
+  return left_begin < right_end && right_begin < left_end;
+}
+
 }  // namespace
 
 void cca_decode_state_prepare(
@@ -319,7 +341,7 @@ void cca_decode_state_commit(const torch::Tensor& qk0,
           !conv_state.is_alias_of(v_delayed_current) &&
           !conv_state.is_alias_of(state_idx) &&
           !conv_state.is_alias_of(conv_tail) &&
-          !conv_state.is_alias_of(recurrent_state) &&
+          !byte_ranges_overlap(conv_state, recurrent_state) &&
           !conv_state.is_alias_of(qkv_out) &&
           !recurrent_state.is_alias_of(qk0) &&
           !recurrent_state.is_alias_of(v_delayed_current) &&

@@ -265,6 +265,8 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
         "tensor.is_contiguous()",
         "state_idx must be int32",
         "mutable outputs must not share storage",
+        "bool byte_ranges_overlap(",
+        "!byte_ranges_overlap(conv_state, recurrent_state)",
         "__uint_as_float(old0_bits)",
         "conv_tail[tail_offset] = old1_bits;",
         "conv_state[state_offset] =",
@@ -285,6 +287,32 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
     ):
         assert forbidden not in source
 
+    commit_guard = source[
+        source.index("TORCH_CHECK(", source.index("void cca_decode_state_commit("))
+        : source.index("check_gfx942(qk0, rows, op);", source.index(
+            "void cca_decode_state_commit("
+        ))
+    ]
+    assert commit_guard.count("byte_ranges_overlap(") == 1
+    assert "conv_state.is_alias_of(recurrent_state)" not in commit_guard
+    for pair in (
+        "conv_state.is_alias_of(qk0)",
+        "conv_state.is_alias_of(v_delayed_current)",
+        "conv_state.is_alias_of(state_idx)",
+        "conv_state.is_alias_of(conv_tail)",
+        "conv_state.is_alias_of(qkv_out)",
+        "recurrent_state.is_alias_of(qk0)",
+        "recurrent_state.is_alias_of(v_delayed_current)",
+        "recurrent_state.is_alias_of(state_idx)",
+        "recurrent_state.is_alias_of(conv_tail)",
+        "recurrent_state.is_alias_of(qkv_out)",
+        "qkv_out.is_alias_of(qk0)",
+        "qkv_out.is_alias_of(v_delayed_current)",
+        "qkv_out.is_alias_of(state_idx)",
+        "qkv_out.is_alias_of(conv_tail)",
+    ):
+        assert pair in commit_guard
+
     prepare = source[
         source.index("__global__ void cca_decode_state_prepare_kernel") : source.index(
             "__global__ void cca_decode_state_commit_kernel"
@@ -304,6 +332,35 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
     assert "conv_state[state_offset + 1] =" in commit
     assert "recurrent_state[" in commit
     assert "const int safe_slot = is_pad ? 0 : slot;" in commit
+
+
+def test_bind_kv_cache_equivalent_state_slices_share_storage_without_overlap():
+    slots = 8
+    conv_elements = slots * QK_WIDTH * 2
+    recurrent_elements = slots * VALUE_WIDTH
+    page = np.empty((conv_elements + recurrent_elements) * 4, dtype=np.uint8)
+    conv_bytes = page[: conv_elements * 4]
+    recurrent_bytes = page[conv_elements * 4 :]
+    conv_state = conv_bytes.view(np.float32).reshape(slots, QK_WIDTH, 2)
+    recurrent_state = recurrent_bytes.view(np.float32).reshape(slots, VALUE_WIDTH)
+
+    assert np.shares_memory(conv_state, page)
+    assert np.shares_memory(recurrent_state, page)
+    assert not np.shares_memory(conv_state, recurrent_state)
+    conv_begin = conv_state.__array_interface__["data"][0]
+    conv_end = conv_begin + conv_state.nbytes
+    recurrent_begin = recurrent_state.__array_interface__["data"][0]
+    recurrent_end = recurrent_begin + recurrent_state.nbytes
+    assert conv_end == recurrent_begin
+    assert conv_begin < conv_end <= recurrent_begin < recurrent_end
+
+    overlapping_bytes = page[conv_elements * 4 - 4 :][
+        : recurrent_elements * 4
+    ]
+    overlapping_state = overlapping_bytes.view(np.float32).reshape(
+        slots, VALUE_WIDTH
+    )
+    assert np.shares_memory(conv_state, overlapping_state)
 
 
 def test_cca_integration_is_opt_in_pure_decode_and_uses_static_workspaces():
