@@ -74,6 +74,55 @@ def test_native_op_is_built_and_registered_with_a_mandatory_output():
     assert 'hasattr(torch.ops._rocm_C, "cca_qk_postprocess")' in custom_ops
 
 
+def test_cca_integration_is_default_off_and_fails_closed():
+    source = _read("vllm", "model_executor", "layers", "mamba", "cca.py")
+
+    for contract in (
+        "from vllm import _custom_ops as ops",
+        'os.getenv("VLLM_CCA_NATIVE_QK_POSTPROCESS", "0") == "1"',
+        "if not self._packed_in_proj or not self._compiled_qk_postprocess:",
+        '"native CCA Q/K postprocess requires packed projection "',
+        "if self.config.clamp_temp:",
+        '"native CCA Q/K postprocess requires clamp_temp=False"',
+        'torch.ops._rocm_C, "cca_qk_postprocess"',
+        '"native CCA Q/K postprocess was requested but unavailable"',
+        '"native CCA Q/K postprocess requires BF16 tensors"',
+    ):
+        assert contract in source
+
+
+def test_cca_integration_writes_pure_decode_qk_directly():
+    source = _read("vllm", "model_executor", "layers", "mamba", "cca.py")
+
+    selection_start = source.index("use_native_qk_postprocess = (")
+    selection_end = source.index("qk_packed0, v1, delayed_v_state", selection_start)
+    selection = source[selection_start:selection_end]
+    assert "and use_compiled_qk_postprocess" in selection
+    assert "and has_decode" in selection
+    assert "and not has_prefill" in selection
+
+    native_start = source.index("if use_native_qk_postprocess:", selection_end)
+    native_end = source.index("elif use_compiled_qk_postprocess:", native_start)
+    native = source[native_start:native_end]
+    assert "grouped = qk_packed3[:, 0, :]" in native
+    assert "first = qk_packed0[:, 0, :]" in native
+    assert "qk_out = output[:num_actual_tokens, :k_end]" in native
+    assert "ops.cca_qk_postprocess(grouped, first, self.temp, qk_out)" in native
+    assert ".to(" not in native
+    assert ".contiguous(" not in native
+    assert "output[" not in native.replace(
+        "qk_out = output[:num_actual_tokens, :k_end]", ""
+    )
+
+    direct_store = source.index("if not use_native_qk_postprocess:", native_end)
+    value_store = source.index(
+        "output[:num_actual_tokens, k_end:] = value", direct_store
+    )
+    stores = source[direct_store:value_store]
+    assert "output[:num_actual_tokens, :q_end] = query" in stores
+    assert "output[:num_actual_tokens, q_end:k_end] = key" in stores
+
+
 def test_kernel_preserves_exact_math_and_fails_closed():
     source = _read("csrc", "rocm", "cca_qk_postprocess.cu")
 
