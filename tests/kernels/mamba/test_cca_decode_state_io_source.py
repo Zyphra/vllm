@@ -135,6 +135,94 @@ def test_python_wrappers_and_fakes_use_mutation_only_abis():
     assert calls == []
 
 
+def test_mutation_only_wrappers_compile_as_one_full_graph():
+    import torch
+
+    definitions = torch.library.Library("_rocm_C", "FRAGMENT")
+    definitions.define(
+        "cca_decode_state_prepare("
+        "Tensor qk0, Tensor v_current, Tensor conv_state, "
+        "Tensor recurrent_state, Tensor state_idx, "
+        "Tensor(a!) conv_window, Tensor(b!) conv_tail, "
+        "Tensor(c!) qkv_out) -> ()"
+    )
+    definitions.define(
+        "cca_decode_state_commit("
+        "Tensor qk0, Tensor v_delayed_current, Tensor state_idx, "
+        "Tensor conv_tail, Tensor(a!) conv_state, "
+        "Tensor(b!) recurrent_state, Tensor(c!) qkv_out) -> ()"
+    )
+
+    implementations = torch.library.Library("_rocm_C", "IMPL", "CPU")
+    implementations.impl("cca_decode_state_prepare", lambda *args: None)
+    implementations.impl("cca_decode_state_commit", lambda *args: None)
+
+    @torch.library.register_fake("_rocm_C::cca_decode_state_prepare")
+    def prepare_fake(*args):
+        return None
+
+    @torch.library.register_fake("_rocm_C::cca_decode_state_commit")
+    def commit_fake(*args):
+        return None
+
+    def load_wrapper(name: str):
+        tree = ast.parse(_read("vllm", "_custom_ops.py"))
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        function.decorator_list = []
+        module = ast.fix_missing_locations(
+            ast.Module(body=[function], type_ignores=[])
+        )
+        namespace = {"torch": torch}
+        exec(compile(module, "vllm/_custom_ops.py", "exec"), namespace)
+        return namespace[name]
+
+    prepare = load_wrapper("cca_decode_state_prepare")
+    commit = load_wrapper("cca_decode_state_commit")
+
+    def state_io(
+        qk0,
+        v_current,
+        v_delayed_current,
+        conv_state,
+        recurrent_state,
+        state_idx,
+        conv_window,
+        conv_tail,
+        qkv_out,
+    ):
+        prepare(
+            qk0,
+            v_current,
+            conv_state,
+            recurrent_state,
+            state_idx,
+            conv_window,
+            conv_tail,
+            qkv_out,
+        )
+        commit(
+            qk0,
+            v_delayed_current,
+            state_idx,
+            conv_tail,
+            conv_state,
+            recurrent_state,
+            qkv_out,
+        )
+        return qkv_out
+
+    tensors = tuple(torch.zeros(1) for _ in range(9))
+    explanation = torch._dynamo.explain(state_io)(*tensors)
+    assert explanation.graph_count == 1
+    assert explanation.graph_break_count == 0
+    compiled = torch.compile(state_io, backend="eager", fullgraph=True)
+    assert compiled(*tensors) is tensors[-1]
+
+
 def test_native_ops_are_built_and_registered_with_explicit_mutations():
     cmake = _read("CMakeLists.txt")
     cmake_utils = _read("cmake", "utils.cmake")
@@ -216,6 +304,72 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
     assert "conv_state[state_offset + 1] =" in commit
     assert "recurrent_state[" in commit
     assert "const int safe_slot = is_pad ? 0 : slot;" in commit
+
+
+def test_cca_integration_is_opt_in_pure_decode_and_uses_static_workspaces():
+    source = _read("vllm", "model_executor", "layers", "mamba", "cca.py")
+
+    assert 'os.getenv("VLLM_CCA_NATIVE_DECODE_STATE_IO", "0") == "1"' in source
+    assert (
+        "self._native_decode_state_io and use_native_qk_postprocess" in source
+    )
+    assert (
+        "and has_decode\n            and not has_prefill"
+        in source
+    )
+    assert (
+        "native CCA decode state I/O requires native Q/K postprocess" in source
+    )
+    assert (
+        "max_decode_rows = vllm_config.scheduler_config.max_num_seqs" in source
+    )
+    assert source.count('"_native_decode_conv_window"') == 1
+    assert source.count('"_native_decode_conv_tail"') == 1
+    assert source.count("persistent=False") >= 2
+
+    prepare = source.index("ops.cca_decode_state_prepare(")
+    convolution = source.index(
+        "qk_packed3 = self._conv_qk_decode(conv_window)", prepare
+    )
+    qk_postprocess = source.index("ops.cca_qk_postprocess(", convolution)
+    commit = source.index("ops.cca_decode_state_commit(", qk_postprocess)
+    assert prepare < convolution < qk_postprocess < commit
+
+    native_start = source.index(
+        "if use_native_decode_state_io:", source.index("if has_decode:")
+    )
+    native_branch = source[
+        native_start : source.index("            else:", native_start)
+    ]
+    assert "torch.empty(" not in native_branch
+    assert "torch.cat(" not in native_branch
+    assert ".to(" not in native_branch
+
+
+def test_cca_integration_keeps_prefill_mixed_and_qk_fallbacks_intact():
+    source = _read("vllm", "model_executor", "layers", "mamba", "cca.py")
+
+    assert "if has_prefill:" in source
+    assert "self.conv_qk_grouped(" in source
+    assert "self.conv_qk_depthwise(qk_packed2_cur)" in source
+    assert "recurrent_states[state_indices_tensor_p]" in source
+    assert "elif use_compiled_qk_postprocess:" in source
+    assert "query, key = self._add_grouped_qk_means_inplace(" in source
+
+    decode = source.index("if has_decode:")
+    fallback = source[
+        source.index("if not use_native_decode_state_io:", decode)
+        : source.index("del qk_packed0_d")
+    ]
+    for operation in (
+        "safe_decode_indices = torch.where(",
+        "qk_packed0_cached = conv_states[",
+        "qk_packed0_cat = torch.cat(",
+        "new_qk_packed0_cache = qk_packed0_cached.roll(",
+        "value_delayed_decode = recurrent_states[",
+        "recurrent_states[safe_decode_indices] =",
+    ):
+        assert operation in fallback
 
 
 def test_cpu_contract_preserves_snapshot_pad_and_fp32_tail_semantics():

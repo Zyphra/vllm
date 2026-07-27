@@ -134,6 +134,9 @@ class CCA(MambaBase, CustomOp):
         self._native_qk_postprocess = (
             os.getenv("VLLM_CCA_NATIVE_QK_POSTPROCESS", "0") == "1"
         )
+        self._native_decode_state_io = (
+            os.getenv("VLLM_CCA_NATIVE_DECODE_STATE_IO", "0") == "1"
+        )
         if self._compiled_qk_postprocess and (
             self.num_q_heads, self.num_k_heads, self.head_dim, self.gqa_groups
         ) != (8, 2, 128, 4):
@@ -154,8 +157,31 @@ class CCA(MambaBase, CustomOp):
                 raise RuntimeError(
                     "native CCA Q/K postprocess was requested but unavailable"
                 )
+        if self._native_decode_state_io:
+            if not self._native_qk_postprocess:
+                raise RuntimeError(
+                    "native CCA decode state I/O requires native Q/K postprocess"
+                )
+            if (
+                self.latent_q_dim + self.latent_k_dim,
+                self.recurrent_v_dim,
+                self.total_padding,
+            ) != (1280, 128, 2):
+                raise RuntimeError(
+                    "native CCA decode state I/O only supports Zaya "
+                    "QK1280/V128/P2"
+                )
+            if (
+                not hasattr(torch.ops, "_rocm_C")
+                or not hasattr(torch.ops._rocm_C, "cca_decode_state_prepare")
+                or not hasattr(torch.ops._rocm_C, "cca_decode_state_commit")
+            ):
+                raise RuntimeError(
+                    "native CCA decode state I/O was requested but unavailable"
+                )
         self._compiled_qk_postprocess_logged = False
         self._native_qk_postprocess_logged = False
+        self._native_decode_state_io_logged = False
         if self._packed_in_proj:
             self.in_proj = MergedColumnParallelLinear(
                 self.hidden_size,
@@ -228,7 +254,32 @@ class CCA(MambaBase, CustomOp):
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads))
 
-        compilation_config = get_current_vllm_config().compilation_config
+        vllm_config = get_current_vllm_config()
+        if self._native_decode_state_io:
+            max_decode_rows = vllm_config.scheduler_config.max_num_seqs
+            self.register_buffer(
+                "_native_decode_conv_window",
+                torch.empty(
+                    max_decode_rows,
+                    self.in_out_ch,
+                    self.total_padding + 1,
+                    dtype=torch.bfloat16,
+                    device=self.temp.device,
+                ),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_native_decode_conv_tail",
+                torch.empty(
+                    max_decode_rows,
+                    self.in_out_ch,
+                    dtype=torch.float32,
+                    device=self.temp.device,
+                ),
+                persistent=False,
+            )
+
+        compilation_config = vllm_config.compilation_config
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
@@ -452,6 +503,9 @@ class CCA(MambaBase, CustomOp):
             and has_decode
             and not has_prefill
         )
+        use_native_decode_state_io = (
+            self._native_decode_state_io and use_native_qk_postprocess
+        )
 
         qk_packed0, v1, delayed_v_state = self._project_all(hs)
 
@@ -483,18 +537,29 @@ class CCA(MambaBase, CustomOp):
             dim=0,
         )
 
-        qk_packed3 = torch.empty(
-            (num_actual_tokens, batch_size, self.in_out_ch),
-            device=hs.device,
-            dtype=hs.dtype,
-        )
-        value_delayed = torch.empty(
-            (num_actual_tokens, batch_size, self.recurrent_v_dim),
-            device=hs.device,
-            dtype=hs.dtype,
-        )
+        if use_native_decode_state_io:
+            if num_decodes > self._native_decode_conv_window.shape[0]:
+                raise RuntimeError(
+                    "native CCA decode state I/O exceeds its graph-stable "
+                    f"workspace: M={num_decodes}"
+                )
+            qk_packed3 = None
+            value_delayed = None
+        else:
+            qk_packed3 = torch.empty(
+                (num_actual_tokens, batch_size, self.in_out_ch),
+                device=hs.device,
+                dtype=hs.dtype,
+            )
+            value_delayed = torch.empty(
+                (num_actual_tokens, batch_size, self.recurrent_v_dim),
+                device=hs.device,
+                dtype=hs.dtype,
+            )
         decode_is_pad: torch.Tensor | None = None
         if has_prefill:
+            assert qk_packed3 is not None
+            assert value_delayed is not None
             assert state_indices_tensor_p is not None
             assert has_initial_states_p is not None
             assert query_start_loc_p is not None
@@ -555,103 +620,139 @@ class CCA(MambaBase, CustomOp):
 
         if has_decode:
             assert state_indices_tensor_d is not None
+            if use_native_decode_state_io:
+                conv_window = self._native_decode_conv_window[:num_decodes]
+                conv_tail = self._native_decode_conv_tail[:num_decodes]
+                qk0_decode = qk_packed0_d[:, 0, :]
+                ops.cca_decode_state_prepare(
+                    qk0_decode,
+                    v1[:num_decodes, 0, :],
+                    conv_states,
+                    recurrent_states,
+                    state_indices_tensor_d,
+                    conv_window,
+                    conv_tail,
+                    output[:num_decodes],
+                )
+                qk_packed3 = self._conv_qk_decode(conv_window).transpose(1, 2)
+                if not self._native_decode_state_io_logged:
+                    logger.info(
+                        "Using native CCA decode state I/O for %s", self.prefix
+                    )
+                    self._native_decode_state_io_logged = True
+            else:
+                assert qk_packed3 is not None
+                assert value_delayed is not None
             # Generation
             # In generation B and S are actually the same in meaning
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
-            decode_is_pad = state_indices_tensor_d == PAD_SLOT_ID
-            # block_id=0 reserved
-            # Zvllm/vllm/v1/core/block_pool.py
-            safe_decode_indices = torch.where(
-                decode_is_pad,
-                torch.zeros_like(state_indices_tensor_d),
-                state_indices_tensor_d,
-            )
-            qk_packed0_d = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                qk_packed0_d.new_zeros(()),
-                qk_packed0_d,
-            )
-            hs_d = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                hs_d.new_zeros(()),
-                hs_d,
-            )
-
-            qk_packed0_cached = conv_states[
-                safe_decode_indices
-            ]  # [S, H, total_padding]
-            qk_packed0_cached = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                qk_packed0_cached.new_zeros(()),
-                qk_packed0_cached,
-            )
-            qk_packed0_cached_for_compute = qk_packed0_cached
-            decode_qk_dtype = qk_packed0_d.dtype
-            if qk_packed0_cached_for_compute.dtype != decode_qk_dtype:
-                qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(
-                    decode_qk_dtype
+            if not use_native_decode_state_io:
+                decode_is_pad = state_indices_tensor_d == PAD_SLOT_ID
+                # block_id=0 reserved
+                # Zvllm/vllm/v1/core/block_pool.py
+                safe_decode_indices = torch.where(
+                    decode_is_pad,
+                    torch.zeros_like(state_indices_tensor_d),
+                    state_indices_tensor_d,
                 )
-            qk_packed0_cat = torch.cat(
-                [qk_packed0_cached_for_compute, qk_packed0_d.transpose(1, 2)], dim=-1
-            )  # [S, H, total_padding + 1]
-            qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(
-                1, 2
-            )  # [S, 1, E]
-            qk_packed3[:num_decodes] = qk_packed3_d
+                qk_packed0_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed0_d.new_zeros(()),
+                    qk_packed0_d,
+                )
+                hs_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    hs_d.new_zeros(()),
+                    hs_d,
+                )
 
-            new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
-            new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
-                new_qk_packed0_cache.dtype
-            )
-            new_qk_packed0_cache = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                new_qk_packed0_cache.new_zeros(()),
-                new_qk_packed0_cache,
-            )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
-                device=conv_states.device, dtype=conv_states.dtype
-            )
+                qk_packed0_cached = conv_states[
+                    safe_decode_indices
+                ]  # [S, H, total_padding]
+                qk_packed0_cached = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed0_cached.new_zeros(()),
+                    qk_packed0_cached,
+                )
+                qk_packed0_cached_for_compute = qk_packed0_cached
+                decode_qk_dtype = qk_packed0_d.dtype
+                if qk_packed0_cached_for_compute.dtype != decode_qk_dtype:
+                    qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(
+                        decode_qk_dtype
+                    )
+                qk_packed0_cat = torch.cat(
+                    [
+                        qk_packed0_cached_for_compute,
+                        qk_packed0_d.transpose(1, 2),
+                    ],
+                    dim=-1,
+                )  # [S, H, total_padding + 1]
+                qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(
+                    1, 2
+                )  # [S, 1, E]
+                qk_packed3[:num_decodes] = qk_packed3_d
 
-            value_delayed_decode = recurrent_states[safe_decode_indices].unsqueeze(1)
-            value_delayed_decode = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                value_delayed_decode.new_zeros(()),
-                value_delayed_decode,
-            )
-            if value_delayed_decode.dtype != value_delayed.dtype:
-                value_delayed_decode = value_delayed_decode.to(value_delayed.dtype)
-            value_delayed[:num_decodes] = value_delayed_decode
-            new_recurrent_state = delayed_v_state_d[:, 0, :].to(
-                recurrent_states.dtype)
-            new_recurrent_state = torch.where(
-                decode_is_pad.view(-1, 1),
-                new_recurrent_state.new_zeros(()),
-                new_recurrent_state,
-            )
-            recurrent_states[safe_decode_indices] = new_recurrent_state.to(
-                device=recurrent_states.device,
-                dtype=recurrent_states.dtype)
+                new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
+                new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
+                    new_qk_packed0_cache.dtype
+                )
+                new_qk_packed0_cache = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    new_qk_packed0_cache.new_zeros(()),
+                    new_qk_packed0_cache,
+                )
+                conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype
+                )
+
+                value_delayed_decode = recurrent_states[
+                    safe_decode_indices
+                ].unsqueeze(1)
+                value_delayed_decode = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    value_delayed_decode.new_zeros(()),
+                    value_delayed_decode,
+                )
+                if value_delayed_decode.dtype != value_delayed.dtype:
+                    value_delayed_decode = value_delayed_decode.to(value_delayed.dtype)
+                value_delayed[:num_decodes] = value_delayed_decode
+                new_recurrent_state = delayed_v_state_d[:, 0, :].to(
+                    recurrent_states.dtype
+                )
+                new_recurrent_state = torch.where(
+                    decode_is_pad.view(-1, 1),
+                    new_recurrent_state.new_zeros(()),
+                    new_recurrent_state,
+                )
+                recurrent_states[safe_decode_indices] = new_recurrent_state.to(
+                    device=recurrent_states.device,
+                    dtype=recurrent_states.dtype,
+                )
 
         del qk_packed0_d
         del qk_packed0_p
         del hs_d
         del hs_p
-        del delayed_v_state_d
         del delayed_v_state_p
 
-        # Values from the two time streams
-        value = torch.cat([v1, value_delayed], dim=-1).contiguous()
-        value = value.view(
-            num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
-        )  # [S, B, kh, dh]
-        del value_delayed
+        if use_native_decode_state_io:
+            value = None
+        else:
+            assert value_delayed is not None
+            # Values from the two time streams
+            value = torch.cat([v1, value_delayed], dim=-1).contiguous()
+            value = value.view(
+                num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
+            )  # [S, B, kh, dh]
+            del value_delayed
 
         q_end = self.latent_q_dim
         k_end = q_end + self.latent_k_dim
 
         # Build queries/keys from conv output + means.
         if use_native_qk_postprocess:
+            assert qk_packed3 is not None
             grouped = qk_packed3[:, 0, :]
             first = qk_packed0[:, 0, :]
             qk_out = output[:num_actual_tokens, :k_end]
@@ -701,12 +802,25 @@ class CCA(MambaBase, CustomOp):
 
         # Flatten the singleton batch dimension without transpose/cat copies and
         # write directly into the preallocated output buffer.
-        value = value.reshape(num_actual_tokens, self.latent_k_dim)
         if not use_native_qk_postprocess:
             output[:num_actual_tokens, :q_end] = query
             output[:num_actual_tokens, q_end:k_end] = key
-        output[:num_actual_tokens, k_end:] = value
-        if decode_is_pad is not None:
+        if use_native_decode_state_io:
+            ops.cca_decode_state_commit(
+                qk0_decode,
+                delayed_v_state_d[:, 0, :],
+                state_indices_tensor_d,
+                conv_tail,
+                conv_states,
+                recurrent_states,
+                output[:num_decodes],
+            )
+            del delayed_v_state_d
+        else:
+            assert value is not None
+            value = value.reshape(num_actual_tokens, self.latent_k_dim)
+            output[:num_actual_tokens, k_end:] = value
+        if decode_is_pad is not None and not use_native_decode_state_io:
             decode_output = output[:num_decodes]
             output[:num_decodes] = torch.where(
                 decode_is_pad.view(-1, 1),
