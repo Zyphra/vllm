@@ -56,3 +56,19 @@ void paged_attention(
 void cca_qk_postprocess(const torch::Tensor& grouped,
                         const torch::Tensor& first, const torch::Tensor& temp,
                         torch::Tensor& out);
+
+void cca_decode_state_prepare(const torch::Tensor& qk0,
+                              const torch::Tensor& v_current,
+                              const torch::Tensor& conv_state,
+                              const torch::Tensor& recurrent_state,
+                              const torch::Tensor& state_idx,
+                              torch::Tensor& conv_window,
+                              torch::Tensor& conv_tail, torch::Tensor& qkv_out);
+
+void cca_decode_state_commit(const torch::Tensor& qk0,
+                             const torch::Tensor& v_delayed_current,
+                             const torch::Tensor& state_idx,
+                             const torch::Tensor& conv_tail,
+                             torch::Tensor& conv_state,
+                             torch::Tensor& recurrent_state,
+                             torch::Tensor& qkv_out);

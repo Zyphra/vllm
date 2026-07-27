@@ -184,6 +184,80 @@ if hasattr(torch.ops, "_rocm_C") and hasattr(torch.ops._rocm_C, "cca_qk_postproc
         return None
 
 
+def cca_decode_state_prepare(
+    qk0: torch.Tensor,
+    v_current: torch.Tensor,
+    conv_state: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    state_idx: torch.Tensor,
+    conv_window: torch.Tensor,
+    conv_tail: torch.Tensor,
+    qkv_out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.cca_decode_state_prepare(
+        qk0,
+        v_current,
+        conv_state,
+        recurrent_state,
+        state_idx,
+        conv_window,
+        conv_tail,
+        qkv_out,
+    )
+
+
+def cca_decode_state_commit(
+    qk0: torch.Tensor,
+    v_delayed_current: torch.Tensor,
+    state_idx: torch.Tensor,
+    conv_tail: torch.Tensor,
+    conv_state: torch.Tensor,
+    recurrent_state: torch.Tensor,
+    qkv_out: torch.Tensor,
+) -> None:
+    torch.ops._rocm_C.cca_decode_state_commit(
+        qk0,
+        v_delayed_current,
+        state_idx,
+        conv_tail,
+        conv_state,
+        recurrent_state,
+        qkv_out,
+    )
+
+
+if (
+    hasattr(torch.ops, "_rocm_C")
+    and hasattr(torch.ops._rocm_C, "cca_decode_state_prepare")
+    and hasattr(torch.ops._rocm_C, "cca_decode_state_commit")
+):
+
+    @register_fake("_rocm_C::cca_decode_state_prepare")
+    def _cca_decode_state_prepare_fake(
+        qk0: torch.Tensor,
+        v_current: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        state_idx: torch.Tensor,
+        conv_window: torch.Tensor,
+        conv_tail: torch.Tensor,
+        qkv_out: torch.Tensor,
+    ) -> None:
+        return None
+
+    @register_fake("_rocm_C::cca_decode_state_commit")
+    def _cca_decode_state_commit_fake(
+        qk0: torch.Tensor,
+        v_delayed_current: torch.Tensor,
+        state_idx: torch.Tensor,
+        conv_tail: torch.Tensor,
+        conv_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
+        qkv_out: torch.Tensor,
+    ) -> None:
+        return None
+
+
 def mla_decode_kvcache_cpu(
     out: torch.Tensor,
     query: torch.Tensor,
