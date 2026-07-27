@@ -220,6 +220,7 @@ class CCA(MambaBase, CustomOp):
         self._cca_fused_gw_version = -1
         self._cca_fused_logged = False
         self._cca_fused_route_logged_batches: set[int] = set()
+        self._cca_fused_custom_op_logged_batches: set[int] = set()
 
     def _get_cca_fused_weights(self):
         """Return live grouped-conv views for the optional fused decode op."""
@@ -861,7 +862,7 @@ def cca(
     # extension is built but the regular CCA implementation remains selected.
     # The set makes this one log per static graph shape rather than per token.
     if (metadata is not None and not metadata.num_prefills
-            and num_decodes not in self._cca_fused_route_logged_batches):
+            and num_decodes not in self._cca_fused_custom_op_logged_batches):
         logger.info(
             "CCA fused decode custom-op selector for %s: route=%s B=%d "
             "requested=%s available=%s selectable=%s",
@@ -872,7 +873,7 @@ def cca(
             cca_decode_fused.available(),
             cca_decode_fused.selectable(),
         )
-        self._cca_fused_route_logged_batches.add(num_decodes)
+        self._cca_fused_custom_op_logged_batches.add(num_decodes)
     if use_fused:
         self.forward_cuda_fused(hidden_states=hidden_states, output=output)
     else:
