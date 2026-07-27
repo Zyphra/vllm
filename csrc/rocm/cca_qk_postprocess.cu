@@ -19,11 +19,14 @@ constexpr int kHeadDim = 128;
 constexpr int kGqaGroups = 4;
 constexpr int kNumHeads = kNumQueryHeads + kNumKeyHeads;
 constexpr int kWidth = 1280;
+constexpr int kValuesPerLane = 4;
+constexpr int kReductionLanes = kHeadDim / kValuesPerLane;
 constexpr float kNormEps = 1e-12f;
 constexpr float kSqrtHeadDim = 11.313708305358887f;
 
 static_assert(kNumQueryHeads == kNumKeyHeads * kGqaGroups);
 static_assert(kWidth == kNumHeads * kHeadDim);
+static_assert(kReductionLanes == 32);
 
 __global__ void cca_qk_postprocess_kernel(
     const at::BFloat16* grouped, const at::BFloat16* first,
@@ -31,63 +34,72 @@ __global__ void cca_qk_postprocess_kernel(
     int64_t grouped_stride, int64_t first_stride, int64_t out_stride) {
   const int row = blockIdx.x;
   const int head = blockIdx.y;
-  const int channel = threadIdx.x;
-  if (row >= rows || head >= kNumHeads || channel >= kHeadDim) {
+  const int lane = threadIdx.x;
+  if (row >= rows || head >= kNumHeads || lane >= kReductionLanes) {
     return;
   }
 
-  __shared__ float squared[kHeadDim];
   const bool is_query = head < kNumQueryHeads;
   const int64_t row_offset = static_cast<int64_t>(row);
-  float value = static_cast<float>(
-      grouped[row_offset * grouped_stride + head * kHeadDim + channel]);
   const at::BFloat16* input = first + row_offset * first_stride;
+  const int channel_base = lane * kValuesPerLane;
+  float values[kValuesPerLane];
 
-  if (is_query) {
-    const int key_channel =
-        kNumQueryHeads * kHeadDim + (head / kGqaGroups) * kHeadDim + channel;
-    value += 0.5f * static_cast<float>(input[head * kHeadDim + channel]);
-    value += 0.5f * static_cast<float>(input[key_channel]);
-  } else {
-    const int key_head = head - kNumQueryHeads;
-    float query_sum = 0.0f;
 #pragma unroll
-    for (int query = 0; query < kGqaGroups; ++query) {
-      query_sum += static_cast<float>(
-          input[(key_head * kGqaGroups + query) * kHeadDim + channel]);
+  for (int i = 0; i < kValuesPerLane; ++i) {
+    const int channel = channel_base + i;
+    float value = static_cast<float>(
+        grouped[row_offset * grouped_stride + head * kHeadDim + channel]);
+    if (is_query) {
+      const int key_channel =
+          kNumQueryHeads * kHeadDim + (head / kGqaGroups) * kHeadDim + channel;
+      value += 0.5f * static_cast<float>(input[head * kHeadDim + channel]);
+      value += 0.5f * static_cast<float>(input[key_channel]);
+    } else {
+      const int key_head = head - kNumQueryHeads;
+      float query_sum = 0.0f;
+#pragma unroll
+      for (int query = 0; query < kGqaGroups; ++query) {
+        query_sum += static_cast<float>(
+            input[(key_head * kGqaGroups + query) * kHeadDim + channel]);
+      }
+      value += 0.5f * (query_sum / static_cast<float>(kGqaGroups));
+      value += 0.5f * static_cast<float>(input[head * kHeadDim + channel]);
     }
-    value += 0.5f * (query_sum / static_cast<float>(kGqaGroups));
-    value += 0.5f * static_cast<float>(input[head * kHeadDim + channel]);
+    values[i] = value;
   }
 
-  squared[channel] = value * value;
-  __syncthreads();
+  // Match the vectorized ROCm vector_norm path: contiguous float4 reduction
+  // within each lane, then ascending shuffle offsets across 32 logical lanes.
+  volatile float lane_sum = values[0] * values[0];
+#pragma unroll
+  for (int i = 1; i < kValuesPerLane; ++i) {
+    lane_sum = lane_sum + values[i] * values[i];
+  }
+  float sum = lane_sum;
+#pragma unroll
+  for (int offset = 1; offset < kReductionLanes; offset <<= 1) {
+    const float other = __shfl_down(sum, offset);
+    sum = sum + other;
+  }
+  sum = __shfl(sum, 0);
 
-  // Match ATen on gfx942: reduce each wave64 before combining the waves.
-  const int wave_base = (channel / 64) * 64;
-  const int lane = channel % 64;
-  for (int stride = 32; stride > 0; stride /= 2) {
-    if (lane < stride) {
-      squared[wave_base + lane] += squared[wave_base + lane + stride];
+  volatile float norm = sqrtf(sum);
+  volatile float norm_squared = norm * norm;
+  volatile float stabilized = norm_squared + kNormEps;
+  volatile float inverse_norm = rsqrtf(stabilized);
+  const float key_temp =
+      is_query ? 1.0f : static_cast<float>(temp[head - kNumQueryHeads]);
+#pragma unroll
+  for (int i = 0; i < kValuesPerLane; ++i) {
+    volatile float normalized = values[i] * inverse_norm;
+    normalized = normalized * kSqrtHeadDim;
+    if (!is_query) {
+      normalized = normalized * key_temp;
     }
-    __syncthreads();
+    out[row_offset * out_stride + head * kHeadDim + channel_base + i] =
+        static_cast<at::BFloat16>(normalized);
   }
-  if (channel == 0) {
-    squared[0] += squared[64];
-  }
-  __syncthreads();
-
-  // Preserve vector_norm -> square -> rsqrt and each subsequent multiply.
-  volatile float norm = sqrtf(squared[0]);
-  const float inverse_norm = rsqrtf(norm * norm + kNormEps);
-  volatile float normalized = value * inverse_norm;
-  normalized = normalized * kSqrtHeadDim;
-  if (!is_query) {
-    const float key_temp = static_cast<float>(temp[head - kNumQueryHeads]);
-    normalized = normalized * key_temp;
-  }
-  out[row_offset * out_stride + head * kHeadDim + channel] =
-      static_cast<at::BFloat16>(normalized);
 }
 
 void check_matrix_layout(const torch::Tensor& tensor, int64_t rows,
@@ -145,7 +157,7 @@ void cca_qk_postprocess(const torch::Tensor& grouped,
 
   const auto stream = at::cuda::getCurrentCUDAStream();
   cca_qk_postprocess_kernel<<<dim3(static_cast<uint32_t>(rows), kNumHeads),
-                              dim3(kHeadDim), 0, stream>>>(
+                              dim3(kReductionLanes), 0, stream>>>(
       grouped.data_ptr<at::BFloat16>(), first.data_ptr<at::BFloat16>(),
       temp.data_ptr<at::BFloat16>(), out.data_ptr<at::BFloat16>(),
       static_cast<int>(rows), grouped.stride(0), first.stride(0),

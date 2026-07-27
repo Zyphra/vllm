@@ -83,6 +83,9 @@ def test_kernel_preserves_exact_math_and_fails_closed():
         "constexpr int kHeadDim = 128;",
         "constexpr int kGqaGroups = 4;",
         "constexpr int kWidth = 1280;",
+        "constexpr int kValuesPerLane = 4;",
+        "constexpr int kReductionLanes = kHeadDim / kValuesPerLane;",
+        "static_assert(kReductionLanes == 32);",
         "rows > 0",
         "std::numeric_limits<int>::max()",
         "grouped.is_cuda()",
@@ -121,14 +124,22 @@ def test_kernel_preserves_exact_math_and_fails_closed():
     assert source.count("value += 0.5f") == 4
 
     reduction = (
-        source.index("const int wave_base"),
-        source.index("for (int stride = 32"),
-        source.index("squared[0] += squared[64]"),
+        source.index("const int channel_base = lane * kValuesPerLane"),
+        source.index("const int channel = channel_base + i"),
+        source.index("values[i] = value"),
+        source.index("volatile float lane_sum = values[0] * values[0]"),
+        source.index("for (int i = 1; i < kValuesPerLane; ++i)"),
+        source.index("lane_sum = lane_sum + values[i] * values[i]"),
+        source.index("for (int offset = 1; offset < kReductionLanes; offset <<= 1)"),
+        source.index("const float other = __shfl_down(sum, offset)"),
+        source.index("sum = __shfl(sum, 0)"),
     )
     normalization = (
-        source.index("sqrtf(squared[0])"),
-        source.index("rsqrtf(norm * norm + kNormEps)"),
-        source.index("value * inverse_norm"),
+        source.index("sqrtf(sum)"),
+        source.index("norm_squared = norm * norm"),
+        source.index("stabilized = norm_squared + kNormEps"),
+        source.index("rsqrtf(stabilized)"),
+        source.index("values[i] * inverse_norm"),
         source.index("normalized * kSqrtHeadDim"),
         source.index("normalized * key_temp"),
     )
@@ -142,3 +153,5 @@ def test_kernel_preserves_exact_math_and_fails_closed():
     assert reduction == tuple(sorted(reduction))
     assert normalization == tuple(sorted(normalization))
     assert launch == tuple(sorted(launch))
+    assert "dim3(kReductionLanes), 0, stream" in source
+    assert "__shared__" not in source
