@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import TYPE_CHECKING
+import logging
+from typing import TYPE_CHECKING, Callable
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionBackend
@@ -31,6 +32,45 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.cca_attn import CCAAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+
+logger = logging.getLogger(__name__)
+
+
+def _cca_qk_add_grouped_means(
+    qk_packed3: torch.Tensor,
+    qk_packed0: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Source-equivalent CCA Q/K grouped-mean preparation in FP32."""
+    batch = qk_packed3.shape[0]
+    query = qk_packed3[..., :1024].view(batch, 1, 8, 128).float()
+    key = qk_packed3[..., 1024:].view(batch, 1, 2, 128).float()
+    query_pre = qk_packed0[..., :1024].view(batch, 1, 8, 128)
+    key_base = qk_packed0[..., 1024:].view(batch, 1, 2, 128)
+
+    key_base_fp32 = key_base.float()
+    query_pre_grouped = query_pre.view(batch, 1, 2, 4, 128)
+    query.view_as(query_pre_grouped).add_(query_pre_grouped, alpha=0.5)
+    query.view_as(query_pre_grouped).add_(key_base_fp32.unsqueeze(-2), alpha=0.5)
+    key.add_(
+        torch.mean(query_pre_grouped, dim=-2, dtype=torch.float32), alpha=0.5
+    )
+    key.add_(key_base_fp32, alpha=0.5)
+    return query, key
+
+
+_compiled_cca_qk_add_grouped_means: Callable | None = None
+
+
+def _get_compiled_cca_qk_add_grouped_means() -> Callable:
+    global _compiled_cca_qk_add_grouped_means
+    if _compiled_cca_qk_add_grouped_means is None:
+        _compiled_cca_qk_add_grouped_means = torch.compile(
+            # vLLM captures multiple static decode sizes through this custom op.
+            # A dynamic batch dimension avoids exhausting Dynamo's per-function
+            # recompile cache during that capture sequence.
+            _cca_qk_add_grouped_means, fullgraph=True, dynamic=True
+        )
+    return _compiled_cca_qk_add_grouped_means
 
 
 @CustomOp.register("cca")
@@ -87,6 +127,14 @@ class CCA(MambaBase, CustomOp):
         self._packed_in_proj = (
             os.getenv("VLLM_CCA_PACKED_INPROJ_ENABLED", "0") == "1"
         )
+        self._compiled_qk_postprocess = (
+            os.getenv("VLLM_CCA_COMPILED_QK_POSTPROCESS", "0") == "1"
+        )
+        if self._compiled_qk_postprocess and (
+            self.num_q_heads, self.num_k_heads, self.head_dim, self.gqa_groups
+        ) != (8, 2, 128, 4):
+            raise RuntimeError("compiled CCA Q/K postprocess only supports Zaya Q8/K2/D128")
+        self._compiled_qk_postprocess_logged = False
         if self._packed_in_proj:
             self.in_proj = MergedColumnParallelLinear(
                 self.hidden_size,
@@ -374,17 +422,20 @@ class CCA(MambaBase, CustomOp):
         # dimension directly instead of transposing and materializing a copy.
         hs = hidden_states.unsqueeze(1)  # [S, 1, H]
         batch_size = hs.shape[1]
+        use_compiled_qk_postprocess = (
+            self._compiled_qk_postprocess and batch_size == 1
+        )
 
         qk_packed0, v1, delayed_v_state = self._project_all(hs)
 
         # Pre-mean tensors in head form (for "qk_mean_{q,k}" calc)
-        query_pre = qk_packed0[..., : self.latent_q_dim].view(
-            *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
-        )  # [S, B, qh, dh]
-
-        key_base = qk_packed0[..., self.latent_q_dim :].view(
-            *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
-        )  # [S, B, kh, dh]
+        if not use_compiled_qk_postprocess:
+            query_pre = qk_packed0[..., : self.latent_q_dim].view(
+                *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
+            )  # [S, B, qh, dh]
+            key_base = qk_packed0[..., self.latent_q_dim :].view(
+                *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
+            )  # [S, B, kh, dh]
 
         # NOTE: V1 puts decode before prefill
         # Separate prefill and decode by splitting varlen input
@@ -569,29 +620,42 @@ class CCA(MambaBase, CustomOp):
         )  # [S, B, kh, dh]
         del value_delayed
 
-        # Build queries/keys from conv output + means
-        query = (
-            qk_packed3[..., : self.latent_q_dim]
-            .view(num_actual_tokens, batch_size, self.num_q_heads, self.head_dim)
-            .float()
-        )
-
-        key = (
-            qk_packed3[..., self.latent_q_dim :]
-            .view(num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)
-            .float()
-        )
-        query, key = self._add_grouped_qk_means_inplace(query, key, query_pre, key_base)
-        del query_pre
-        del key_base
+        # Build queries/keys from conv output + means.
+        if use_compiled_qk_postprocess:
+            if not self._compiled_qk_postprocess_logged:
+                logger.info("Using compiled CCA Q/K mean preparation for %s", self.prefix)
+                self._compiled_qk_postprocess_logged = True
+            query, key = _get_compiled_cca_qk_add_grouped_means()(
+                qk_packed3, qk_packed0,
+            )
+            query, key = self._rms_normalize_qk(
+                query.contiguous(), key.contiguous())
+            query = query.reshape(num_actual_tokens, self.latent_q_dim)
+            key = key.reshape(num_actual_tokens, self.latent_k_dim)
+        else:
+            query = (
+                qk_packed3[..., : self.latent_q_dim]
+                .view(num_actual_tokens, batch_size, self.num_q_heads, self.head_dim)
+                .float()
+            )
+            key = (
+                qk_packed3[..., self.latent_q_dim :]
+                .view(num_actual_tokens, batch_size, self.num_k_heads, self.head_dim)
+                .float()
+            )
+            query, key = self._add_grouped_qk_means_inplace(
+                query, key, query_pre, key_base)
+            query, key = self._rms_normalize_qk(
+                query.contiguous(), key.contiguous())
+            query = query.reshape(num_actual_tokens, self.latent_q_dim)
+            key = key.reshape(num_actual_tokens, self.latent_k_dim)
+            del query_pre
+            del key_base
         del qk_packed0
         del qk_packed3
 
-        query, key = self._rms_normalize_qk(query.contiguous(), key.contiguous())
         # Flatten the singleton batch dimension without transpose/cat copies and
         # write directly into the preallocated output buffer.
-        query = query.reshape(num_actual_tokens, self.latent_q_dim)
-        key = key.reshape(num_actual_tokens, self.latent_k_dim)
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
         q_end = self.latent_q_dim
         k_end = q_end + self.latent_k_dim
