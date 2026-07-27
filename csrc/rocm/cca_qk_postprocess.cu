@@ -66,17 +66,25 @@ __global__ void cca_qk_postprocess_kernel(
       value += 0.5f * (query_sum / static_cast<float>(kGqaGroups));
       value += 0.5f * static_cast<float>(input[head * kHeadDim + channel]);
     }
+    // The source mean path materializes FP32 before vector_norm. Keep the
+    // merged value in a VGPR while preventing contraction across that boundary.
+    asm volatile("" : "+v"(value));
     values[i] = value;
   }
 
   // Match the vectorized ROCm vector_norm path: contiguous float4 reduction
   // within each lane, then ascending shuffle offsets across 32 logical lanes.
-  volatile float lane_sum = values[0] * values[0];
+  float value_list[kValuesPerLane];
+#pragma unroll
+  for (int i = 0; i < kValuesPerLane; ++i) {
+    value_list[i] = 0.0f;
+    value_list[i] = value_list[i] + values[i] * values[i];
+  }
 #pragma unroll
   for (int i = 1; i < kValuesPerLane; ++i) {
-    lane_sum = lane_sum + values[i] * values[i];
+    value_list[0] = value_list[0] + value_list[i];
   }
-  float sum = lane_sum;
+  float sum = value_list[0];
 #pragma unroll
   for (int offset = 1; offset < kReductionLanes; offset <<= 1) {
     const float other = __shfl_down(sum, offset);
@@ -87,7 +95,7 @@ __global__ void cca_qk_postprocess_kernel(
   volatile float norm = sqrtf(sum);
   volatile float norm_squared = norm * norm;
   volatile float stabilized = norm_squared + kNormEps;
-  volatile float inverse_norm = rsqrtf(stabilized);
+  volatile float inverse_norm = ::rsqrt(stabilized);
   const float key_temp =
       is_query ? 1.0f : static_cast<float>(temp[head - kNumQueryHeads]);
 #pragma unroll
