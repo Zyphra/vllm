@@ -1,4 +1,4 @@
-# ZAYA1 BF16 AITER FMoE rows (HOLD)
+# ZAYA1 BF16 AITER FMoE rows (image-scoped promotion)
 
 These nine exact rows are scoped to the AITER build in image
 `sha256:edb4ba6c85813723fc8ef29e695566bb5e881cc2a9f4c216f9ae3ba0d403f829`.
@@ -42,8 +42,17 @@ Same-source ABBA job `324433` measured B1 `87.3294 -> 89.9359` TPS
 `2788.641 -> 2818.880` (`+1.0844%`). All four trajectories and log-probabilities
 were exact, and runtime logs proved every intended row hit.
 
-The durable reducer is
+NUMA/GPU-pinned same-source reverse ABBA job `324584` then promoted the
+combined native-CCA and current-image AITER profile: B1
+`76.0745 -> 89.5045` TPS (`+17.65%`), C16 `850.947 -> 947.521`
+(`+11.35%`), and C64 `2565.789 -> 2791.908` (`+8.81%`). Both paired
+directions agreed; trajectories and token log-probabilities were exact and
+finite; all nine candidate rows, native CCA, and FULL/PIECEWISE replay were
+proved. The final receipt SHA-256 is
+`c949d969a5ee922fff1a91d4ff41c6ef34752bcf34fe2b74a6cd92edf405afaf`.
+
+The durable directional reducer is
 `/shared/home/rob/research/zaya_profile_20260725/aiter_retuned_on_native_cca_${SLURM_JOB_ID}/summary.json`.
-The older `85a5` overlay is rejected on this image. Promotion remains HOLD
-until the image-scoped config is integrated and the outstanding checkpoint-scale
-native-CCA numerical gate is complete.
+The promoted cumulative receipt is
+`/shared/home/rob/research/zaya_profile_20260725/native_cca_aiter_cumulative_runs/run_324584/FINAL_RECEIPT.json`.
+The older `85a5` overlay remains rejected on this image.
