@@ -262,10 +262,6 @@ class CCA(MambaBase, CustomOp):
             self.v_proj_delayed(hs),
         )
 
-    def invalidate_fused_weight_cache(self) -> None:
-        self._cca_fused_gw_weight = None
-        self._cca_fused_gw_version = -1
-
     def forward_native(
         self,
         hidden_states: torch.Tensor,

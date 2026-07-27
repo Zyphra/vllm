@@ -1293,7 +1293,6 @@ class Worker(WorkerBase):
 
         with set_current_vllm_config(self.vllm_config):
             self.weight_transfer_engine.finish_weight_update()
-            getattr(self.get_model(), "refresh_fp32_lmhead_cache", lambda: None)()
             self.weight_transfer_engine.reset_weight_update_target()
             self._weight_update_active = False
 
