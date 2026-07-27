@@ -374,6 +374,10 @@ class EngineCore:
         """Return DP1 freeze readiness without disturbing resident requests."""
         batch_queue = getattr(self, "batch_queue", None)
         batch_queue_size = len(batch_queue) if batch_queue is not None else 0
+        request_output_token_offsets = {
+            str(request_id): int(request.num_output_tokens)
+            for request_id, request in self.scheduler.requests.items()
+        }
         try:
             scheduler_request_counts = list(self.scheduler.get_request_counts())
         except Exception:
@@ -389,6 +393,10 @@ class EngineCore:
             "scheduler_paused": paused,
             "scheduler_has_unfinished_requests": scheduler_has_unfinished,
             "scheduler_request_counts": scheduler_request_counts,
+            # Exact response-coordinate boundary for every request resident at
+            # the freeze. The caller commits these offsets to its compact
+            # parameter-version RLE only after the weight update succeeds.
+            "request_output_token_offsets": request_output_token_offsets,
             "batch_queue_size": batch_queue_size,
             "sync_drain_requested": paused,
             "sync_drain_quiesced": paused and batch_queue_size == 0,
