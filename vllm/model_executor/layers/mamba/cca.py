@@ -850,13 +850,29 @@ def cca(
     metadata = forward_context.attn_metadata
     if isinstance(metadata, dict):
         metadata = metadata[self.prefix]
+    num_decodes = 0 if metadata is None else metadata.num_decode_tokens
     use_fused = (
         metadata is not None
         and not metadata.num_prefills
-        and (metadata.num_decode_tokens <= 8
-             or metadata.num_decode_tokens >= 32)
+        and (num_decodes <= 8 or num_decodes >= 32)
         and cca_decode_fused.enabled()
     )
+    # Audit receipt at the custom-op boundary, including load-only where the
+    # extension is built but the regular CCA implementation remains selected.
+    # The set makes this one log per static graph shape rather than per token.
+    if (metadata is not None and not metadata.num_prefills
+            and num_decodes not in self._cca_fused_route_logged_batches):
+        logger.info(
+            "CCA fused decode custom-op selector for %s: route=%s B=%d "
+            "requested=%s available=%s selectable=%s",
+            self.prefix,
+            "fused" if use_fused else "fallback",
+            num_decodes,
+            cca_decode_fused.requested(),
+            cca_decode_fused.available(),
+            cca_decode_fused.selectable(),
+        )
+        self._cca_fused_route_logged_batches.add(num_decodes)
     if use_fused:
         self.forward_cuda_fused(hidden_states=hidden_states, output=output)
     else:
