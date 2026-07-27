@@ -26,9 +26,6 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator,
     MambaStateShapeCalculator,
 )
-from vllm.model_executor.layers.mamba.cca_legacy import (
-    forward_cuda_legacy,
-)
 from vllm.model_executor.layers.mamba.ops import cca_decode_fused
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -76,9 +73,6 @@ def _get_compiled_cca_qk_add_grouped_means() -> Callable:
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
-    forward_cuda_legacy = forward_cuda_legacy
-    forward_cuda = forward_cuda_legacy
-
     def __init__(
         self,
         config,
@@ -422,7 +416,7 @@ class CCA(MambaBase, CustomOp):
             out = out + b1.view(1, g, d, 1)
         return out.reshape(x.shape[0], g * d, out.shape[-1])
 
-    def forward_cuda_fused(
+    def forward_cuda(
         self,
         hidden_states: torch.Tensor,
         output: torch.Tensor,
@@ -867,17 +861,14 @@ def cca(
             "CCA fused decode custom-op selector for %s: route=%s B=%d "
             "requested=%s available=%s selectable=%s",
             self.prefix,
-            "fused" if use_fused else "fallback",
+            "fused-wrapper" if use_fused else "fallback",
             num_decodes,
             cca_decode_fused.requested(),
             cca_decode_fused.available(),
             cca_decode_fused.selectable(),
         )
         self._cca_fused_custom_op_logged_batches.add(num_decodes)
-    if use_fused:
-        self.forward_cuda_fused(hidden_states=hidden_states, output=output)
-    else:
-        self.forward_cuda(hidden_states=hidden_states, output=output)
+    self.forward_cuda(hidden_states=hidden_states, output=output)
 
 
 def cca_fake(
