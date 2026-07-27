@@ -224,10 +224,10 @@ void check_gfx942(const torch::Tensor& anchor, int64_t rows, const char* op) {
 
 bool byte_ranges_overlap(const torch::Tensor& left,
                          const torch::Tensor& right) {
-  const auto byte_range = [](const torch::Tensor& tensor) {
+  const auto byte_range = [](const torch::Tensor& tensor, int64_t first_dim) {
     uintptr_t begin = reinterpret_cast<uintptr_t>(tensor.data_ptr());
     uint64_t last_element_offset = 0;
-    for (int64_t dim = 0; dim < tensor.dim(); ++dim) {
+    for (int64_t dim = first_dim; dim < tensor.dim(); ++dim) {
       TORCH_INTERNAL_ASSERT(tensor.size(dim) > 0);
       TORCH_INTERNAL_ASSERT(tensor.stride(dim) >= 0);
       last_element_offset += static_cast<uint64_t>(tensor.size(dim) - 1) *
@@ -238,9 +238,33 @@ bool byte_ranges_overlap(const torch::Tensor& left,
     return std::pair<uintptr_t, uintptr_t>{begin, end};
   };
 
-  const auto [left_begin, left_end] = byte_range(left);
-  const auto [right_begin, right_end] = byte_range(right);
-  return left_begin < right_end && right_begin < left_end;
+  const auto [left_begin, left_end] = byte_range(left, 0);
+  const auto [right_begin, right_end] = byte_range(right, 0);
+  if (left_begin >= right_end || right_begin >= left_end) {
+    return false;
+  }
+
+  const uint64_t left_row_stride =
+      static_cast<uint64_t>(left.stride(0)) * left.element_size();
+  const uint64_t right_row_stride =
+      static_cast<uint64_t>(right.stride(0)) * right.element_size();
+  if (left.size(0) != right.size(0) ||
+      left_row_stride != right_row_stride) {
+    return true;
+  }
+
+  const auto [left_row_begin, left_row_end] = byte_range(left, 1);
+  const auto [right_row_begin, right_row_end] = byte_range(right, 1);
+  const uint64_t left_row_bytes = left_row_end - left_row_begin;
+  const uint64_t right_row_bytes = right_row_end - right_row_begin;
+  if (left_begin <= right_begin) {
+    const uint64_t offset = right_begin - left_begin;
+    return offset > left_row_stride || left_row_bytes > offset ||
+           right_row_bytes > left_row_stride - offset;
+  }
+  const uint64_t offset = left_begin - right_begin;
+  return offset > right_row_stride || right_row_bytes > offset ||
+         left_row_bytes > right_row_stride - offset;
 }
 
 }  // namespace

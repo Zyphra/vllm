@@ -266,6 +266,9 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
         "state_idx must be int32",
         "mutable outputs must not share storage",
         "bool byte_ranges_overlap(",
+        "left_row_stride != right_row_stride",
+        "left_row_bytes > offset",
+        "right_row_bytes > left_row_stride - offset",
         "!byte_ranges_overlap(conv_state, recurrent_state)",
         "__uint_as_float(old0_bits)",
         "conv_tail[tail_offset] = old1_bits;",
@@ -336,29 +339,20 @@ def test_kernel_is_allocation_free_fixed_geometry_and_fails_closed():
 
 def test_bind_kv_cache_equivalent_state_slices_share_storage_without_overlap():
     slots = 8
-    conv_elements = slots * QK_WIDTH * 2
-    recurrent_elements = slots * VALUE_WIDTH
-    page = np.empty((conv_elements + recurrent_elements) * 4, dtype=np.uint8)
-    conv_bytes = page[: conv_elements * 4]
-    recurrent_bytes = page[conv_elements * 4 :]
-    conv_state = conv_bytes.view(np.float32).reshape(slots, QK_WIDTH, 2)
-    recurrent_state = recurrent_bytes.view(np.float32).reshape(slots, VALUE_WIDTH)
+    page = np.empty((slots, 16384), dtype=np.uint8)
+    conv_state = page[:, :10240].view(np.float32).reshape(slots, QK_WIDTH, 2)
+    recurrent_state = page[:, 10240:10752].view(np.float32).reshape(slots, VALUE_WIDTH)
 
     assert np.shares_memory(conv_state, page)
     assert np.shares_memory(recurrent_state, page)
     assert not np.shares_memory(conv_state, recurrent_state)
-    conv_begin = conv_state.__array_interface__["data"][0]
-    conv_end = conv_begin + conv_state.nbytes
-    recurrent_begin = recurrent_state.__array_interface__["data"][0]
-    recurrent_end = recurrent_begin + recurrent_state.nbytes
-    assert conv_end == recurrent_begin
-    assert conv_begin < conv_end <= recurrent_begin < recurrent_end
+    assert conv_state.strides[0] == recurrent_state.strides[0] == 16384
+    conv_row_begin = conv_state.__array_interface__["data"][0]
+    recurrent_row_begin = recurrent_state.__array_interface__["data"][0]
+    assert recurrent_row_begin - conv_row_begin == 10240
 
-    overlapping_bytes = page[conv_elements * 4 - 4 :][
-        : recurrent_elements * 4
-    ]
-    overlapping_state = overlapping_bytes.view(np.float32).reshape(
-        slots, VALUE_WIDTH
+    overlapping_state = (
+        page[:, 10236:10748].view(np.float32).reshape(slots, VALUE_WIDTH)
     )
     assert np.shares_memory(conv_state, overlapping_state)
 

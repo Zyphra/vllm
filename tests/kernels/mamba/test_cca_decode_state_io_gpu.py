@@ -18,17 +18,11 @@ pytestmark = pytest.mark.skipif(
 
 
 def _packed_states(*, overlap: bool) -> tuple[torch.Tensor, torch.Tensor]:
-    conv_bytes = SLOTS * QK_WIDTH * 2 * 4
-    recurrent_bytes = SLOTS * VALUE_WIDTH * 4
-    page = torch.empty(
-        conv_bytes + recurrent_bytes,
-        dtype=torch.uint8,
-        device="cuda",
-    )
-    conv_state = page[:conv_bytes].view(torch.float32).view(SLOTS, QK_WIDTH, 2)
-    recurrent_offset = conv_bytes - 4 if overlap else conv_bytes
+    page = torch.empty((SLOTS, 16384), dtype=torch.uint8, device="cuda")
+    conv_state = page[:, :10240].view(torch.float32).view(SLOTS, QK_WIDTH, 2)
+    recurrent_offset = 10236 if overlap else 10240
     recurrent_state = (
-        page[recurrent_offset : recurrent_offset + recurrent_bytes]
+        page[:, recurrent_offset : recurrent_offset + 512]
         .view(torch.float32)
         .view(SLOTS, VALUE_WIDTH)
     )
@@ -63,6 +57,8 @@ def _inputs():
 
 def test_bind_kv_cache_equivalent_disjoint_state_views_are_exact():
     conv_state, recurrent_state = _packed_states(overlap=False)
+    assert conv_state.stride(0) * conv_state.element_size() == 16384
+    assert recurrent_state.stride(0) * recurrent_state.element_size() == 16384
     generator = torch.Generator(device="cuda").manual_seed(20260728)
     conv_state.copy_(torch.randn(conv_state.shape, generator=generator, device="cuda"))
     recurrent_state.copy_(
