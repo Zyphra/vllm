@@ -58,8 +58,8 @@ def test_sync_prepare_adds_frontend_lifecycle_receipts():
         async def prepare_for_sync_async(self, **_kwargs):
             return [
                 {
-                    "request_output_token_offsets": {"active": 17},
-                    "terminal_request_ids": ["finished-in-core"],
+                    "request_output_token_offsets": {"active-deadbeef": 17},
+                    "terminal_request_ids": ["finished-in-core-deadbeef"],
                     "sync_drain_quiesced": True,
                 }
             ]
@@ -76,7 +76,12 @@ def test_sync_prepare_adds_frontend_lifecycle_receipts():
         engine._paused = False
         engine.engine_core = _EngineCoreClient()
         engine.output_processor = SimpleNamespace(
-            request_states={"active": object(), "submitted-zero-token": object()}
+            request_states={
+                "active-deadbeef": SimpleNamespace(external_req_id="active"),
+                "submitted-zero-token-cafebabe": SimpleNamespace(
+                    external_req_id="submitted-zero-token"
+                ),
+            }
         )
         engine._sync_terminal_request_ids = {"terminal-awaiting-caller"}
 
@@ -85,7 +90,7 @@ def test_sync_prepare_adds_frontend_lifecycle_receipts():
         assert states == [
             {
                 "request_output_token_offsets": {"active": 17},
-                "terminal_request_ids": ["finished-in-core"],
+                "terminal_request_ids": [],
                 "frontend_request_ids": ["active", "submitted-zero-token"],
                 "frontend_terminal_request_ids": ["terminal-awaiting-caller"],
                 "sync_drain_quiesced": True,
@@ -98,7 +103,7 @@ def test_sync_prepare_adds_frontend_lifecycle_receipts():
 
 def test_terminal_receipt_lives_until_generate_caller_consumes_output():
     class _Collector:
-        request_id = "terminal-awaiting-caller"
+        request_id = "terminal-deadbeef"
 
         def __init__(self, output):
             self.output = output
@@ -115,10 +120,10 @@ def test_terminal_receipt_lives_until_generate_caller_consumes_output():
 
     async def scenario():
         engine = object.__new__(AsyncLLM)
-        engine._sync_terminal_request_ids = {"terminal-awaiting-caller"}
+        engine._sync_terminal_request_ids = set()
         engine.log_requests = False
         output = RequestOutput(
-            request_id="terminal-awaiting-caller",
+            request_id="terminal",
             prompt=None,
             prompt_token_ids=None,
             prompt_logprobs=None,
@@ -138,9 +143,7 @@ def test_terminal_receipt_lives_until_generate_caller_consumes_output():
         )
 
         assert await anext(generator) is output
-        assert engine._sync_terminal_request_ids == {
-            "terminal-awaiting-caller"
-        }
+        assert engine._sync_terminal_request_ids == {"terminal"}
         with pytest.raises(StopAsyncIteration):
             await anext(generator)
         assert engine._sync_terminal_request_ids == set()
@@ -166,7 +169,7 @@ def test_output_processor_records_terminal_before_publishing_abort():
 
         def make_request_output(self, **_kwargs):
             return RequestOutput(
-                request_id="terminal-abort",
+                request_id="external",
                 prompt=None,
                 prompt_token_ids=None,
                 prompt_logprobs=None,
@@ -188,5 +191,5 @@ def test_output_processor_records_terminal_before_publishing_abort():
     aborted = processor.abort_requests(["terminal-abort"], internal=True)
 
     assert aborted == ["terminal-abort"]
-    assert processor.sync_terminal_request_ids == {"terminal-abort"}
+    assert processor.sync_terminal_request_ids == {"external"}
     assert state.queue.outputs[0].finished is True

@@ -506,7 +506,9 @@ class OutputProcessor:
                     )
                 ):
                     if self.sync_terminal_request_ids is not None:
-                        self.sync_terminal_request_ids.add(request_id)
+                        self.sync_terminal_request_ids.add(
+                            request_output.request_id
+                        )
                     req_state.queue.put(request_output)
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
@@ -638,7 +640,7 @@ class OutputProcessor:
                 and not req_state.streaming_input
                 and self.sync_terminal_request_ids is not None
             ):
-                self.sync_terminal_request_ids.add(req_id)
+                self.sync_terminal_request_ids.add(req_state.external_req_id)
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
 

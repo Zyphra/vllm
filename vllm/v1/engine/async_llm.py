@@ -601,12 +601,12 @@ class AsyncLLM(EngineClient):
                 finished = out.finished
                 if out is not STREAM_FINISHED:
                     if finished:
-                        self._sync_terminal_request_ids.add(q.request_id)
+                        self._sync_terminal_request_ids.add(out.request_id)
                     try:
                         yield out
                     finally:
                         if finished:
-                            self._sync_terminal_request_ids.discard(q.request_id)
+                            self._sync_terminal_request_ids.discard(out.request_id)
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
@@ -655,7 +655,7 @@ class AsyncLLM(EngineClient):
             raise EngineGenerateError() from e
         finally:
             if q is not None:
-                self._sync_terminal_request_ids.discard(q.request_id)
+                self._sync_terminal_request_ids.discard(request_id)
                 q.close()
 
     def _run_output_handler(self):
@@ -773,15 +773,49 @@ class AsyncLLM(EngineClient):
                 poll_interval_s=poll_interval_s,
                 reason=reason,
             )
-            # The EngineCore receipt identifies unfinished and just-finished
-            # scheduler requests.  These frontend receipts distinguish a
-            # request that passed admission from one still blocked by the
-            # pause, and bridge terminal delivery until the caller consumes it.
-            frontend_request_ids = sorted(self.output_processor.request_states)
+            # InputProcessor assigns each request a private EngineCore ID while
+            # callers and the rollout server retain the external ID.  Translate
+            # the entire sync receipt back to the caller namespace; otherwise
+            # exact offsets cannot be joined to rollout metadata.
+            internal_to_external = {
+                str(internal_id): str(req_state.external_req_id)
+                for internal_id, req_state in self.output_processor.request_states.items()
+            }
+            frontend_request_ids = sorted(set(internal_to_external.values()))
             frontend_terminal_request_ids = sorted(
                 self._sync_terminal_request_ids
             )
             for state in drain_states:
+                raw_offsets = state.get("request_output_token_offsets")
+                if not isinstance(raw_offsets, dict):
+                    raise RuntimeError(
+                        "EngineCore sync receipt is missing request offsets"
+                    )
+                external_offsets: dict[str, int] = {}
+                for internal_id, offset in raw_offsets.items():
+                    internal_id = str(internal_id)
+                    external_id = internal_to_external.get(internal_id)
+                    if external_id is None:
+                        raise RuntimeError(
+                            "EngineCore sync receipt contains an unfinished "
+                            f"request absent from the frontend: {internal_id}"
+                        )
+                    if external_id in external_offsets:
+                        raise RuntimeError(
+                            "multiple unfinished EngineCore requests map to the "
+                            f"same external request ID: {external_id}"
+                        )
+                    external_offsets[external_id] = int(offset)
+                state["request_output_token_offsets"] = external_offsets
+                raw_terminal_ids = state.get("terminal_request_ids")
+                if isinstance(raw_terminal_ids, (list, tuple, set)):
+                    state["terminal_request_ids"] = sorted(
+                        {
+                            internal_to_external[str(internal_id)]
+                            for internal_id in raw_terminal_ids
+                            if str(internal_id) in internal_to_external
+                        }
+                    )
                 state["frontend_request_ids"] = frontend_request_ids
                 state["frontend_terminal_request_ids"] = (
                     frontend_terminal_request_ids
