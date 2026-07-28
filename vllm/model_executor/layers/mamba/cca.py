@@ -1658,7 +1658,9 @@ class CCA(MambaBase, CustomOp):
                     hs2_d.new_zeros(()),
                     hs2_d,
                 )
-                prev_hs[state_indices_tensor_d] = hs_d.to(
+                # PAD_SLOT_ID and stale slots are invalid cache indices. Reads
+                # already use the clamped indices; writes must do the same.
+                prev_hs[safe_decode_indices] = hs_d.to(
                     device=prev_hs.device, dtype=prev_hs.dtype)
                 hs2_output_list.insert(0, hs2_d)
 

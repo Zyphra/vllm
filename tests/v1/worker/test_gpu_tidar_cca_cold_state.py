@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from pathlib import Path
 import torch
 
 from vllm.model_executor.layers.mamba.cca import (
@@ -39,3 +40,16 @@ def test_cca_cached_state_gather_converts_dtype() -> None:
     )
     assert actual.dtype == torch.bfloat16
     assert torch.equal(actual.float(), cache)
+
+
+def test_ar_decode_cache_write_uses_validated_indices() -> None:
+    """Padded singleton AR decode rows must never index cache storage."""
+    root = Path(__file__).resolve().parents[3]
+    source = (
+        root / "vllm/model_executor/layers/mamba/cca.py"
+    ).read_text()
+    assert "prev_hs[state_indices_tensor_d] =" not in source
+    assert (
+        "prev_hs[safe_decode_indices] = new_prev_hs.to(" in source
+        or "prev_hs[safe_decode_indices] = hs_d.to(" in source
+    )
