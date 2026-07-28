@@ -111,6 +111,8 @@ def _top1_logprobs_kernel(
     max_val = float("-inf")
     max_token_id = 0
     rank = 0
+    num_pos_inf = 0
+    num_nan = 0
     for i in range(0, vocab_size, BLOCK_SIZE):
         block = i + tl.arange(0, BLOCK_SIZE)
         mask = block < vocab_size
@@ -124,6 +126,8 @@ def _top1_logprobs_kernel(
         )
         max_val = tl.maximum(max_val, block_max)
         rank += tl.sum((mask & (logits >= sampled_logit)).to(tl.int32))
+        num_pos_inf += tl.sum((mask & (logits == float("inf"))).to(tl.int32))
+        num_nan += tl.sum((mask & (logits != logits)).to(tl.int32))
 
     se = 0.0
     for i in range(0, vocab_size, BLOCK_SIZE):
@@ -132,12 +136,26 @@ def _top1_logprobs_kernel(
         logits = tl.load(row_ptr + block, mask=mask, other=0.0).to(tl.float32)
         se += tl.sum(tl.where(mask, tl.exp(logits - max_val), 0.0))
     log_normalizer = max_val + tl.log(se)
+    sampled_logprob = sampled_logit - log_normalizer
+    top1_logprob = max_val - log_normalizer
+
+    # A positive-infinity logit wins the sampler deterministically, but the
+    # usual log-softmax expression evaluates inf - inf to NaN. Preserve
+    # fail-closed behavior for NaNs and for an unexpectedly sampled finite
+    # token; only canonicalize a clean sampled +inf row.
+    clean_pos_inf_row = (num_pos_inf > 0) & (num_nan == 0)
+    sampled_logprob = tl.where(
+        clean_pos_inf_row,
+        tl.where(sampled_logit == float("inf"), 0.0, float("-inf")),
+        sampled_logprob,
+    )
+    top1_logprob = tl.where(clean_pos_inf_row, 0.0, top1_logprob)
 
     output_offset = req_idx * 2
     tl.store(logprob_token_ids_ptr + output_offset, sampled_token_id)
     tl.store(logprob_token_ids_ptr + output_offset + 1, max_token_id)
-    tl.store(logprobs_ptr + output_offset, sampled_logit - log_normalizer)
-    tl.store(logprobs_ptr + output_offset + 1, max_val - log_normalizer)
+    tl.store(logprobs_ptr + output_offset, sampled_logprob)
+    tl.store(logprobs_ptr + output_offset + 1, top1_logprob)
     tl.store(token_ranks_ptr + req_idx, rank)
 
 

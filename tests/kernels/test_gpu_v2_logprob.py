@@ -45,6 +45,47 @@ def test_compute_top1_logprobs(dtype: torch.dtype) -> None:
     assert torch.equal(output.selected_token_ranks, expected_ranks)
 
 
+def test_compute_top1_logprobs_positive_infinity() -> None:
+    logits = torch.tensor(
+        [
+            [float("inf"), 1.0, 0.0],
+            [0.0, float("inf"), float("inf")],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    sampled_token_ids = torch.tensor([0, 1], device="cuda")
+
+    output = compute_top1_logprobs(logits, sampled_token_ids)
+
+    assert torch.equal(
+        output.logprob_token_ids,
+        torch.tensor([[0, 0], [1, 1]], device="cuda"),
+    )
+    assert torch.equal(output.logprobs, torch.zeros(2, 2, device="cuda"))
+    assert torch.equal(
+        output.selected_token_ranks,
+        torch.tensor([1, 2], device="cuda"),
+    )
+
+
+def test_compute_top1_logprobs_undefined_rows_remain_nonfinite() -> None:
+    logits = torch.tensor(
+        [
+            [float("inf"), float("nan"), 0.0],
+            [float("-inf"), float("-inf"), float("-inf")],
+            [0.0, float("inf"), 1.0],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    sampled_token_ids = torch.tensor([0, 0, 0], device="cuda")
+
+    output = compute_top1_logprobs(logits, sampled_token_ids)
+
+    assert not torch.isfinite(output.logprobs[:, 0]).any()
+
+
 def test_compute_topk_logprobs_uses_top1_fast_path() -> None:
     logits = torch.randn(4, 1025, dtype=torch.float32, device="cuda")
     sampled_token_ids = torch.tensor([0, 1, 2, 3], device="cuda")
