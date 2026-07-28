@@ -150,6 +150,21 @@ def _top1_logprobs_kernel(
         sampled_logprob,
     )
     top1_logprob = tl.where(clean_pos_inf_row, 0.0, top1_logprob)
+    # Invalid rows fail closed downstream. Encode their subtype in the rank
+    # field so the scheduler can report the source without another GPU scan.
+    rank = tl.where(
+        num_nan > 0,
+        -1,
+        tl.where(
+            max_val == float("-inf"),
+            -2,
+            tl.where(
+                clean_pos_inf_row & (sampled_logit != float("inf")),
+                -3,
+                rank,
+            ),
+        ),
+    )
 
     output_offset = req_idx * 2
     tl.store(logprob_token_ids_ptr + output_offset, sampled_token_id)

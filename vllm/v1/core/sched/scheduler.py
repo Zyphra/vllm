@@ -96,9 +96,21 @@ def _assert_sampled_logprob_rows(
             f"logprob_row={int(row_token_ids[first, 0])}"
         )
     if row_logprobs.size and not np.isfinite(row_logprobs[:, 0]).all():
+        nonfinite = np.flatnonzero(~np.isfinite(row_logprobs[:, 0]))
+        first = int(nonfinite[0])
+        sampled_ranks = np.asarray(new_logprobs.sampled_token_ranks)
+        rank = int(sampled_ranks[first])
+        subtype = {
+            -1: "contains_nan",
+            -2: "all_negative_infinity",
+            -3: "positive_infinity_sample_mismatch",
+        }.get(rank, "unclassified")
         raise RuntimeError(
             "V2 TiDAR sampled-token logprobs are non-finite for request "
-            f"{req_id}"
+            f"{req_id} at row {first}: "
+            f"sampled_token={int(row_token_ids[first, 0])}, "
+            f"logprob={float(row_logprobs[first, 0])!r}, "
+            f"rank={rank}, subtype={subtype}"
         )
 
 

@@ -36,11 +36,30 @@ def test_tidar_logprob_rows_reject_request_offset_drift():
         _assert_sampled_logprob_rows("out-of-order", [71, 72], _rows([81, 82]))
 
 
-def test_tidar_logprob_rows_reject_shape_and_nonfinite_values():
+def test_tidar_logprob_rows_reject_shape():
     with pytest.raises(RuntimeError, match="row-count mismatch"):
         _assert_sampled_logprob_rows("short", [1, 2], _rows([1]))
 
+
+@pytest.mark.parametrize(
+    ("logprob", "rank", "subtype"),
+    [
+        (np.nan, -1, "contains_nan"),
+        (-np.inf, -2, "all_negative_infinity"),
+        (-np.inf, -3, "positive_infinity_sample_mismatch"),
+    ],
+)
+def test_tidar_logprob_rows_report_nonfinite_subtype(
+    logprob: float,
+    rank: int,
+    subtype: str,
+):
     bad = _rows([1, 2])
-    bad.logprobs[1, 0] = np.nan
-    with pytest.raises(RuntimeError, match="non-finite"):
-        _assert_sampled_logprob_rows("nan", [1, 2], bad)
+    bad.logprobs[1, 0] = logprob
+    bad.sampled_token_ranks[1] = rank
+    expected = (
+        rf"request diagnostic at row 1: sampled_token=2, "
+        rf"logprob=(nan|-inf), rank={rank}, subtype={subtype}"
+    )
+    with pytest.raises(RuntimeError, match=expected):
+        _assert_sampled_logprob_rows("diagnostic", [1, 2], bad)

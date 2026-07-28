@@ -84,6 +84,10 @@ def test_compute_top1_logprobs_undefined_rows_remain_nonfinite() -> None:
     output = compute_top1_logprobs(logits, sampled_token_ids)
 
     assert not torch.isfinite(output.logprobs[:, 0]).any()
+    assert torch.equal(
+        output.selected_token_ranks,
+        torch.tensor([-1, -2, -3], device="cuda"),
+    )
 
 
 def test_compute_topk_logprobs_uses_top1_fast_path() -> None:
