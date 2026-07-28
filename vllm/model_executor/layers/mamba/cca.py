@@ -1704,7 +1704,7 @@ class CCA(MambaBase, CustomOp):
                         dw_weight,
                         self.conv_qk[0].bias,
                         conv_states,
-                        state_indices_tensor_d,
+                        safe_decode_indices,
                         gw_weight,
                         gw_bias,
                         qk_mean_packed,
@@ -1729,7 +1729,7 @@ class CCA(MambaBase, CustomOp):
                     conv_states,
                     weights,
                     self.conv_qk[0].bias,
-                    state_indices_tensor_d,
+                    safe_decode_indices,
                     seqlen=1
                 )
                 groups = self.num_k_heads + self.num_q_heads

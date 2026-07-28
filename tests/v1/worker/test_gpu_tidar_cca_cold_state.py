@@ -53,3 +53,11 @@ def test_ar_decode_cache_write_uses_validated_indices() -> None:
         "prev_hs[safe_decode_indices] = new_prev_hs.to(" in source
         or "prev_hs[safe_decode_indices] = hs_d.to(" in source
     )
+    assert (
+        "conv_states,\n"
+        "                        state_indices_tensor_d,\n"
+    ) not in source
+    assert (
+        "self.conv_qk[0].bias,\n"
+        "                    state_indices_tensor_d,\n"
+    ) not in source
