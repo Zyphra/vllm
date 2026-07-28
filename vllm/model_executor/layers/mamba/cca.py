@@ -52,6 +52,10 @@ _CCA_AMD_CONV_UNFOLD_ENABLED = os.environ.get(
 _CCA_BATCH_INVARIANT_CONV_ENABLED = os.environ.get(
     "VLLM_CCA_BATCH_INVARIANT_CONV", "0").lower() in ("1", "true", "yes")
 
+_CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED = os.environ.get(
+    "VLLM_CCA_MATCH_MEGATRON_CONV_DTYPE", "0").lower() in (
+        "1", "true", "yes")
+
 _CCA_DIM_PRESERVE_CONV_ENABLED = os.environ.get(
     "CCA_DIM_PRESERVE_CONV", "0").lower() in ("1", "true", "yes")
 
@@ -312,6 +316,14 @@ class CCA(MambaBase, CustomOp):
                 self.conv_qk[1].bias,
                 self.num_k_heads + self.num_q_heads,
             )
+        if _CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED:
+            # Megatron's Float16Module casts the complete CCA module to the
+            # configured model dtype.  Calling the Sequential module preserves
+            # the same dtype rounding between the two Conv1d stages.  This
+            # opt-in path is useful when rollout logprobs must match a Megatron
+            # recompute; the established FP32 path below remains the default.
+            model_dtype = self.conv_qk[0].weight.dtype
+            return self.conv_qk(x.to(dtype=model_dtype))
         x_fp32 = x.to(torch.float32)
 
         versions = tuple(
