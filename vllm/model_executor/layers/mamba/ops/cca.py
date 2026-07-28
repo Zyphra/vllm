@@ -356,10 +356,19 @@ def _causal_conv1d_update_kernel(
     y1 = b + w0 * x0 + w1 * x1
     y2 = b + w0 * x1 + w1 * x2
 
-    # Store outputs to (batch, dim, 2)
+    # Store outputs to (batch, dim, 2). Invalid rows still need a defined
+    # result: torch.empty otherwise leaves PAD/OOB outputs uninitialized.
     o_base = o_ptr + idx_seq * stride_o_seq + idx_feats * stride_o_dim
-    tl.store(o_base + 0 * stride_o_token, y1, mask=mask_c)
-    tl.store(o_base + 1 * stride_o_token, y2, mask=mask_c)
+    tl.store(
+        o_base + 0 * stride_o_token,
+        tl.where(valid_row, y1, 0.0),
+        mask=mask_feat,
+    )
+    tl.store(
+        o_base + 1 * stride_o_token,
+        tl.where(valid_row, y2, 0.0),
+        mask=mask_feat,
+    )
 
     # Update state: roll(-1) then append new token
     # new_state[0] = old_state[1] (= x1), new_state[1] = new_token (= x2)
@@ -447,9 +456,8 @@ def grouped_conv1d_decode(x, weight, bias=None):
 
 
 # ---------------------------------------------------------------------------
-# Fused pad detection + hs_d zeroing + prev_hs gather/scatter.
-# Replaces 6 separate kernel launches with 1 in the decode path.
-# Controlled by VLLM_CCA_PAD_SLOTS_FUSED_ENABLED (default: disabled).
+# Fused invalid-row detection + graph-safe recurrent cache gather/scatter.
+# Used for both prev_hs and flattened convolution-cache rows.
 # ---------------------------------------------------------------------------
 @triton.jit
 def _fused_pad_gather_scatter_kernel(
@@ -497,18 +505,31 @@ def _fused_pad_gather_scatter_kernel(
 
 def fused_pad_gather_scatter(
     state_indices,   # [S], int64
-    hs_d,            # [S, H]
-    prev_hs,         # [num_blocks, H]  — modified in-place (scatter)
+    hs_d,            # [S, ...]
+    prev_hs,         # [num_blocks, ...] — modified in-place (scatter)
 ):
-    """Fused pad handling for the CCA decode path.
+    """Graph-safe masked cache gather/scatter for the CCA decode path.
 
     Returns (hs2_d_out, decode_is_pad):
-        hs2_d_out:     [S, H]  gathered from prev_hs, zeroed for pads
-        decode_is_pad: [S]     boolean pad mask
-    Also scatters valid (non-pad) hs_d rows into prev_hs in-place.
+        hs2_d_out:     [S, ...] gathered from prev_hs, zeroed for PAD/OOB
+        decode_is_pad: [S]     boolean invalid-row mask
+    Also scatters valid hs_d rows into prev_hs in-place. The cache and values
+    may have arbitrary matching trailing dimensions; they are flattened only
+    for the kernel launch.
     """
     S = state_indices.shape[0]
-    H = hs_d.shape[-1]
+    if prev_hs.shape[0] == 0:
+        raise ValueError("CCA recurrent cache must have at least one row")
+    if hs_d.shape[0] != S:
+        raise ValueError("state_indices and values must have the same batch")
+    if S == 0:
+        return (
+            torch.empty_like(hs_d, dtype=prev_hs.dtype),
+            torch.empty(0, device=hs_d.device, dtype=torch.bool),
+        )
+    if (hs_d.numel() // S
+            != prev_hs.numel() // prev_hs.shape[0]):
+        raise ValueError("cache and values must have matching row shapes")
 
     # state_indices can be a strided view (block-table column); the kernel
     # indexes it as a dense [S] array.
@@ -521,8 +542,13 @@ def fused_pad_gather_scatter(
         torch.full_like(state_indices, -1),
         state_indices,
     )
-    hs_d_cast = hs_d.to(dtype=prev_hs.dtype) if hs_d.dtype != prev_hs.dtype else hs_d
-    hs2_d_out = torch.empty(S, H, device=hs_d.device, dtype=prev_hs.dtype)
+    hs_d_cast = (hs_d.to(dtype=prev_hs.dtype)
+                 if hs_d.dtype != prev_hs.dtype else hs_d)
+    hs_d_flat = hs_d_cast.contiguous().view(S, -1)
+    prev_hs_flat = prev_hs.view(prev_hs.shape[0], -1)
+    H = hs_d_flat.shape[1]
+    hs2_d_out = torch.empty(
+        S, H, device=hs_d.device, dtype=prev_hs.dtype)
     decode_is_pad = torch.empty(S, device=hs_d.device, dtype=torch.bool)
 
     BLOCK_H = 128
@@ -530,19 +556,19 @@ def fused_pad_gather_scatter(
 
     _fused_pad_gather_scatter_kernel[grid](
         state_indices,
-        hs_d_cast,
-        prev_hs,
+        hs_d_flat,
+        prev_hs_flat,
         hs2_d_out,
         decode_is_pad,
         H=H,
-        HS_D_STRIDE0=hs_d_cast.stride(0),
-        PREV_HS_STRIDE0=prev_hs.stride(0),
+        HS_D_STRIDE0=hs_d_flat.stride(0),
+        PREV_HS_STRIDE0=prev_hs_flat.stride(0),
         PAD_SLOT_ID=-1,
         BLOCK_H=BLOCK_H,
     )
 
     return (
-        hs2_d_out,
+        hs2_d_out.view(S, *prev_hs.shape[1:]),
         decode_is_pad,
     )
 

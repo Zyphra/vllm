@@ -25,10 +25,34 @@ from vllm.model_executor.layers.linear import (ColumnParallelLinear,
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateDtypeCalculator, MambaStateShapeCalculator)
+from vllm.model_executor.layers.mamba.ops import fused_pad_gather_scatter
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.utils import direct_register_custom_op
 from vllm.v1.attention.backends.cca_attn import (
     CCAAttentionMetadata)
+
+
+def _gather_cached_state_or_zeros(
+    cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_states: torch.Tensor,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Use clamped indices only for a masked, read-only cache gather."""
+    indices = state_indices.to(dtype=torch.long)
+    valid = (
+        has_initial_states.to(dtype=torch.bool)
+        & (indices >= 0)
+        & (indices < cache.shape[0])
+    )
+    safe_indices = indices.clamp(min=0, max=cache.shape[0] - 1)
+    gathered = cache[safe_indices].to(dtype)
+    return torch.where(
+        valid.view(-1, *([1] * (cache.ndim - 1))),
+        gathered,
+        gathered.new_zeros(()),
+    )
+
 
 @CustomOp.register("cca")
 class CCA(MambaBase, CustomOp):
@@ -248,10 +272,17 @@ class CCA(MambaBase, CustomOp):
         selected_hs = self._spec_stash_hs[arange, idx]
 
         slots = self._spec_stash_slots[:n_used].to(torch.long)
-        conv_states[slots] = selected_conv.to(
-            device=conv_states.device, dtype=conv_states.dtype)
-        prev_hs[slots] = selected_hs.to(
-            device=prev_hs.device, dtype=prev_hs.dtype)
+        fused_pad_gather_scatter(
+            slots,
+            selected_conv.to(device=conv_states.device,
+                             dtype=conv_states.dtype),
+            conv_states,
+        )
+        fused_pad_gather_scatter(
+            slots,
+            selected_hs.to(device=prev_hs.device, dtype=prev_hs.dtype),
+            prev_hs,
+        )
 
         # DEBUG (TiDAR FULL cudagraph drift): dump per-step CCA state for
         # req 0 to localize where eager and FULL diverge. Gated on
@@ -435,18 +466,16 @@ class CCA(MambaBase, CustomOp):
         hs_p_2d = hs_p.view(P, S, H_hs)
         qk_packed0_p_2d = qk_packed0_p.view(P, S, H_conv)
 
-        # Cached state reads. In steady-state TiDAR captured replay,
-        # has_initial_states_p is always True: every captured forward
-        # follows the cold prompt prefill that lives off the captured
-        # path entirely. Cold-prefill batches of length K+1 are rare
-        # enough we keep them on the eager fallback (the gate above
-        # only requires shape, but cold prefill of exactly K+1 tokens
-        # is unusual). So skip the torch.where + cold-path zeros
-        # branches and use the cached state directly. Saves ~4 GPU ops
-        # per CCA layer per forward = ~88 ops/step at K=16, b=1.
-        hs_cached = prev_hs[state_indices_p].to(hs_p_2d.dtype)  # [P, H_hs]
-        qk_cached = conv_states[state_indices_p].to(
-            qk_packed0_p_2d.dtype)  # [P, H_conv, total_padding]
+        # Clamp only this masked read. Captured replays can substitute a cold,
+        # PAD, or stale OOB row into the otherwise uniform shape.
+        hs_cached = _gather_cached_state_or_zeros(
+            prev_hs, state_indices_p, has_initial_states_p, hs_p_2d.dtype)
+        qk_cached = _gather_cached_state_or_zeros(
+            conv_states,
+            state_indices_p,
+            has_initial_states_p,
+            qk_packed0_p_2d.dtype,
+        )
 
         # Build hs2 context: [hs_cached, hs_p[:, :-1]] -> [P, S, H_hs].
         hs2_p_2d = torch.cat(
@@ -493,10 +522,17 @@ class CCA(MambaBase, CustomOp):
             # post-acceptance candidate.
             last_conv = qk_packed2_p[..., -cca_time0:].contiguous()  # [P, H_conv, cca_time0]
             last_hs = hs_p_2d[:, -1, :]  # [P, H_hs]
-            conv_states[state_indices_p_write] = last_conv.to(
-                device=conv_states.device, dtype=conv_states.dtype)
-            prev_hs[state_indices_p_write] = last_hs.to(
-                device=prev_hs.device, dtype=prev_hs.dtype)
+            fused_pad_gather_scatter(
+                state_indices_p_write,
+                last_conv.to(device=conv_states.device,
+                             dtype=conv_states.dtype),
+                conv_states,
+            )
+            fused_pad_gather_scatter(
+                state_indices_p_write,
+                last_hs.to(device=prev_hs.device, dtype=prev_hs.dtype),
+                prev_hs,
+            )
 
             # Stash all K+1 = S candidates per req.
             # Candidate window n for req i: qk_packed2_p[i, :, start_off+n :
@@ -959,7 +995,8 @@ class CCA(MambaBase, CustomOp):
                     qk_packed0_cur = qk_packed0_p[start_i:end_i, :, :]
                     qk_packed1_cur = qk_packed0_cur.permute(1, 2, 0)
 
-                    if has_init_i:
+                    if (has_init_i
+                            and 0 <= slot_i < prev_hs.shape[0]):
                         hs2_cached = prev_hs[slot_i].unsqueeze(0).unsqueeze(0)
                         if hs2_cached.dtype != hs2_cur.dtype:
                             hs2_cached = hs2_cached.to(hs2_cur.dtype)
@@ -980,11 +1017,18 @@ class CCA(MambaBase, CustomOp):
                     conv_states_cur = nn.functional.pad(
                         qk_packed2_cur,
                         (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                    conv_states[slot_i] = conv_states_cur.to(
-                        device=conv_states.device, dtype=conv_states.dtype)
-                    prev_hs[slot_i] = hs_p[
-                        end_i - 1, 0, :].to(device=prev_hs.device,
-                                            dtype=prev_hs.dtype)
+                    fused_pad_gather_scatter(
+                        state_indices_tensor_p[i:i + 1],
+                        conv_states_cur.to(device=conv_states.device,
+                                           dtype=conv_states.dtype),
+                        conv_states,
+                    )
+                    fused_pad_gather_scatter(
+                        state_indices_tensor_p[i:i + 1],
+                        hs_p[end_i - 1, 0, :].unsqueeze(0).to(
+                            device=prev_hs.device, dtype=prev_hs.dtype),
+                        prev_hs,
+                    )
 
                     qk_packed3_cur = self._conv_qk_decode(
                         qk_packed2_cur).permute(2, 0, 1)
@@ -995,7 +1039,11 @@ class CCA(MambaBase, CustomOp):
             # In generation B and S are actually the same in meaning
             # That's why we don't need to transpose qk_packed0
             # qk_packed0_d [S, 1, H]
-            decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+            decode_is_pad = (
+                (state_indices_tensor_d == PAD_SLOT_ID)
+                | (state_indices_tensor_d < 0)
+                | (state_indices_tensor_d >= prev_hs.shape[0])
+            )
             # block_id=0 reserved
             # Zvllm/vllm/v1/core/block_pool.py
             safe_decode_indices = torch.where(
@@ -1026,6 +1074,11 @@ class CCA(MambaBase, CustomOp):
                 qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(decode_qk_dtype)
             qk_packed0_cat = torch.cat([qk_packed0_cached_for_compute, qk_packed0_d.transpose(1, 2)], dim=-1) # [S, H, total_padding + 1]
             qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(1, 2)  # [S, 1, E]
+            qk_packed3_d = torch.where(
+                decode_is_pad.view(-1, 1, 1),
+                qk_packed3_d.new_zeros(()),
+                qk_packed3_d,
+            )
             qk_packed3[:num_decodes] = qk_packed3_d
             
             new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
@@ -1035,26 +1088,22 @@ class CCA(MambaBase, CustomOp):
                 new_qk_packed0_cache.new_zeros(()),
                 new_qk_packed0_cache,
             )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
-                device=conv_states.device, dtype=conv_states.dtype)
-
-            hs2_decode = prev_hs[safe_decode_indices].unsqueeze(1) # [S, 1, H]
-            hs2_decode = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                hs2_decode.new_zeros(()),
-                hs2_decode,
+            fused_pad_gather_scatter(
+                state_indices_tensor_d,
+                new_qk_packed0_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype),
+                conv_states,
             )
+            hs2_decode, _ = fused_pad_gather_scatter(
+                state_indices_tensor_d,
+                hs_d[:, 0, :].to(
+                    device=prev_hs.device, dtype=prev_hs.dtype),
+                prev_hs,
+            )
+            hs2_decode = hs2_decode.unsqueeze(1)
             if hs2_decode.dtype != hs.dtype:
                 hs2_decode = hs2_decode.to(hs.dtype)
             hs2[:num_decodes] = hs2_decode
-            new_prev_hs = hs_d[:, 0, :].to(prev_hs.dtype)
-            new_prev_hs = torch.where(
-                decode_is_pad.view(-1, 1),
-                new_prev_hs.new_zeros(()),
-                new_prev_hs,
-            )
-            prev_hs[safe_decode_indices] = new_prev_hs.to(
-                device=prev_hs.device, dtype=prev_hs.dtype)
 
         del qk_packed0_d
         del qk_packed0_p

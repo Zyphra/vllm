@@ -616,10 +616,17 @@ class CCA(MambaBase, CustomOp):
             # Default commit. TiDAR runs additionally stash all candidates.
             last_conv = qk_packed2_p[..., -cca_time0:].contiguous()
             last_hs = hs_p_2d[:, -1, :]
-            conv_states[state_indices_p_write] = last_conv.to(
-                device=conv_states.device, dtype=conv_states.dtype)
-            prev_hs[state_indices_p_write] = last_hs.to(
-                device=prev_hs.device, dtype=prev_hs.dtype)
+            fused_pad_gather_scatter(
+                state_indices_p_write,
+                last_conv.to(device=conv_states.device,
+                             dtype=conv_states.dtype),
+                conv_states,
+            )
+            fused_pad_gather_scatter(
+                state_indices_p_write,
+                last_hs.to(device=prev_hs.device, dtype=prev_hs.dtype),
+                prev_hs,
+            )
 
             if (self._spec_stash_conv is not None
                     and P <= self._spec_max_P
@@ -817,23 +824,22 @@ class CCA(MambaBase, CustomOp):
         valid = slots >= 0
         if mask is not None:
             valid = valid & mask
-        # Skipped rows write their own current state back (slot 0 is the
-        # reserved pad block for rows whose slot is -1) — keeps the scatter
-        # shape static and avoids a host sync on the valid mask.
-        safe_slots = torch.where(valid, slots, torch.zeros_like(slots))
-        cur_conv = conv_states[safe_slots]
-        cur_hs = prev_hs[safe_slots]
-        out_conv = torch.where(
-            valid.view(-1, 1, 1),
+        # Turn semantically skipped rows into PAD rows and let the masked
+        # scatter suppress their writes. Clamping them to slot 0 aliases an
+        # invalid row with a simultaneously active request that owns slot 0.
+        write_slots = torch.where(
+            valid, slots, torch.full_like(slots, PAD_SLOT_ID))
+        fused_pad_gather_scatter(
+            write_slots,
             selected_conv.to(device=conv_states.device,
                              dtype=conv_states.dtype),
-            cur_conv)
-        out_hs = torch.where(
-            valid.view(-1, 1),
+            conv_states,
+        )
+        fused_pad_gather_scatter(
+            write_slots,
             selected_hs.to(device=prev_hs.device, dtype=prev_hs.dtype),
-            cur_hs)
-        conv_states[safe_slots] = out_conv
-        prev_hs[safe_slots] = out_hs
+            prev_hs,
+        )
 
     def forward_native(
         self,
@@ -999,11 +1005,16 @@ class CCA(MambaBase, CustomOp):
                     
                 hs2[start_i:end_i] = hs2_cur
 
-                _widx_p = int(state_indices_tensor_p[i])  # ccaoob-prefill-fix(JZ): skip OOB write slot
-                if 0 <= _widx_p < conv_states.shape[0]:
-                    conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                    conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
-                        device=conv_states.device, dtype=conv_states.dtype)
+                conv_states_cur = nn.functional.pad(
+                    qk_packed2_cur,
+                    (self.cca_time0 - qk_packed2_cur.shape[-1], 0),
+                )
+                fused_pad_gather_scatter(
+                    state_indices_tensor_p[i:i + 1],
+                    conv_states_cur.to(device=conv_states.device,
+                                       dtype=conv_states.dtype),
+                    conv_states,
+                )
                 
                 # Computing conv
                 qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
@@ -1012,11 +1023,8 @@ class CCA(MambaBase, CustomOp):
             qk_packed3_output_list.append(qk_packed3_p)
             hs2_output_list.append(hs2)
             _vals_p = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)  # ccaoob-prefill-fix(JZ)
-            _wv_p = (state_indices_tensor_p >= 0) & (state_indices_tensor_p < prev_hs.shape[0])
-            if bool(_wv_p.all()):
-                prev_hs[state_indices_tensor_p] = _vals_p
-            else:
-                prev_hs[state_indices_tensor_p[_wv_p]] = _vals_p[_wv_p]
+            fused_pad_gather_scatter(
+                state_indices_tensor_p, _vals_p, prev_hs)
 
         if has_decode:
             # Generation
@@ -1062,24 +1070,20 @@ class CCA(MambaBase, CustomOp):
                 new_qk_packed0_cache.new_zeros(()),
                 new_qk_packed0_cache,
             )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
-                device=conv_states.device, dtype=conv_states.dtype)
+            fused_pad_gather_scatter(
+                state_indices_tensor_d,
+                new_qk_packed0_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype),
+                conv_states,
+            )
 
-            hs2 = prev_hs[safe_decode_indices]  # [S, H]
-            hs2 = torch.where(
-                decode_is_pad.view(-1, 1),
-                hs2.new_zeros(()),
-                hs2,
+            hs2, _ = fused_pad_gather_scatter(
+                state_indices_tensor_d,
+                hs_d.to(device=prev_hs.device, dtype=prev_hs.dtype),
+                prev_hs,
             )
+            hs2 = hs2.to(hs.dtype)
             hs2_output_list.insert(0, hs2)
-            new_prev_hs = hs_d.to(prev_hs.dtype)
-            new_prev_hs = torch.where(
-                decode_is_pad.view(-1, 1),
-                new_prev_hs.new_zeros(()),
-                new_prev_hs,
-            )
-            prev_hs[safe_decode_indices] = new_prev_hs.to(
-                device=prev_hs.device, dtype=prev_hs.dtype)
 
 
         qk_packed3 = torch.vstack(qk_packed3_output_list)[:num_actual_tokens]
@@ -1107,6 +1111,12 @@ class CCA(MambaBase, CustomOp):
         key   = key.reshape(num_actual_tokens, self.num_k_heads * self.head_dim)
         value = value.reshape(num_actual_tokens, self.num_k_heads * self.head_dim)
         qkv = torch.cat([query, key, value], dim=1)
+        if has_decode:
+            qkv[:num_decodes] = torch.where(
+                decode_is_pad.view(-1, 1),
+                qkv.new_zeros(()),
+                qkv[:num_decodes],
+            )
         output[:num_actual_tokens] = qkv
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
@@ -1541,11 +1551,16 @@ class CCA(MambaBase, CustomOp):
                     hs2[start_i:end_i] = hs2_cur
 
                     if not drafter_pass:
-                        _widx_p = int(_sit_write_p[i])  # ccaoob-prefill-fix(JZ): skip OOB write slot
-                        if 0 <= _widx_p < conv_states.shape[0]:
-                            conv_states_cur = nn.functional.pad(qk_packed2_cur, (self.cca_time0 - qk_packed2_cur.shape[-1], 0))
-                            conv_states[_widx_p] = conv_states_cur.squeeze(0).to(
-                                device=conv_states.device, dtype=conv_states.dtype)
+                        conv_states_cur = nn.functional.pad(
+                            qk_packed2_cur,
+                            (self.cca_time0 - qk_packed2_cur.shape[-1], 0),
+                        )
+                        fused_pad_gather_scatter(
+                            _sit_write_p[i:i + 1],
+                            conv_states_cur.to(device=conv_states.device,
+                                               dtype=conv_states.dtype),
+                            conv_states,
+                        )
 
                     # Computing conv
                     qk_packed3_cur = self._conv_qk_apply(qk_packed2_cur).squeeze(0).T  # [S, E]
@@ -1554,11 +1569,8 @@ class CCA(MambaBase, CustomOp):
                 hs2_output_list.append(hs2)
                 if not drafter_pass:
                     _vals_p = hs_p[query_start_loc_p[1:] - 1].to(device=prev_hs.device, dtype=prev_hs.dtype)  # ccaoob-prefill-fix(JZ)
-                    _wv_p = (_sit_write_p >= 0) & (_sit_write_p < prev_hs.shape[0])
-                    if bool(_wv_p.all()):
-                        prev_hs[_sit_write_p] = _vals_p
-                    else:
-                        prev_hs[_sit_write_p[_wv_p]] = _vals_p[_wv_p]
+                    fused_pad_gather_scatter(
+                        _sit_write_p, _vals_p, prev_hs)
 
         _fused_decode_active = False
         if has_decode:
@@ -1571,7 +1583,11 @@ class CCA(MambaBase, CustomOp):
 
             # Generation
             if use_capture_decode:
-                decode_is_pad = (state_indices_tensor_d == PAD_SLOT_ID)
+                decode_is_pad = (
+                    (state_indices_tensor_d == PAD_SLOT_ID)
+                    | (state_indices_tensor_d < 0)
+                    | (state_indices_tensor_d >= prev_hs.shape[0])
+                )
                 safe_decode_indices = torch.where(
                     decode_is_pad,
                     torch.zeros_like(state_indices_tensor_d),
@@ -1617,51 +1633,28 @@ class CCA(MambaBase, CustomOp):
                     new_qk_cache.new_zeros(()),
                     new_qk_cache,
                 )
-                conv_states[safe_decode_indices] = new_qk_cache.to(
-                    device=conv_states.device, dtype=conv_states.dtype)
-
-                hs2_d = prev_hs[safe_decode_indices].to(hs.dtype)
-                hs2_d = torch.where(
-                    decode_is_pad.view(-1, 1),
-                    hs2_d.new_zeros(()),
-                    hs2_d,
+                fused_pad_gather_scatter(
+                    state_indices_tensor_d,
+                    new_qk_cache.to(
+                        device=conv_states.device, dtype=conv_states.dtype),
+                    conv_states,
                 )
+                hs2_d, _ = fused_pad_gather_scatter(
+                    state_indices_tensor_d,
+                    hs_d.to(device=prev_hs.device, dtype=prev_hs.dtype),
+                    prev_hs,
+                )
+                hs2_d = hs2_d.to(hs.dtype)
                 hs2_output_list.insert(0, hs2_d)
-                new_prev_hs = hs_d.to(prev_hs.dtype)
-                new_prev_hs = torch.where(
-                    decode_is_pad.view(-1, 1),
-                    new_prev_hs.new_zeros(()),
-                    new_prev_hs,
-                )
-                prev_hs[safe_decode_indices] = new_prev_hs.to(
-                    device=prev_hs.device, dtype=prev_hs.dtype)
-            elif _CCA_TRITON_FUSION_ENABLED:
+            else:
                 hs2_d, decode_is_pad = fused_pad_gather_scatter(
                     state_indices_tensor_d, hs_d, prev_hs,
                 )
-                hs2_output_list.insert(0, hs2_d)
-            else:
-                decode_is_pad = ((state_indices_tensor_d == PAD_SLOT_ID) | (state_indices_tensor_d < 0) | (state_indices_tensor_d >= prev_hs.shape[0]))  # ccaoob-fix(JZ): treat <0 / >=num_slots as pad -> avoids forward_triton illegal-mem (Xid31)
-                safe_decode_indices = torch.where(
-                    decode_is_pad,
-                    torch.zeros_like(state_indices_tensor_d),
-                    state_indices_tensor_d,
-                )
-                hs_d = torch.where(
+                qk_packed0_d = torch.where(
                     decode_is_pad.view(-1, 1),
-                    hs_d.new_zeros(()),
-                    hs_d,
+                    qk_packed0_d.new_zeros(()),
+                    qk_packed0_d,
                 )
-                hs2_d = prev_hs[safe_decode_indices]  # [S, H]
-                hs2_d = torch.where(
-                    decode_is_pad.view(-1, 1),
-                    hs2_d.new_zeros(()),
-                    hs2_d,
-                )
-                # PAD_SLOT_ID and stale slots are invalid cache indices. Reads
-                # already use the clamped indices; writes must do the same.
-                prev_hs[safe_decode_indices] = hs_d.to(
-                    device=prev_hs.device, dtype=prev_hs.dtype)
                 hs2_output_list.insert(0, hs2_d)
 
             use_decode_fused = False
@@ -1704,7 +1697,7 @@ class CCA(MambaBase, CustomOp):
                         dw_weight,
                         self.conv_qk[0].bias,
                         conv_states,
-                        safe_decode_indices,
+                        state_indices_tensor_d,
                         gw_weight,
                         gw_bias,
                         qk_mean_packed,
@@ -1713,6 +1706,11 @@ class CCA(MambaBase, CustomOp):
                         self.sqrt_head_dim,
                         self.config.clamp_temp,
                     )  # [B, G*dh]
+                    fused_out = torch.where(
+                        decode_is_pad.view(-1, 1),
+                        fused_out.new_zeros(()),
+                        fused_out,
+                    )
 
                     _fused_query_d = fused_out[:, :self.latent_q_dim]   # [B, qh*dh]
                     _fused_key_d   = fused_out[:, self.latent_q_dim:]   # [B, kh*dh]
@@ -1729,8 +1727,13 @@ class CCA(MambaBase, CustomOp):
                     conv_states,
                     weights,
                     self.conv_qk[0].bias,
-                    safe_decode_indices,
+                    state_indices_tensor_d,
                     seqlen=1
+                )
+                qk_packed3_old = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed3_old.new_zeros(()),
+                    qk_packed3_old,
                 )
                 groups = self.num_k_heads + self.num_q_heads
                 b, d, w = qk_packed3_old.shape
@@ -1820,6 +1823,12 @@ class CCA(MambaBase, CustomOp):
             self._patch_probe_value[:probe_rows].copy_(value[:probe_rows])
 
         qkv = torch.cat([query, key, value], dim=1)
+        if has_decode:
+            qkv[:num_decodes] = torch.where(
+                decode_is_pad.view(-1, 1),
+                qkv.new_zeros(()),
+                qkv[:num_decodes],
+            )
         output[:num_actual_tokens] = qkv
 
     @property
