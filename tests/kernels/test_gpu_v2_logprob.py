@@ -129,3 +129,53 @@ def test_compute_top1_logprobs_from_stats(dtype: torch.dtype) -> None:
     assert torch.equal(actual.logprob_token_ids, expected.logprob_token_ids)
     torch.testing.assert_close(actual.logprobs, expected.logprobs)
     assert torch.equal(actual.selected_token_ranks, expected.selected_token_ranks)
+
+
+def test_compute_top1_logprobs_from_stats_positive_infinity() -> None:
+    logits = torch.tensor(
+        [
+            [float("inf"), 1.0, 0.0],
+            [0.0, float("inf"), float("inf")],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    sampled_token_ids = torch.tensor([0, 1], device="cuda")
+    logsumexp = torch.logsumexp(logits, dim=-1)
+    top1_token_ids = logits.argmax(dim=-1)
+
+    expected = compute_top1_logprobs(logits, sampled_token_ids)
+    actual = compute_top1_logprobs_from_stats(
+        logits,
+        sampled_token_ids,
+        logsumexp,
+        top1_token_ids,
+    )
+
+    assert torch.equal(actual.logprob_token_ids, expected.logprob_token_ids)
+    assert torch.equal(actual.logprobs, expected.logprobs)
+    assert torch.equal(actual.selected_token_ranks, expected.selected_token_ranks)
+
+
+def test_compute_top1_logprobs_from_stats_undefined_rows_remain_nonfinite() -> None:
+    logits = torch.tensor(
+        [
+            [float("inf"), float("nan"), 0.0],
+            [float("-inf"), float("-inf"), float("-inf")],
+            [0.0, float("inf"), 1.0],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    sampled_token_ids = torch.tensor([0, 0, 0], device="cuda")
+    logsumexp = torch.logsumexp(logits, dim=-1)
+    top1_token_ids = logits.nan_to_num(nan=float("-inf")).argmax(dim=-1)
+
+    output = compute_top1_logprobs_from_stats(
+        logits,
+        sampled_token_ids,
+        logsumexp,
+        top1_token_ids,
+    )
+
+    assert not torch.isfinite(output.logprobs[:, 0]).any()
