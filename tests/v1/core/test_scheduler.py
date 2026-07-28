@@ -1016,6 +1016,53 @@ def test_v2_tidar_explicit_opt_out_retains_mixed_scheduling(
     ]
 
 
+def test_ar_opt_out_with_zero_minimum_still_admits_waiting_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(SpeculativeConfig, "use_tidar", lambda self: True)
+    monkeypatch.setenv("VLLM_TIDAR_DECODE_FIRST_REFILL", "0")
+    monkeypatch.setenv("VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING", "0")
+    monkeypatch.setenv("VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", "0")
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        num_speculative_tokens=3,
+    )
+    warm, waiting = _prepare_warm_spec_request_with_waiter(scheduler)
+
+    output = scheduler.schedule()
+
+    assert scheduler.tidar_decode_first_refill is False
+    assert warm.request_id in output.scheduled_spec_decode_tokens
+    assert waiting.request_id in output.num_scheduled_tokens
+    assert [req.req_id for req in output.scheduled_new_reqs] == [
+        waiting.request_id
+    ]
+
+
+def test_tidar_enabled_with_zero_minimum_still_blocks_waiting_admission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(envs, "VLLM_USE_V2_MODEL_RUNNER", True)
+    monkeypatch.setattr(SpeculativeConfig, "use_tidar", lambda self: True)
+    monkeypatch.setenv("VLLM_TIDAR_DECODE_FIRST_REFILL", "1")
+    monkeypatch.setenv("VLLM_TIDAR_DECODE_FIRST_REFILL_MIN_RUNNING", "0")
+    monkeypatch.setenv("VLLM_TIDAR_REQUIRE_PREFILL_VERIFY_SEGREGATION", "0")
+    monkeypatch.setenv("VLLM_TIDAR_PREFILL_WAVE_REFILL", "0")
+    scheduler = create_scheduler(
+        max_num_seqs=2,
+        num_speculative_tokens=3,
+    )
+    warm, waiting = _prepare_warm_spec_request_with_waiter(scheduler)
+
+    output = scheduler.schedule()
+
+    assert scheduler.tidar_decode_first_refill is True
+    assert warm.request_id not in output.scheduled_spec_decode_tokens
+    assert waiting.request_id not in output.num_scheduled_tokens
+    assert not output.scheduled_new_reqs
+
+
 def test_v2_tidar_pauses_verify_to_finish_running_prompt_chunk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

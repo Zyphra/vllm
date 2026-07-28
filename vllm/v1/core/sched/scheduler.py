@@ -708,7 +708,8 @@ class Scheduler(SchedulerInterface):
             else 0
         )
         skip_waiting_for_tidar_decode = (
-            tidar_decode_running_reqs
+            self.tidar_decode_first_refill
+            and tidar_decode_running_reqs
             >= self.tidar_decode_first_refill_min_running
         )
         if not preempted_reqs and not skip_waiting_for_tidar_decode:
