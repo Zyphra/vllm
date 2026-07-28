@@ -170,6 +170,13 @@ class AsyncLLM(EngineClient):
         # Pause / resume state for async RL workflows.
         self._pause_cond = asyncio.Condition()
         self._paused = False
+        # Terminal outputs live here from frontend publication until
+        # ``generate()`` finishes yielding them to its caller.  The sync receipt
+        # bridges that cleanup/consumption handoff without retaining old IDs.
+        self._sync_terminal_request_ids: set[str] = set()
+        self.output_processor.sync_terminal_request_ids = (
+            self._sync_terminal_request_ids
+        )
         self._client_count = client_count
 
         self.output_handler: asyncio.Task | None = None
@@ -593,7 +600,13 @@ class AsyncLLM(EngineClient):
                 assert isinstance(out, RequestOutput)
                 finished = out.finished
                 if out is not STREAM_FINISHED:
-                    yield out
+                    if finished:
+                        self._sync_terminal_request_ids.add(q.request_id)
+                    try:
+                        yield out
+                    finally:
+                        if finished:
+                            self._sync_terminal_request_ids.discard(q.request_id)
 
         # If the request is disconnected by the client, generate()
         # is cancelled or the generator is garbage collected. So,
@@ -642,6 +655,7 @@ class AsyncLLM(EngineClient):
             raise EngineGenerateError() from e
         finally:
             if q is not None:
+                self._sync_terminal_request_ids.discard(q.request_id)
                 q.close()
 
     def _run_output_handler(self):
@@ -754,11 +768,25 @@ class AsyncLLM(EngineClient):
         async with self._pause_cond:
             self._paused = True
         try:
-            return await self.engine_core.prepare_for_sync_async(
+            drain_states = await self.engine_core.prepare_for_sync_async(
                 timeout_s=timeout_s,
                 poll_interval_s=poll_interval_s,
                 reason=reason,
             )
+            # The EngineCore receipt identifies unfinished and just-finished
+            # scheduler requests.  These frontend receipts distinguish a
+            # request that passed admission from one still blocked by the
+            # pause, and bridge terminal delivery until the caller consumes it.
+            frontend_request_ids = sorted(self.output_processor.request_states)
+            frontend_terminal_request_ids = sorted(
+                self._sync_terminal_request_ids
+            )
+            for state in drain_states:
+                state["frontend_request_ids"] = frontend_request_ids
+                state["frontend_terminal_request_ids"] = (
+                    frontend_terminal_request_ids
+                )
+            return drain_states
         except BaseException:
             async with self._pause_cond:
                 await self.engine_core.resume_scheduler_async()

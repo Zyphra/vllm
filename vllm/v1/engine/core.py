@@ -379,6 +379,19 @@ class EngineCore:
             for request_id, request in self.scheduler.requests.items()
             if not request.is_finished()
         }
+        terminal_request_ids = {
+            str(request_id)
+            for request_id, request in self.scheduler.requests.items()
+            if request.is_finished()
+        }
+        # Requests whose blocks were freed are no longer in ``requests``, but
+        # remain in this per-step set until the next scheduling decision.  The
+        # sync pause is handled before another batch is scheduled, so including
+        # both sets closes the EngineCore-finish/frontend-delivery race.
+        terminal_request_ids.update(
+            str(request_id)
+            for request_id in getattr(self.scheduler, "finished_req_ids", ())
+        )
         try:
             scheduler_request_counts = list(self.scheduler.get_request_counts())
         except Exception:
@@ -401,6 +414,7 @@ class EngineCore:
             # cannot emit post-sync tokens and therefore must not receive a
             # new parameter-version span.
             "request_output_token_offsets": request_output_token_offsets,
+            "terminal_request_ids": sorted(terminal_request_ids),
             "batch_queue_size": batch_queue_size,
             "sync_drain_requested": paused,
             "sync_drain_quiesced": paused and batch_queue_size == 0,

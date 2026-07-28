@@ -426,6 +426,10 @@ class OutputProcessor:
         self.request_states: dict[str, RequestState] = {}
         self.parent_requests: dict[str, ParentRequest] = {}
         self.external_req_ids: defaultdict[str, list[str]] = defaultdict(list)
+        # AsyncLLM attaches its freeze-lifecycle set here.  Recording a
+        # terminal ID before publishing the RequestOutput closes the gap
+        # between frontend state removal and caller consumption.
+        self.sync_terminal_request_ids: set[str] | None = None
         self.lora_states = LoRARequestStates(log_stats)
         self.tracing_enabled: bool = False
         self._requests_drained = asyncio.Event()
@@ -501,6 +505,8 @@ class OutputProcessor:
                         kv_transfer_params=None,
                     )
                 ):
+                    if self.sync_terminal_request_ids is not None:
+                        self.sync_terminal_request_ids.add(request_id)
                     req_state.queue.put(request_output)
             elif parent := self.parent_requests.get(request_id):
                 # Abort children prior to removing the parent.
@@ -627,6 +633,12 @@ class OutputProcessor:
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
             routed_experts = engine_core_output.routed_experts
+            if (
+                finish_reason is not None
+                and not req_state.streaming_input
+                and self.sync_terminal_request_ids is not None
+            ):
+                self.sync_terminal_request_ids.add(req_id)
             req_state.num_cached_tokens = engine_core_output.num_cached_tokens
             req_state.is_prefilling = False
 
