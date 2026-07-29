@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 
+import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -40,6 +41,7 @@ def _make_lightweight_cca() -> CCA:
     nn.Module.__init__(cca)
     cca.num_k_heads = 1
     cca.num_q_heads = 1
+    cca.head_dim = 2
     cca.conv_qk = nn.Sequential(
         nn.Conv1d(
             4,
@@ -150,6 +152,98 @@ def test_default_path_remains_two_stage_fp32(monkeypatch) -> None:
     assert actual.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert cca._conv_qk_fp32_cache is not None
+
+
+def test_decode_megatron_parity_path_rounds_between_conv_stages(
+    monkeypatch,
+) -> None:
+    cca = _make_lightweight_cca()
+    x = torch.linspace(
+        -1.3,
+        1.7,
+        2 * 4 * 7,
+        dtype=torch.float32,
+    ).reshape(2, 4, 7)
+
+    monkeypatch.setattr(
+        cca_module,
+        "_CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED",
+        True,
+    )
+
+    actual = cca._conv_qk_decode(x)
+    expected = cca.conv_qk(x.to(cca.conv_qk[0].weight.dtype))
+
+    assert actual.dtype == torch.bfloat16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert not torch.equal(actual.float(), _fp32_two_stage_conv(cca, x))
+
+
+def test_decode_default_path_remains_manual_fp32(monkeypatch) -> None:
+    cca = _make_lightweight_cca()
+    x = torch.linspace(
+        -1.3,
+        1.7,
+        2 * 4 * 7,
+        dtype=torch.bfloat16,
+    ).reshape(2, 4, 7)
+
+    monkeypatch.setattr(
+        cca_module,
+        "_CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED",
+        False,
+    )
+
+    actual = cca._conv_qk_decode(x)
+    expected = _fp32_two_stage_conv(cca, x).to(x.dtype)
+
+    assert actual.dtype == x.dtype
+    torch.testing.assert_close(actual, expected, rtol=4e-3, atol=4e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="CUDA graph capture requires a CUDA device",
+)
+def test_decode_megatron_parity_path_cuda_graph_replay(monkeypatch) -> None:
+    cca = _make_lightweight_cca().cuda()
+    x = torch.linspace(
+        -1.3,
+        1.7,
+        2 * 4 * 7,
+        dtype=torch.float32,
+        device="cuda",
+    ).reshape(2, 4, 7)
+
+    monkeypatch.setattr(
+        cca_module,
+        "_CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED",
+        True,
+    )
+
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            cca._conv_qk_decode(x)
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = cca._conv_qk_decode(x)
+
+    replay_input = torch.linspace(
+        1.9,
+        -0.7,
+        x.numel(),
+        dtype=x.dtype,
+        device=x.device,
+    ).reshape_as(x)
+    x.copy_(replay_input)
+    graph.replay()
+
+    expected = cca.conv_qk(replay_input.to(cca.conv_qk[0].weight.dtype))
+    torch.testing.assert_close(graph_output, expected, rtol=0, atol=0)
 
 
 def test_batch_invariant_path_keeps_precedence(monkeypatch) -> None:

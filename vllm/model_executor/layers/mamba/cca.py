@@ -509,15 +509,17 @@ class CCA(MambaBase, CustomOp):
     def _conv_qk_decode(self, x: torch.Tensor) -> torch.Tensor:
         """Manual conv_qk for decode-sized inputs.
 
-        Runs in fp32 (same as _conv_qk_apply) to keep CCA acceptance
-        rates matching the eager Python-loop path. The Python-loop
-        path uses _conv_qk_apply (fp32), so this method must too —
-        bf16 here introduced ~37% mean-acceptance regression vs eager
-        on AIME25 thinking-off.
+        Runs in fp32 by default (same as _conv_qk_apply) to keep CCA
+        acceptance rates matching the eager Python-loop path. When
+        VLLM_CCA_MATCH_MEGATRON_CONV_DTYPE is enabled, use the module's
+        native dtype so both conv stages reproduce Megatron's rounding.
 
         Input:  [N, C, S]
         Output: [N, C, S_out]
         """
+        if _CCA_MATCH_MEGATRON_CONV_DTYPE_ENABLED:
+            return self.conv_qk(x.to(self.conv_qk[0].weight.dtype))
+
         orig_dtype = x.dtype
         # Stage 1: depthwise conv over sequence.
         w0 = self.conv_qk[0].weight.squeeze(1).to(torch.float32)  # [C, K0]
