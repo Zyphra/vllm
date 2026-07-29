@@ -173,7 +173,13 @@ class CudaGraphManager:
         sizes = set(self.cudagraph_sizes.values())
         tidar_verify_len = self._tidar_tokens_per_verify_req
         if tidar_verify_len is None:
-            return {CudaGraphKey(size) for size in sizes}
+            # Ordinary AR full graphs are decode-only: one token per request.
+            # Larger synthetic token counts create multi-token prefill rows,
+            # which are neither a valid AR replay geometry nor graph-safe for
+            # recurrent CCA's prompt-prefill state updates.
+            return {
+                CudaGraphKey(size) for size in sizes
+                if size <= self.max_num_reqs}
 
         keys = {
             CudaGraphKey(size)

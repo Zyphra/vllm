@@ -177,6 +177,19 @@ def test_tidar_capture_keys_distinguish_same_token_count() -> None:
     assert manager.get_padded_cudagraph_key(17, verify_key) == verify_key
 
 
+def test_ar_capture_keys_are_decode_only() -> None:
+    manager = _manager()
+    manager._tidar_tokens_per_verify_req = None
+    manager.max_num_reqs = 16
+    manager.cudagraph_sizes = {
+        1: 1,
+        16: 16,
+        32: 32,
+    }
+    assert manager._get_capture_keys() == {
+        CudaGraphKey(1), CudaGraphKey(16)}
+
+
 def test_tidar_dp_verify_full_graphs_stay_disabled() -> None:
     manager = _manager()
     manager.dp_size = 2
