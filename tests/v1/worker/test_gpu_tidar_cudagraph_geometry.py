@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import MethodType, SimpleNamespace
+
+import pytest
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backends.cca_attn import CCAAttentionMetadataBuilder
 from vllm.v1.worker.gpu import cudagraph_utils, dp_utils
 from vllm.v1.worker.gpu.cudagraph_utils import (
     CudaGraphBatchType,
@@ -24,6 +28,57 @@ def _manager() -> CudaGraphManager:
     }
     manager.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
     return manager
+
+
+def _cca_builder(*, tidar: bool) -> CCAAttentionMetadataBuilder:
+    builder = object.__new__(CCAAttentionMetadataBuilder)
+    spec = (
+        SimpleNamespace(use_tidar=lambda: True)
+        if tidar
+        else None
+    )
+    builder.vllm_config = SimpleNamespace(speculative_config=spec)
+    builder.build = MethodType(
+        lambda self, common_prefix_len, metadata: metadata,
+        builder,
+    )
+    return builder
+
+
+def test_ar_cca_full_capture_restores_decode_only_metadata() -> None:
+    builder = _cca_builder(tidar=False)
+    metadata = SimpleNamespace(
+        num_reqs=4,
+        num_actual_tokens=4,
+        max_query_len=4,
+    )
+
+    assert builder.build_for_cudagraph_capture(metadata) is metadata
+    assert metadata.max_query_len == 1
+
+
+def test_ar_cca_full_capture_rejects_non_decode_geometry() -> None:
+    builder = _cca_builder(tidar=False)
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=34,
+        max_query_len=17,
+    )
+
+    with pytest.raises(AssertionError, match="decode-only"):
+        builder.build_for_cudagraph_capture(metadata)
+
+
+def test_tidar_cca_full_capture_keeps_uniform_verify_geometry() -> None:
+    builder = _cca_builder(tidar=True)
+    metadata = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=34,
+        max_query_len=17,
+    )
+
+    assert builder.build_for_cudagraph_capture(metadata) is metadata
+    assert metadata.max_query_len == 17
 
 
 def test_tidar_single_verify_uses_geometry_specific_graph() -> None:

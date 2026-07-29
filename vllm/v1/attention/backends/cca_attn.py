@@ -102,7 +102,17 @@ class CCAAttentionMetadataBuilder(
         batch). We bypass the base assertion that requires num_reqs ==
         num_actual_tokens (= decode-only), instead allowing the case where
         num_actual_tokens is a uniform multiple of num_reqs.
+
+        Ordinary AR still uses the base Mamba decode-only contract. In
+        particular, the base builder pins ``max_query_len`` to one before
+        building metadata for a FULL graph. Only TiDAR needs to bypass that
+        invariant for its uniform K+1 verifier batches.
         """
+        spec = self.vllm_config.speculative_config
+        if spec is None or not getattr(spec, "use_tidar", lambda: False)():
+            return super().build_for_cudagraph_capture(
+                common_attn_metadata)
+
         m = common_attn_metadata
         # max_query_len computed from query_start_loc by the caller; do not
         # overwrite to 1 because that lies about the K+1 verify layout.
