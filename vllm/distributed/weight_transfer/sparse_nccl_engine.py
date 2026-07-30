@@ -35,6 +35,7 @@ from vllm.distributed.weight_transfer.nccl_common import (
     worker_init_process_group,
 )
 from vllm.distributed.weight_transfer.nccl_engine import NCCLTrainerSendWeightsArgs
+from vllm.model_executor.utils import run_post_weight_update
 
 __all__ = [
     "SparseWeightPatch",
@@ -194,6 +195,7 @@ class SparseNCCLWeightTransferEngine(
             patch.indices.to(device=flat_param.device, dtype=torch.long),
             patch.values.to(device=flat_param.device),
         )
+        run_post_weight_update(param)
 
     def shutdown(self) -> None:
         if self.model_update_group is not None:

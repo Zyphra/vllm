@@ -10,6 +10,17 @@ import torch
 from vllm.utils.torch_utils import is_torch_equal_or_newer
 
 
+def run_post_weight_update(weight: torch.Tensor) -> None:
+    callback = getattr(weight, "post_weight_update", None)
+    if callback is not None:
+        callback()
+
+
+def run_post_weight_updates(model: torch.nn.Module) -> None:
+    for weight in model.parameters():
+        run_post_weight_update(weight)
+
+
 def set_weight_attrs(
     weight: torch.Tensor,
     weight_attrs: dict[str, Any] | None,

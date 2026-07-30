@@ -2,14 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import gc
 import inspect
+from types import SimpleNamespace
 from weakref import WeakKeyDictionary, ref
 
 import pytest
 import torch
 from torch.nn.parameter import UninitializedParameter
 
+import vllm.model_executor.model_loader.base_loader as base_loader
 import vllm.model_executor.model_loader.reload.meta as reload_meta
+from vllm.config.load import LoadConfig
 from vllm.model_executor.layers.linear import QKVParallelLinear
+from vllm.model_executor.model_loader.base_loader import BaseModelLoader
 from vllm.model_executor.model_loader.reload.layerwise import (
     finalize_layerwise_reload,
     initialize_layerwise_reload,
@@ -30,6 +34,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
 )
 from vllm.platforms import current_platform
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 
 def _fp8_reload_unsupported() -> bool:
@@ -97,6 +102,67 @@ class _NonPersistentBufferLayer(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.ones(2, 2))
         self.register_buffer("scale", torch.tensor(0.25), persistent=False)
+
+
+class _InitialWeightLoader(BaseModelLoader):
+    def download_model(self, model_config):
+        pass
+
+    def load_weights(self, model, model_config):
+        model.weight.copy_(torch.tensor([[1.0, 2.0], [3.0, 4.0]]))
+        if model.bias is not None:
+            model.bias.copy_(torch.tensor([5.0, 6.0]))
+
+
+def _make_initial_model(*, bias=True, with_hook=True):
+    model = torch.nn.Linear(2, 2, bias=bias)
+    model.requires_grad_(False)
+    model.register_buffer(
+        "derived_weight",
+        torch.full((2, 2), -1.0),
+        persistent=False,
+    )
+    if with_hook:
+
+        def refresh():
+            bias_value = 0 if model.bias is None else model.bias[:, None]
+            model.derived_weight.copy_(model.weight + bias_value)
+
+        model.weight.post_weight_update = refresh
+    return model
+
+
+def _run_initial_load(monkeypatch, loader, model, process_weights=None):
+    monkeypatch.setattr(base_loader, "initialize_model", lambda **kwargs: model)
+    if process_weights is not None:
+        monkeypatch.setattr(
+            base_loader,
+            "process_weights_after_loading",
+            process_weights,
+        )
+    vllm_config = SimpleNamespace(
+        device_config=SimpleNamespace(device="cpu"),
+        load_config=loader.load_config,
+    )
+    model_config = SimpleNamespace(dtype=torch.float32, quantization=None)
+    return loader.load_model(vllm_config, model_config)
+
+
+def test_initial_load_runs_hook_after_processing(monkeypatch):
+    model = _make_initial_model(with_hook=True)
+
+    def process_weights(model, model_config, target_device):
+        model.weight.mul_(2.0)
+        model.bias.add_(1.0)
+
+    loader = _InitialWeightLoader(LoadConfig(load_format="auto"))
+    _run_initial_load(monkeypatch, loader, model, process_weights)
+
+    expected_weight = torch.tensor([[2.0, 4.0], [6.0, 8.0]])
+    expected_bias = torch.tensor([6.0, 7.0])
+    assert torch.equal(model.weight, expected_weight)
+    assert torch.equal(model.bias, expected_bias)
+    assert torch.equal(model.derived_weight, expected_weight + expected_bias[:, None])
 
 
 def test_move_metatensors():
@@ -310,6 +376,75 @@ def test_layerwise_reload_skips_non_persistent_parameter_alias_buffers(monkeypat
     )
     assert "weight_view" in layer._non_persistent_buffers_set
     assert "0.weight_view" not in model.state_dict()
+
+
+def test_layerwise_reload_runs_post_weight_update_after_final_weights():
+    layer = torch.nn.Linear(2, 2)
+    layer.register_buffer(
+        "derived_weight",
+        torch.full((2, 2), -1.0),
+        persistent=False,
+    )
+    derived_ptr = layer.derived_weight.data_ptr()
+    callback_weights = []
+
+    def refresh():
+        callback_weights.append((layer.weight.clone(), layer.bias.clone()))
+        layer.derived_weight.copy_(layer.weight + layer.bias[:, None])
+
+    layer.weight.post_weight_update = refresh
+    model = torch.nn.Sequential(layer)
+    loaded_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    loaded_bias = torch.tensor([5.0, 6.0])
+
+    record_metadata_for_reloading(model)
+    initialize_layerwise_reload(model)
+    layer.weight.weight_loader(layer.weight, loaded_weight)
+    layer.bias.weight_loader(layer.bias, loaded_bias)
+    finalize_layerwise_reload(model, model_config=None)
+
+    assert torch.equal(layer.weight, loaded_weight)
+    assert torch.equal(layer.bias, loaded_bias)
+    assert len(callback_weights) == 1
+    assert torch.equal(callback_weights[0][0], loaded_weight)
+    assert torch.equal(callback_weights[0][1], loaded_bias)
+    assert torch.equal(layer.derived_weight, loaded_weight + loaded_bias[:, None])
+    assert layer.derived_weight.data_ptr() == derived_ptr
+
+
+def _make_direct_reload_runner(model):
+    runner = object.__new__(GPUModelRunner)
+    runner.model = model
+    runner.model_config = SimpleNamespace(quantization=None)
+    runner.reset_encoder_cache = lambda: None
+    runner.reset_mm_cache = lambda: None
+    return runner
+
+
+def test_direct_reload_runs_post_weight_update_in_place():
+    model = torch.nn.Linear(2, 2, bias=False)
+    model.weight.requires_grad_(False)
+    model.register_buffer(
+        "derived_weight",
+        torch.full((2, 2), -1.0),
+        persistent=False,
+    )
+    derived_ptr = model.derived_weight.data_ptr()
+
+    def refresh():
+        model.derived_weight.copy_(model.weight.square())
+
+    model.weight.post_weight_update = refresh
+    loaded_weight = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+
+    _make_direct_reload_runner(model).reload_weights(
+        iter([("weight", loaded_weight)]),
+        is_checkpoint_format=False,
+    )
+
+    assert torch.equal(model.weight, loaded_weight)
+    assert torch.equal(model.derived_weight, loaded_weight.square())
+    assert model.derived_weight.data_ptr() == derived_ptr
 
 
 def test_capture_layer_to_meta_skips_uninitialized_parameter_storage_ptrs():

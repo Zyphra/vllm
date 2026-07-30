@@ -336,6 +336,33 @@ class TestSparseNCCLPatchApplication:
         expected[3] = 7.0
         assert torch.equal(model.w.data, expected)
 
+    def test_apply_patch_runs_post_weight_update_in_place(self):
+        model = self._make_model(8)
+        model.register_buffer(
+            "derived_w",
+            torch.full_like(model.w, -1.0),
+            persistent=False,
+        )
+        derived_ptr = model.derived_w.data_ptr()
+
+        def refresh():
+            model.derived_w.copy_(model.w.square())
+
+        model.w.post_weight_update = refresh
+        self._make_engine(model)._apply_patch(
+            SparseWeightPatch(
+                name="w",
+                indices=torch.tensor([1, 3], dtype=torch.int32),
+                values=torch.tensor([5.0, 7.0], dtype=torch.float32),
+            )
+        )
+
+        expected = torch.zeros(8)
+        expected[1] = 25.0
+        expected[3] = 49.0
+        assert torch.equal(model.derived_w, expected)
+        assert model.derived_w.data_ptr() == derived_ptr
+
     def test_apply_patch_rejects_mismatched_lengths(self):
         model = self._make_model(8)
         engine = self._make_engine(model)

@@ -98,6 +98,7 @@ from vllm.model_executor.offloader import (
     get_offloader,
     set_offloader,
 )
+from vllm.model_executor.utils import run_post_weight_update
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.encoder_budget import MultiModalBudget
 from vllm.multimodal.inputs import (
@@ -5539,6 +5540,7 @@ class GPUModelRunner(
             for name, loaded_weight in weights_iterator:
                 param = model.get_parameter(name)  # TODO: buffers?
                 param.copy_(loaded_weight)
+                run_post_weight_update(param)
                 loaded_weights.add(name)
 
         # logging and validation
