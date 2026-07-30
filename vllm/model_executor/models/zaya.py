@@ -93,10 +93,7 @@ def _rope_parameters_for_layer(config: ZayaConfig, layer_idx: int) -> dict:
     rope_parameters = getattr(config, "rope_parameters", None)
     if isinstance(rope_parameters, dict):
         params = rope_parameters.get(layer_type, rope_parameters)
-        if isinstance(params, dict):
-            params = dict(params)
-        else:
-            params = {}
+        params = dict(params) if isinstance(params, dict) else {}
     else:
         params = {}
     params.setdefault("rope_type", "default")
@@ -124,6 +121,16 @@ class ZayaAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.scale = self.head_dim**-0.5
+        layer_type = config.layer_types[layer_idx]
+        sliding_window = (
+            config.sliding_window if layer_type == "hybrid_sliding" else None
+        )
+        rotary_emb = get_rope(
+            head_size=self.head_dim,
+            max_position=config.max_position_embeddings,
+            is_neox_style=True,
+            rope_parameters=_rope_parameters_for_layer(config, layer_idx),
+        )
 
         self.qkv_proj = CCA(
             config=config,
@@ -137,8 +144,12 @@ class ZayaAttention(nn.Module):
             model_config=model_config,
             cache_config=cache_config,
             quant_config=quant_config,
+            rotary_emb=rotary_emb,
             prefix=f"{prefix}.qkv_proj",
         )
+        self._cca_returns_rotated_qk = self.qkv_proj.returns_rotated_qk
+        if not self._cca_returns_rotated_qk:
+            self.rotary_emb = rotary_emb
         self.o_proj = ReplicatedLinear(
             self.num_attention_heads * self.head_dim,
             self.hidden_size,
@@ -148,10 +159,6 @@ class ZayaAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        layer_type = config.layer_types[layer_idx]
-        sliding_window = (
-            config.sliding_window if layer_type == "hybrid_sliding" else None
-        )
         self.attn = Attention(
             self.num_attention_heads,
             self.head_dim,
@@ -160,12 +167,6 @@ class ZayaAttention(nn.Module):
             per_layer_sliding_window=sliding_window,
             cache_config=cache_config,
             prefix=f"{prefix}.attn",
-        )
-        self.rotary_emb = get_rope(
-            head_size=self.head_dim,
-            max_position=config.max_position_embeddings,
-            is_neox_style=True,
-            rope_parameters=_rope_parameters_for_layer(config, layer_idx),
         )
 
         self.q_dim = self.num_attention_heads * self.head_dim
@@ -183,9 +184,10 @@ class ZayaAttention(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        self.qkv_proj(hidden_states, output_qkv)
+        self.qkv_proj(hidden_states, output_qkv, position_ids)
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
-        q, k = self.rotary_emb(position_ids, q, k)
+        if not self._cca_returns_rotated_qk:
+            q, k = self.rotary_emb(position_ids, q, k)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
 
