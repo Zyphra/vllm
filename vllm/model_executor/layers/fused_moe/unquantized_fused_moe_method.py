@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 import vllm.envs as envs
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.fused_moe.config import (
@@ -39,6 +40,21 @@ if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
 logger = init_logger(__name__)
+
+
+def _shuffle_aiter_weights_in_place(*weights: torch.Tensor) -> None:
+    """Shuffle RL weight updates one expert at a time.
+
+    AITER's layout transform is independent across the leading expert
+    dimension.  Updating each expert separately bounds temporary storage to
+    one expert while preserving the parameter addresses captured by graphs.
+    """
+    with torch.no_grad():
+        for weight in weights:
+            for expert_weight in weight:
+                shuffled = rocm_aiter_ops.shuffle_weight(expert_weight)
+                expert_weight.copy_(shuffled)
+                del shuffled
 
 
 # --8<-- [start:unquantized_fused_moe]
@@ -158,13 +174,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13: torch.Tensor,
         w2: torch.Tensor,
     ) -> None:
-        # Shuffle weights to runtime format.
-        w13_new, w2_new = convert_to_unquantized_kernel_format(
-            self.unquantized_backend,
-            moe_config=layer.moe_config,
-            w13_weight=w13,
-            w2_weight=w2,
-        )
         # `moe_kernel` is initialized to None in FusedMoEMethodBase.__init__;
         # On the first call we replace the parameter normally. On subsequent
         # calls (e.g. RL weight updates that re-trigger
@@ -173,6 +182,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # we copy the shuffled data into the existing storage instead of
         # re-registering a new Parameter.
         is_weight_update = self.moe_kernel is not None  # type: ignore[has-type]
+        if is_weight_update and self.unquantized_backend == UnquantizedMoeBackend.AITER:
+            _shuffle_aiter_weights_in_place(w13, w2)
+            w13_new, w2_new = w13, w2
+        else:
+            # Initial model loading can use the faster full-tensor transform.
+            w13_new, w2_new = convert_to_unquantized_kernel_format(
+                self.unquantized_backend,
+                moe_config=layer.moe_config,
+                w13_weight=w13,
+                w2_weight=w2,
+            )
         replace_parameter(layer, "w13_weight", w13_new, prefer_copy=is_weight_update)
         replace_parameter(layer, "w2_weight", w2_new, prefer_copy=is_weight_update)
 
