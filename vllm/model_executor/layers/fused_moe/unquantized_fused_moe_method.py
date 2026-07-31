@@ -154,6 +154,12 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             set_weight_attrs(w2_bias, extra_weight_attrs)
 
     def _maybe_pad_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        # AITER immediately materializes a contiguous shuffled tensor, so this
+        # padding would be discarded. Repeating the full-tensor allocation
+        # after an RL weight update also exhausts graph-capture headroom.
+        if self.unquantized_backend == UnquantizedMoeBackend.AITER:
+            return weight
+
         # Pad the weight tensor. This is an optimization on ROCm platform, which
         # can benefit from tensors located far enough from one another in memory
         if (

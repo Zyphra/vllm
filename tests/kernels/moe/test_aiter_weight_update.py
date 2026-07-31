@@ -2,7 +2,11 @@ from unittest.mock import patch
 
 import torch
 
+from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
+    UnquantizedMoeBackend,
+)
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+    UnquantizedFusedMoEMethod,
     _shuffle_aiter_weights_in_place,
 )
 
@@ -31,3 +35,13 @@ def test_aiter_weight_update_shuffles_per_expert_in_place() -> None:
     assert torch.equal(w13, original_w13.flip(-1))
     assert torch.equal(w2, original_w2.flip(-1))
     assert shapes == [(4, 8)] * 3 + [(8, 4)] * 3
+
+
+def test_aiter_skips_padding_discarded_by_shuffle() -> None:
+    method = object.__new__(UnquantizedFusedMoEMethod)
+    method.unquantized_backend = UnquantizedMoeBackend.AITER
+    weight = torch.zeros(2, 16, 32)
+
+    with patch("torch.nn.functional.pad") as pad:
+        assert method._maybe_pad_weight(weight) is weight
+    pad.assert_not_called()
