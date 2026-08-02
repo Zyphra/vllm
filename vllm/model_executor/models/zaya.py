@@ -633,17 +633,20 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
                 param_name = f"{fused_moe_prefix}.routed_experts.w13_weight"
                 param = params_dict[param_name]
+                weight_loader = getattr(
+                    param, "weight_loader", fused_moe_module.weight_loader
+                )
                 gate_weight, up_weight = loaded_weight.chunk(2, dim=1)
                 for expert_id, (gate_expert, up_expert) in enumerate(
                         zip(gate_weight, up_weight)):
-                    fused_moe_module.weight_loader(
+                    weight_loader(
                         param,
                         gate_expert,
                         param_name,
                         "w1",
                         expert_id,
                     )
-                    fused_moe_module.weight_loader(
+                    weight_loader(
                         param,
                         up_expert,
                         param_name,
@@ -662,8 +665,11 @@ class ZayaForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
                 param_name = f"{fused_moe_prefix}.routed_experts.w2_weight"
                 param = params_dict[param_name]
+                weight_loader = getattr(
+                    param, "weight_loader", fused_moe_module.weight_loader
+                )
                 for expert_id, down_expert in enumerate(loaded_weight):
-                    fused_moe_module.weight_loader(
+                    weight_loader(
                         param,
                         down_expert,
                         param_name,
