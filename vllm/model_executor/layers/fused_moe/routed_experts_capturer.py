@@ -18,6 +18,47 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
 
+_CAPTURE_BUFFER: torch.Tensor | None = None
+
+
+def set_capture_buffer(device_buffer: torch.Tensor) -> None:
+    """Publish the graph-stable output buffer before model tracing."""
+    global _CAPTURE_BUFFER
+    _CAPTURE_BUFFER = device_buffer
+
+
+def get_capture_buffer() -> torch.Tensor:
+    if _CAPTURE_BUFFER is None:
+        raise RuntimeError("Routed-expert capture buffer is not bound")
+    return _CAPTURE_BUFFER
+
+
+@torch.library.custom_op("vllm::routed_experts_write", mutates_args=("device_buffer",))
+def _routed_experts_write(
+    device_buffer: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layer_id: int,
+) -> None:
+    device_buffer[: topk_ids.shape[0], layer_id, :].copy_(topk_ids)
+
+
+@_routed_experts_write.register_fake
+def _routed_experts_write_fake(
+    device_buffer: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layer_id: int,
+) -> None:
+    return None
+
+
+def write_routed_experts(
+    device_buffer: torch.Tensor,
+    topk_ids: torch.Tensor,
+    layer_id: int,
+) -> None:
+    """Publish router-native IDs through compiled and captured forwards."""
+    torch.ops.vllm.routed_experts_write(device_buffer, topk_ids, layer_id)
+
 
 def _get_num_experts_per_tok(hf_config) -> int:
     """Resolve the per-token expert count from the HF config.

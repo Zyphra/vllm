@@ -5422,6 +5422,16 @@ class GPUModelRunner(
 
         get_offloader().post_init()
 
+        if self.model_config.enable_return_routed_experts:
+            # Bind the device output before the profiling forward can compile
+            # the model with capture disabled. Host and slot storage still
+            # initialize later, once KV-cache geometry is available.
+            self.routed_experts_capturer = RoutedExpertsCapturer(
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                vllm_config=self.vllm_config,
+            )
+            self._bind_routed_experts_capturer(self.routed_experts_capturer)
+
     def _setup_eagle3_aux_hidden_state_outputs(self) -> None:
         if not self.use_aux_hidden_state_outputs:
             return
@@ -7639,12 +7649,13 @@ class GPUModelRunner(
             "Initializing routed experts capturer, enable_return_routed_experts: %s",
             self.model_config.enable_return_routed_experts,
         )
-        self.routed_experts_capturer = RoutedExpertsCapturer(
-            max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
-            vllm_config=self.vllm_config,
-        )
+        if not hasattr(self, "routed_experts_capturer"):
+            self.routed_experts_capturer = RoutedExpertsCapturer(
+                max_num_batched_tokens=self.scheduler_config.max_num_batched_tokens,
+                vllm_config=self.vllm_config,
+            )
+            self._bind_routed_experts_capturer(self.routed_experts_capturer)
         self.routed_experts_attn_gid = self._get_attention_kv_cache_gid()
-        self._bind_routed_experts_capturer(self.routed_experts_capturer)
 
         # Pinned CPU buffer for non-blocking D2H of ``routing_data`` on
         # the sync scheduling path. Shape / dtype mirror the device
@@ -7681,6 +7692,22 @@ class GPUModelRunner(
         from vllm.model_executor.layers.fused_moe.router.base_router import (
             BaseRouter,
         )
+        from vllm.model_executor.models.zaya import ZayaRouter
+
+        # Zaya remaps its learned skip expert to zero before MoE dispatch.
+        # Capture at the model router so replay retains the native skip ID.
+        zaya_routers = [
+            module for module in self.model.modules() if isinstance(module, ZayaRouter)
+        ]
+        if zaya_routers:
+            from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+                set_capture_buffer,
+            )
+
+            set_capture_buffer(capturer.get_device_buffer())
+            for module in zaya_routers:
+                module._capture_routed_experts = True
+            return
 
         for module in self.model.modules():
             if isinstance(module, MoERunner) and isinstance(module.router, BaseRouter):

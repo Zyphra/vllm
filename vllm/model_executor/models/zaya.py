@@ -16,6 +16,10 @@ from vllm.distributed import (
 )
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoE, RoutedExperts
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    get_capture_buffer,
+    write_routed_experts,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -247,6 +251,10 @@ class ZayaRouter(nn.Module):
         self.num_experts = config.num_experts + 1
         self.topk = config.num_experts_per_tok
         self.router_hidden_size = config.router_hidden_size
+        # R3 must preserve the router-native choice, including Zaya's
+        # non-dispatched skip expert. GPUModelRunner binds this only when
+        # routed-expert output is requested.
+        self._capture_routed_experts = False
 
         self.down_proj = ReplicatedLinear(
             self.hidden_size,
@@ -290,6 +298,13 @@ class ZayaRouter(nn.Module):
             router_probs.detach().to(torch.float32) + self.balancing_biases)
         _, router_indices = torch.topk(biased_router_probs, self.topk, dim=-1)
         router_probs = torch.gather(router_probs, dim=1, index=router_indices)
+
+        if self._capture_routed_experts:
+            write_routed_experts(
+                get_capture_buffer(),
+                router_indices,
+                self.layer_idx,
+            )
 
         skip_expert = router_indices == self.config.num_experts
         router_probs = router_probs.masked_fill(skip_expert, 0)

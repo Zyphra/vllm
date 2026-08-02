@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch import nn
 
 from vllm.distributed.eplb.eplb_state import EplbLayerState
 from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
@@ -151,6 +152,37 @@ def test_gpu_model_runner_binds_router_capture(monkeypatch):
     layer_id, topk_ids = capturer.calls[0]
     assert layer_id == 7
     assert torch.equal(topk_ids, torch.tensor([[5, 6]]))
+
+
+def test_zaya_router_capture_preserves_skip_expert():
+    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+        set_capture_buffer,
+    )
+    from vllm.model_executor.models.zaya import ZayaRouter
+
+    class FixedLogits(nn.Module):
+        def forward(self, hidden_states):
+            return torch.tensor([[0.0, 1.0, 9.0], [9.0, 1.0, 0.0]], dtype=torch.float32)
+
+    router = ZayaRouter.__new__(ZayaRouter)
+    nn.Module.__init__(router)
+    router.config = SimpleNamespace(num_experts=2)
+    router.layer_idx = 1
+    router.topk = 1
+    router.use_eda = False
+    router.down_proj = nn.Identity()
+    router.router_mlp = FixedLogits()
+    router.register_buffer("balancing_biases", torch.zeros(3))
+    capture_buffer = torch.full((2, 2, 1), -1, dtype=torch.int32)
+    set_capture_buffer(capture_buffer)
+    router._capture_routed_experts = True
+
+    probs, dispatch_ids, _ = router(torch.zeros(2, 3))
+
+    # Skip ID 2 is dispatch-safe expert 0 with zero weight; R3 retains ID 2.
+    assert dispatch_ids.tolist() == [[0], [0]]
+    assert probs[0].item() == 0.0
+    assert capture_buffer[:, 1, :].tolist() == [[2], [0]]
 
 
 def test_gpu_model_runner_binding_stage(monkeypatch):
