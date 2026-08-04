@@ -232,17 +232,31 @@ class RoutedExperts(PluggableLayer):
         # Update local attributes from ExpertMapManager
         self.local_num_experts = self.expert_map_manager.local_num_experts
         self.expert_placement_strategy = self.expert_map_manager.placement_strategy
-        self.register_buffer("_expert_map", self.expert_map_manager.expert_map)
-        self.register_buffer("expert_mask", self.expert_map_manager.expert_mask)
+        # Expert placement is derived from the live parallel topology, not the
+        # checkpoint. Keep these as buffers for device movement and graph use,
+        # but exclude them from state_dict so dummy checkpoint initialization
+        # cannot overwrite the maps with zeros on ROCm.
+        self.register_buffer(
+            "_expert_map", self.expert_map_manager.expert_map, persistent=False
+        )
+        self.register_buffer(
+            "expert_mask", self.expert_map_manager.expert_mask, persistent=False
+        )
 
         # Get routing tables from ExpertMapManager
         routing_tables = self.expert_map_manager.routing_tables
         if routing_tables is not None:
             # Register routing tables as buffers for this layer
             global_to_physical, physical_to_global, local_global = routing_tables
-            self.register_buffer("expert_global_to_physical", global_to_physical)
-            self.register_buffer("expert_physical_to_global", physical_to_global)
-            self.register_buffer("expert_local_to_global", local_global)
+            self.register_buffer(
+                "expert_global_to_physical", global_to_physical, persistent=False
+            )
+            self.register_buffer(
+                "expert_physical_to_global", physical_to_global, persistent=False
+            )
+            self.register_buffer(
+                "expert_local_to_global", local_global, persistent=False
+            )
 
     def _expert_routing_tables(
         self,
