@@ -694,11 +694,16 @@ class CCA(MambaBase, CustomOp):
                 for i in range(len(query_start_loc_p) - 1):
                     start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
                     delayed_v_state_cur = delayed_v_state_p[start_i:end_i]
+                    state_idx = int(state_indices_tensor_p[i])
+                    use_initial_state = (
+                        bool(has_initial_states_p[i])
+                        and 0 <= state_idx < recurrent_states.shape[0]
+                    )
 
-                    if has_initial_states_p[i]:
-                        value_delayed_cached = recurrent_states[
-                            state_indices_tensor_p[i]
-                        ].unsqueeze(0).unsqueeze(0)
+                    if use_initial_state:
+                        value_delayed_cached = recurrent_states[state_idx].unsqueeze(
+                            0
+                        ).unsqueeze(0)
                         if value_delayed_cached.dtype != value_delayed.dtype:
                             value_delayed_cached = value_delayed_cached.to(
                                 value_delayed.dtype
@@ -715,10 +720,8 @@ class CCA(MambaBase, CustomOp):
                     qk_packed1_cur = qk_packed0_p[
                         start_i:end_i
                     ].permute(1, 2, 0)
-                    if has_initial_states_p[i]:
-                        qk_packed0_cached = conv_states[
-                            state_indices_tensor_p[i]
-                        ].unsqueeze(0)
+                    if use_initial_state:
+                        qk_packed0_cached = conv_states[state_idx].unsqueeze(0)
                         if qk_packed0_cached.dtype != qk_packed1_cur.dtype:
                             qk_packed0_cached = qk_packed0_cached.to(
                                 qk_packed1_cur.dtype
@@ -734,27 +737,39 @@ class CCA(MambaBase, CustomOp):
                         qk_packed2_cur,
                         (self.total_padding - qk_packed2_cur.shape[-1], 0),
                     )
-                    conv_states[state_indices_tensor_p[i]] = conv_states_cur.to(
-                        device=conv_states.device, dtype=conv_states.dtype
-                    )
+                    if 0 <= state_idx < conv_states.shape[0]:
+                        conv_states[state_idx] = conv_states_cur.to(
+                            device=conv_states.device, dtype=conv_states.dtype
+                        )
                     qk_packed3_cur = self.conv_qk_grouped(
                         self.conv_qk_depthwise(qk_packed2_cur)
                     ).permute(2, 0, 1)
                     qk_prefill[start_i:end_i] = qk_packed3_cur
 
-                recurrent_states[state_indices_tensor_p] = delayed_v_state_p[
+                recurrent_state_values = delayed_v_state_p[
                     query_start_loc_p[1:] - 1, 0, :
                 ].to(
                     device=recurrent_states.device,
                     dtype=recurrent_states.dtype,
                 )
+                valid_prefill_indices = (
+                    (state_indices_tensor_p >= 0)
+                    & (state_indices_tensor_p < recurrent_states.shape[0])
+                )
+                recurrent_states[
+                    state_indices_tensor_p[valid_prefill_indices]
+                ] = recurrent_state_values[valid_prefill_indices]
 
         used_zk_decode = False
         decode_roped = False
         qk_decode: torch.Tensor | None = None
         if has_decode:
             assert state_indices_tensor_d is not None
-            decode_is_pad = state_indices_tensor_d == PAD_SLOT_ID
+            decode_is_pad = (
+                (state_indices_tensor_d == PAD_SLOT_ID)
+                | (state_indices_tensor_d < 0)
+                | (state_indices_tensor_d >= recurrent_states.shape[0])
+            )
             safe_decode_indices = torch.where(
                 decode_is_pad,
                 torch.zeros_like(state_indices_tensor_d),
