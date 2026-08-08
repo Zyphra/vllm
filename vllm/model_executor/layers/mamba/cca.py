@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from functools import cache
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm import envs
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import ForwardContext, get_forward_context
@@ -32,20 +31,63 @@ from vllm.v1.attention.backends.cca_attn import CCAAttentionMetadata
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 logger = init_logger(__name__)
-@cache
-def _get_zk_cca_ops():
+
+_USE_ZK_CCA = os.environ.get("VLLM_USE_ZK_CCA", "0").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_ZK_CCA_PREFILL_IMPORTED = False
+_ZK_CCA_DECODE_IMPORTED = False
+
+
+class _ZkFallback(Exception):
+    pass
+
+
+def _zk_cca_prefill_available() -> bool:
+    return False
+
+
+def _zk_cca_decode_available() -> bool:
+    return False
+
+
+if _USE_ZK_CCA:
     try:
         from zyphra_kernels.cca import (
-            cca_decode_fused_rope_auto,
-            cca_prefill_norm_fused,
-            cca_prefill_norm_fused_available,
+            cca_prefill_norm_fused as _zk_cca_prefill,
         )
-        from zyphra_kernels.cca.ops import cca_decode_rope_available
-    except ImportError as exc:
-        raise RuntimeError("Zyphra CCA kernels were requested but unavailable") from exc
-    if not cca_decode_rope_available() or not cca_prefill_norm_fused_available():
-        raise RuntimeError("Zyphra CCA kernels were requested but unavailable")
-    return cca_decode_fused_rope_auto, cca_prefill_norm_fused
+        from zyphra_kernels.cca import (
+            cca_prefill_norm_fused_available as _zk_cca_prefill_available,
+        )
+
+        _ZK_CCA_PREFILL_IMPORTED = True
+        logger.info("zyphra_kernels CCA prefill imported")
+    except Exception:
+        logger.exception(
+            "VLLM_USE_ZK_CCA is enabled, but zyphra_kernels CCA prefill "
+            "could not be imported; falling back to the default implementation"
+        )
+
+    try:
+        from zyphra_kernels.cca import (
+            ZkFallback as _ZkFallback,
+        )
+        from zyphra_kernels.cca import (
+            cca_decode_fused_rope_auto as _zk_cca_decode,
+        )
+        from zyphra_kernels.cca.ops import (
+            cca_decode_rope_available as _zk_cca_decode_available,
+        )
+
+        _ZK_CCA_DECODE_IMPORTED = True
+        logger.info("zyphra_kernels CCA decode imported")
+    except Exception:
+        logger.exception(
+            "VLLM_USE_ZK_CCA is enabled, but zyphra_kernels CCA decode "
+            "could not be imported; decode will use the default implementation"
+        )
 
 
 @CustomOp.register("cca")
@@ -53,6 +95,7 @@ class CCA(MambaBase, CustomOp):
     def __init__(
         self,
         config,
+        rotary_emb: nn.Module,
         cca_num_k_heads: int = 2,
         cca_num_q_heads: int = 8,
         hidden_size: int | None = None,
@@ -63,7 +106,6 @@ class CCA(MambaBase, CustomOp):
         model_config: ModelConfig | None = None,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
-        rotary_emb: nn.Module | None = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -72,6 +114,7 @@ class CCA(MambaBase, CustomOp):
         self.cache_config = cache_config
         self.layer_number = layer_number
         self.prefix = prefix
+        self.rotary_emb = rotary_emb
 
         # Use the model's true hidden size unless explicitly overridden.
         # (In Megatron this is the lane's hidden_size_in.)
@@ -99,27 +142,6 @@ class CCA(MambaBase, CustomOp):
         assert (self.latent_k_dim + self.latent_q_dim) == (
             self.num_k_heads + self.num_q_heads
         ) * self.head_dim
-        self._zk_cca_decode_enabled = envs.VLLM_CCA_ZK_DECODE
-        if self._zk_cca_decode_enabled:
-            if (
-                self.num_q_heads not in (8, 16)
-                or self.num_k_heads != 2
-                or self.head_dim != 128
-                or self.gqa_groups not in (4, 8)
-                or self.cca_time0 != 2
-                or self.cca_time1 != 2
-            ):
-                raise RuntimeError(
-                    "Zyphra CCA decode requires packed Q8/K2 or Q16/K2 "
-                    "D128 with K0=K1=2"
-                )
-            if rotary_emb is None:
-                raise RuntimeError(
-                    "Zyphra CCA decode requires a per-layer RoPE module"
-                )
-            self.rotary_emb = rotary_emb
-            _get_zk_cca_ops()
-
         # Projections
         self.q_proj = ReplicatedLinear(
             self.hidden_size,
@@ -173,7 +195,9 @@ class CCA(MambaBase, CustomOp):
             padding=0,
             stride=1,
         )
-        if self._zk_cca_decode_enabled:
+        if _USE_ZK_CCA and (
+            _ZK_CCA_PREFILL_IMPORTED or _ZK_CCA_DECODE_IMPORTED
+        ):
             # The decode ABI consumes this transposed, contiguous layout.
             grouped_weight = self.conv_qk_grouped.weight
             self.register_buffer(
@@ -189,6 +213,8 @@ class CCA(MambaBase, CustomOp):
                 grouped_weight,
                 {"post_weight_update": self._refresh_zk_grouped_weight},
             )
+        else:
+            self._zk_grouped_weight = None
 
         # Per-k head temperature (Megatron: shape [num_k_heads])
         self.temp = nn.Parameter(torch.zeros(self.num_k_heads, dtype=torch.float32))
@@ -201,6 +227,7 @@ class CCA(MambaBase, CustomOp):
 
     @torch.no_grad()
     def _refresh_zk_grouped_weight(self) -> None:
+        assert self._zk_grouped_weight is not None
         groups = self.num_q_heads + self.num_k_heads
         source = self.conv_qk_grouped.weight.view(
             groups, self.head_dim, self.head_dim, self.cca_time1
@@ -240,10 +267,6 @@ class CCA(MambaBase, CustomOp):
         position_ids: torch.Tensor,
     ):
         self._forward_no_cache(hidden_states, output, position_ids)
-
-    @property
-    def returns_rotated_qk(self) -> bool:
-        return self._zk_cca_decode_enabled
 
     def forward(
         self,
@@ -309,9 +332,8 @@ class CCA(MambaBase, CustomOp):
                                                        self.latent_k_dim)
         output[:num_tokens, k_end:] = value.reshape(num_tokens,
                                                     self.latent_k_dim)
-        if self._zk_cca_decode_enabled:
-            assert position_ids is not None
-            self._apply_rope_to_output(position_ids, output, num_tokens)
+        assert position_ids is not None
+        self._apply_rope_to_output(position_ids, output, num_tokens)
 
     def _rms_normalize_qk(
         self, query: torch.Tensor, key: torch.Tensor
@@ -360,6 +382,36 @@ class CCA(MambaBase, CustomOp):
         key.add_(key_base_fp32, alpha=0.5)
         return query, key
 
+    def _finalize_qk(
+        self,
+        qk_convolved: torch.Tensor,
+        qk_projected: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = qk_projected.shape[0]
+        query_pre = qk_projected[..., : self.latent_q_dim].view(
+            num_tokens, 1, self.num_q_heads, self.head_dim
+        )
+        key_base = qk_projected[..., self.latent_q_dim :].view(
+            num_tokens, 1, self.num_k_heads, self.head_dim
+        )
+        qk_convolved = qk_convolved.view(num_tokens, 1, self.in_out_ch)
+        query = qk_convolved[..., : self.latent_q_dim].view(
+            num_tokens, 1, self.num_q_heads, self.head_dim
+        )
+        key = qk_convolved[..., self.latent_q_dim :].view(
+            num_tokens, 1, self.num_k_heads, self.head_dim
+        )
+        query, key = self._add_grouped_qk_means_inplace(
+            query.float(), key.float(), query_pre, key_base
+        )
+        query, key = self._rms_normalize_qk(
+            query.contiguous(), key.contiguous()
+        )
+        return (
+            query.reshape(num_tokens, self.latent_q_dim),
+            key.reshape(num_tokens, self.latent_k_dim),
+        )
+
     def _conv_qk_decode(self, x: torch.Tensor) -> torch.Tensor:
         """Manual conv_qk for decode-sized inputs.
 
@@ -399,21 +451,18 @@ class CCA(MambaBase, CustomOp):
     def _forward_zk_decode(
         self,
         qk_packed0: torch.Tensor,
-        value_current: torch.Tensor,
-        delayed_v_state: torch.Tensor,
-        output: torch.Tensor,
         position_ids: torch.Tensor,
         conv_states: torch.Tensor,
-        recurrent_states: torch.Tensor,
         state_indices: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         num_tokens = qk_packed0.shape[0]
-        qk_output = output[:num_tokens, : self.in_out_ch]
         positions = position_ids.reshape(-1)[:num_tokens]
-        rope_cache = self._get_zk_rope_cache(qk_packed0)
+        first_input = qk_packed0[:, 0, :].unsqueeze(-1).contiguous()
+        rope_cache = self._get_zk_rope_cache(first_input)
         grouped_bias = self.conv_qk_grouped.bias
-        _get_zk_cca_ops()[0](
-            qk_packed0[:, 0, :],
+        assert self._zk_grouped_weight is not None
+        fused_output = _zk_cca_decode(
+            first_input,
             self.conv_qk_depthwise.weight.squeeze(1),
             self.conv_qk_depthwise.bias,
             conv_states,
@@ -426,7 +475,7 @@ class CCA(MambaBase, CustomOp):
             ),
             self.temp,
             rope_cache,
-            positions,
+            positions.long(),
             int(self.rotary_emb.rotary_dim),
             self.num_q_heads,
             self.head_dim,
@@ -434,42 +483,9 @@ class CCA(MambaBase, CustomOp):
             PAD_SLOT_ID,
             float(self.sqrt_head_dim),
             self.config.clamp_temp,
-            out=qk_output,
         )
         logger.info_once("Using Zyphra fused CCA decode and RoPE")
-
-        is_pad = state_indices == PAD_SLOT_ID
-        safe_indices = torch.where(
-            is_pad, torch.zeros_like(state_indices), state_indices
-        )
-        value_delayed = recurrent_states[safe_indices].unsqueeze(1)
-        value_delayed = torch.where(
-            is_pad.view(-1, 1, 1),
-            value_delayed.new_zeros(()),
-            value_delayed,
-        )
-        if value_delayed.dtype != value_current.dtype:
-            value_delayed = value_delayed.to(value_current.dtype)
-        new_recurrent_state = delayed_v_state[:, 0, :]
-        if new_recurrent_state.dtype != recurrent_states.dtype:
-            new_recurrent_state = new_recurrent_state.to(recurrent_states.dtype)
-        new_recurrent_state = torch.where(
-            is_pad.view(-1, 1),
-            new_recurrent_state.new_zeros(()),
-            new_recurrent_state,
-        )
-        recurrent_states[safe_indices] = new_recurrent_state
-
-        value = torch.cat([value_current, value_delayed], dim=-1).reshape(
-            num_tokens, self.latent_k_dim
-        )
-        output[:num_tokens, self.in_out_ch :] = value
-        decode_output = output[:num_tokens]
-        output[:num_tokens] = torch.where(
-            is_pad.view(-1, 1),
-            decode_output.new_zeros(()),
-            decode_output,
-        )
+        return fused_output.reshape(num_tokens, self.in_out_ch)
 
     def forward_cuda(
         self,
@@ -503,12 +519,6 @@ class CCA(MambaBase, CustomOp):
         num_prefill_tokens = attn_metadata.num_prefill_tokens  # token count
         has_prefill = num_prefills > 0
         has_decode = num_decodes > 0
-        use_zk_cca_decode = (
-            self._zk_cca_decode_enabled and has_decode and not has_prefill
-        )
-        use_zk_cca_prefill = (
-            self._zk_cca_decode_enabled and has_prefill and not has_decode
-        )
         num_actual_tokens = num_decodes + num_prefill_tokens
 
         hidden_states = hidden_states[:num_actual_tokens]
@@ -523,19 +533,6 @@ class CCA(MambaBase, CustomOp):
         qk_packed0 = torch.cat([q, k], dim=-1)  # [S, B, latent_q + latent_k]
         del q
         del k
-        if use_zk_cca_decode:
-            assert state_indices_tensor_d is not None
-            self._forward_zk_decode(
-                qk_packed0,
-                self.v_proj_current(hs),
-                self.v_proj_delayed(hs),
-                output,
-                position_ids,
-                conv_states,
-                recurrent_states,
-                state_indices_tensor_d,
-            )
-            return
 
         # NOTE: V1 puts decode before prefill
         # Separate prefill and decode by splitting varlen input
@@ -552,86 +549,169 @@ class CCA(MambaBase, CustomOp):
             dim=0,
         )
 
-        qk_packed3 = None
-        if not use_zk_cca_prefill:
-            query_pre = qk_packed0[..., : self.latent_q_dim].view(
-                *qk_packed0.shape[:2], self.num_q_heads, self.head_dim
-            )
-            key_base = qk_packed0[..., self.latent_q_dim :].view(
-                *qk_packed0.shape[:2], self.num_k_heads, self.head_dim
-            )
-            qk_packed3 = torch.empty(
-                (num_actual_tokens, batch_size, self.in_out_ch),
-                device=hs.device,
-                dtype=hs.dtype,
-            )
         value_delayed = torch.empty(
             (num_actual_tokens, batch_size, self.recurrent_v_dim),
             device=hs.device,
             dtype=hs.dtype,
         )
         decode_is_pad: torch.Tensor | None = None
+        used_zk_prefill = False
+        prefill_roped = False
+        qk_prefill: torch.Tensor | None = None
         if has_prefill:
             assert state_indices_tensor_p is not None
             assert has_initial_states_p is not None
             assert query_start_loc_p is not None
-            # Prefill
             prefill_slice = slice(num_decodes, num_decodes + num_prefill_tokens)
             value_delayed_prefill = value_delayed[prefill_slice]
-            if use_zk_cca_prefill:
-                request_indices = torch.repeat_interleave(
-                    torch.arange(
-                        num_prefills, device=hs.device, dtype=torch.int32
-                    ),
-                    torch.diff(query_start_loc_p).to(torch.int32),
+            grouped_bias = self.conv_qk_grouped.bias
+            grouped_weight = self._zk_grouped_weight
+            zk_prefill_available = (
+                _USE_ZK_CCA
+                and _ZK_CCA_PREFILL_IMPORTED
+                and grouped_weight is not None
+                and _zk_cca_prefill_available()
+            )
+            zk_prefill_dtypes_ok = (
+                recurrent_states.dtype == delayed_v_state_p.dtype
+                and conv_states.dtype == qk_packed0_p.dtype
+                and self.conv_qk_depthwise.weight.dtype == qk_packed0_p.dtype
+                and grouped_weight is not None
+                and grouped_weight.dtype == qk_packed0_p.dtype
+                and (
+                    self.conv_qk_depthwise.bias is None
+                    or self.conv_qk_depthwise.bias.dtype == qk_packed0_p.dtype
                 )
-                grouped_bias = self.conv_qk_grouped.bias
-                _, qk_prefill = _get_zk_cca_ops()[1](
-                    hidden_states[num_decodes:num_actual_tokens],
-                    qk_packed0_p[:, 0],
-                    None,
-                    conv_states,
-                    query_start_loc_p,
-                    has_initial_states_p,
-                    state_indices_tensor_p,
-                    request_indices,
-                    self.conv_qk_depthwise.weight.squeeze(1),
-                    self.conv_qk_depthwise.bias,
-                    self._zk_grouped_weight,
-                    None
-                    if grouped_bias is None
-                    else grouped_bias.view(
-                        self.num_q_heads + self.num_k_heads, self.head_dim
-                    ),
-                    self.temp,
-                    num_query_heads=self.num_q_heads,
-                    head_dim=self.head_dim,
-                    gqa_groups=self.gqa_groups,
-                    sqrt_head_dim=float(self.sqrt_head_dim),
-                    clamp_temp=self.config.clamp_temp,
+                and (grouped_bias is None or grouped_bias.dtype == qk_packed0_p.dtype)
+            )
+            supported_shape = self.head_dim in (64, 128) and self.gqa_groups in (
+                1,
+                2,
+                4,
+                8,
+            )
+            if zk_prefill_available and zk_prefill_dtypes_ok and supported_shape:
+                try:
+                    request_indices = torch.repeat_interleave(
+                        torch.arange(
+                            num_prefills, device=hs.device, dtype=torch.int32
+                        ),
+                        torch.diff(query_start_loc_p).to(torch.int32),
+                    )
+                    num_prefill_rows = qk_packed0_p.shape[0]
+                    positions_available = (
+                        position_ids is not None
+                        and position_ids.shape[0]
+                        >= num_decodes + num_prefill_rows
+                    )
+                    fuse_rope = (
+                        num_decodes == 0
+                        and positions_available
+                        and int(self.rotary_emb.rotary_dim) == 64
+                        and self.head_dim == 128
+                    )
+                    if (
+                        num_decodes == 0
+                        and position_ids is not None
+                        and not positions_available
+                        and not getattr(logger, "_zk_position_warning_logged", False)
+                    ):
+                        logger._zk_position_warning_logged = True
+                        logger.warning(
+                            "ZK CCA position_ids are too short for prefill RoPE "
+                            "fusion; applying RoPE outside the kernel"
+                        )
+                    prefill_positions = (
+                        position_ids[
+                            num_decodes : num_decodes + num_prefill_rows
+                        ].to(torch.int64)
+                        if fuse_rope
+                        else None
+                    )
+                    rope_cache = (
+                        self.rotary_emb.cos_sin_cache.to(
+                            device=hs.device, dtype=torch.float32
+                        )
+                        if fuse_rope
+                        else None
+                    )
+                    # bmoe-v16 shifts hidden states before its delayed-value
+                    # projection. Zaya caches that projection directly, so
+                    # shift the projected stream and consume the first kernel
+                    # result instead of reconstructing it per request.
+                    value_delayed_zk, qk_prefill = _zk_cca_prefill(
+                        delayed_v_state_p[:, 0, :],
+                        qk_packed0_p[:, 0],
+                        recurrent_states,
+                        conv_states,
+                        query_start_loc_p,
+                        has_initial_states_p,
+                        state_indices_tensor_p,
+                        request_indices,
+                        self.conv_qk_depthwise.weight.squeeze(1),
+                        self.conv_qk_depthwise.bias,
+                        grouped_weight,
+                        None
+                        if grouped_bias is None
+                        else grouped_bias.view(
+                            self.num_q_heads + self.num_k_heads, self.head_dim
+                        ),
+                        self.temp.data.to(torch.float32),
+                        num_query_heads=self.num_q_heads,
+                        head_dim=self.head_dim,
+                        gqa_groups=self.gqa_groups,
+                        sqrt_head_dim=float(self.sqrt_head_dim),
+                        clamp_temp=self.config.clamp_temp,
+                        fold_qk_mean=True,
+                        position_ids=prefill_positions,
+                        cos_sin_cache=rope_cache,
+                        rotary_dim=(
+                            int(self.rotary_emb.rotary_dim) if fuse_rope else 0
+                        ),
+                        fuse_rope=fuse_rope,
+                    )
+                    value_delayed_prefill.copy_(value_delayed_zk.unsqueeze(1))
+                    used_zk_prefill = True
+                    prefill_roped = fuse_rope
+                    logger.info_once(
+                        "Using Zyphra fused CCA prefill (fuse_rope=%s)",
+                        fuse_rope,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "ZK CCA prefill failed (%s: %s); falling back",
+                        type(exc).__name__,
+                        exc,
+                        exc_info=True,
+                    )
+
+            if not used_zk_prefill:
+                qk_prefill = torch.empty(
+                    (num_prefill_tokens, 1, self.in_out_ch),
+                    device=hs.device,
+                    dtype=hs.dtype,
                 )
-                logger.info_once("Using Zyphra fused CCA prefill")
-            else:
-                assert qk_packed3 is not None
-                qk_packed3_prefill = qk_packed3[prefill_slice]
-            for i in range(len(query_start_loc_p) - 1):
-                start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
-                delayed_v_state_cur = delayed_v_state_p[start_i:end_i]
+                for i in range(len(query_start_loc_p) - 1):
+                    start_i, end_i = query_start_loc_p[i], query_start_loc_p[i + 1]
+                    delayed_v_state_cur = delayed_v_state_p[start_i:end_i]
 
-                if has_initial_states_p[i]:
-                    value_delayed_cached = recurrent_states[
-                        state_indices_tensor_p[i]].unsqueeze(0).unsqueeze(0)
-                    if value_delayed_cached.dtype != value_delayed.dtype:
-                        value_delayed_cached = value_delayed_cached.to(
-                            value_delayed.dtype)
-                else:
-                    value_delayed_cached = self.v_proj_delayed(
-                        hs.new_zeros(1, 1, self.hidden_size))
+                    if has_initial_states_p[i]:
+                        value_delayed_cached = recurrent_states[
+                            state_indices_tensor_p[i]
+                        ].unsqueeze(0).unsqueeze(0)
+                        if value_delayed_cached.dtype != value_delayed.dtype:
+                            value_delayed_cached = value_delayed_cached.to(
+                                value_delayed.dtype
+                            )
+                    else:
+                        value_delayed_cached = self.v_proj_delayed(
+                            hs.new_zeros(1, 1, self.hidden_size)
+                        )
 
-                value_delayed_prefill[start_i:end_i] = torch.cat(
-                    [value_delayed_cached, delayed_v_state_cur[:-1]], dim=0)
+                    value_delayed_prefill[start_i:end_i] = torch.cat(
+                        [value_delayed_cached, delayed_v_state_cur[:-1]], dim=0
+                    )
 
-                if not use_zk_cca_prefill:
                     qk_packed1_cur = qk_packed0_p[
                         start_i:end_i
                     ].permute(1, 2, 0)
@@ -660,67 +740,114 @@ class CCA(MambaBase, CustomOp):
                     qk_packed3_cur = self.conv_qk_grouped(
                         self.conv_qk_depthwise(qk_packed2_cur)
                     ).permute(2, 0, 1)
-                    qk_packed3_prefill[start_i:end_i] = qk_packed3_cur
+                    qk_prefill[start_i:end_i] = qk_packed3_cur
 
-            recurrent_states[state_indices_tensor_p] = delayed_v_state_p[
-                query_start_loc_p[1:] - 1, 0, :].to(
+                recurrent_states[state_indices_tensor_p] = delayed_v_state_p[
+                    query_start_loc_p[1:] - 1, 0, :
+                ].to(
                     device=recurrent_states.device,
-                    dtype=recurrent_states.dtype)
+                    dtype=recurrent_states.dtype,
+                )
 
+        used_zk_decode = False
+        decode_roped = False
+        qk_decode: torch.Tensor | None = None
         if has_decode:
             assert state_indices_tensor_d is not None
-            assert qk_packed3 is not None
-            # Generation
-            # In generation B and S are actually the same in meaning
-            # That's why we don't need to transpose qk_packed0
-            # qk_packed0_d [S, 1, H]
             decode_is_pad = state_indices_tensor_d == PAD_SLOT_ID
-            # block_id=0 reserved
-            # Zvllm/vllm/v1/core/block_pool.py
             safe_decode_indices = torch.where(
                 decode_is_pad,
                 torch.zeros_like(state_indices_tensor_d),
                 state_indices_tensor_d,
             )
-            qk_packed0_d = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                qk_packed0_d.new_zeros(()),
-                qk_packed0_d,
+            grouped_bias = self.conv_qk_grouped.bias
+            grouped_weight = self._zk_grouped_weight
+            first_input = qk_packed0_d[:, 0, :].unsqueeze(-1).contiguous()
+            zk_decode_available = (
+                _USE_ZK_CCA
+                and _ZK_CCA_DECODE_IMPORTED
+                and grouped_weight is not None
+                and _zk_cca_decode_available()
             )
-            qk_packed0_cached = conv_states[
-                safe_decode_indices
-            ]  # [S, H, total_padding]
-            qk_packed0_cached = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                qk_packed0_cached.new_zeros(()),
-                qk_packed0_cached,
-            )
-            qk_packed0_cached_for_compute = qk_packed0_cached
-            decode_qk_dtype = qk_packed0_d.dtype
-            if qk_packed0_cached_for_compute.dtype != decode_qk_dtype:
-                qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(
-                    decode_qk_dtype
+            zk_decode_dtypes_ok = (
+                conv_states.dtype == first_input.dtype
+                and self.conv_qk_depthwise.weight.dtype == first_input.dtype
+                and grouped_weight is not None
+                and grouped_weight.dtype == first_input.dtype
+                and (
+                    self.conv_qk_depthwise.bias is None
+                    or self.conv_qk_depthwise.bias.dtype == first_input.dtype
                 )
-            qk_packed0_cat = torch.cat(
-                [qk_packed0_cached_for_compute, qk_packed0_d.transpose(1, 2)], dim=-1
-            )  # [S, H, total_padding + 1]
-            qk_packed3_d = self._conv_qk_decode(qk_packed0_cat).transpose(
-                1, 2
-            )  # [S, 1, E]
-            qk_packed3[:num_decodes] = qk_packed3_d
+                and (grouped_bias is None or grouped_bias.dtype == first_input.dtype)
+            )
+            supported_shape = self.head_dim in (64, 128) and self.gqa_groups in (
+                1,
+                2,
+                4,
+                8,
+            )
+            if zk_decode_available and zk_decode_dtypes_ok and supported_shape:
+                try:
+                    qk_decode = self._forward_zk_decode(
+                        qk_packed0_d,
+                        position_ids[:num_decodes],
+                        conv_states,
+                        state_indices_tensor_d,
+                    )
+                    used_zk_decode = True
+                    decode_roped = True
+                except _ZkFallback as exc:
+                    logger.warning(
+                        "ZK CCA decode declined inputs (%s); falling back",
+                        exc,
+                    )
+                except Exception:
+                    logger.exception(
+                        "ZK CCA decode failed after dispatch; not retrying "
+                        "against potentially mutated state"
+                    )
+                    raise
 
-            new_qk_packed0_cache = qk_packed0_cached.roll(shifts=-1, dims=-1)
-            new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
-                new_qk_packed0_cache.dtype
-            )
-            new_qk_packed0_cache = torch.where(
-                decode_is_pad.view(-1, 1, 1),
-                new_qk_packed0_cache.new_zeros(()),
-                new_qk_packed0_cache,
-            )
-            conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
-                device=conv_states.device, dtype=conv_states.dtype
-            )
+            if not used_zk_decode:
+                qk_packed0_d = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed0_d.new_zeros(()),
+                    qk_packed0_d,
+                )
+                qk_packed0_cached = conv_states[safe_decode_indices]
+                qk_packed0_cached = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    qk_packed0_cached.new_zeros(()),
+                    qk_packed0_cached,
+                )
+                qk_packed0_cached_for_compute = qk_packed0_cached
+                if qk_packed0_cached_for_compute.dtype != qk_packed0_d.dtype:
+                    qk_packed0_cached_for_compute = qk_packed0_cached_for_compute.to(
+                        qk_packed0_d.dtype
+                    )
+                qk_packed0_cat = torch.cat(
+                    [
+                        qk_packed0_cached_for_compute,
+                        qk_packed0_d.transpose(1, 2),
+                    ],
+                    dim=-1,
+                )
+                qk_decode = self._conv_qk_decode(qk_packed0_cat).transpose(1, 2)
+
+                new_qk_packed0_cache = qk_packed0_cached.roll(
+                    shifts=-1, dims=-1
+                )
+                new_qk_packed0_cache[..., -1] = qk_packed0_d[:, 0, :].to(
+                    new_qk_packed0_cache.dtype
+                )
+                new_qk_packed0_cache = torch.where(
+                    decode_is_pad.view(-1, 1, 1),
+                    new_qk_packed0_cache.new_zeros(()),
+                    new_qk_packed0_cache,
+                )
+                conv_states[safe_decode_indices] = new_qk_packed0_cache.to(
+                    device=conv_states.device, dtype=conv_states.dtype
+                )
 
             value_delayed_decode = recurrent_states[safe_decode_indices].unsqueeze(1)
             value_delayed_decode = torch.where(
@@ -742,8 +869,6 @@ class CCA(MambaBase, CustomOp):
                 device=recurrent_states.device,
                 dtype=recurrent_states.dtype)
 
-        del qk_packed0_d
-        del qk_packed0_p
         del delayed_v_state_d
         del delayed_v_state_p
 
@@ -755,34 +880,43 @@ class CCA(MambaBase, CustomOp):
         )  # [S, B, kh, dh]
         del value_delayed
 
-        # Build queries/keys from conv output + means
-        qk_result = (
-            qk_prefill.unsqueeze(1) if use_zk_cca_prefill else qk_packed3
+        query = torch.empty(
+            (num_actual_tokens, self.latent_q_dim),
+            device=hs.device,
+            dtype=hs.dtype,
         )
-        assert qk_result is not None
-        query = qk_result[..., : self.latent_q_dim].view(
-            num_actual_tokens, batch_size, self.num_q_heads, self.head_dim
+        key = torch.empty(
+            (num_actual_tokens, self.latent_k_dim),
+            device=hs.device,
+            dtype=hs.dtype,
         )
-        key = qk_result[..., self.latent_q_dim :].view(
-            num_actual_tokens, batch_size, self.num_k_heads, self.head_dim
-        )
-        if not use_zk_cca_prefill:
-            query, key = self._add_grouped_qk_means_inplace(
-                query.float(), key.float(), query_pre, key_base
-            )
-            del query_pre
-            del key_base
+        if has_decode:
+            assert qk_decode is not None
+            if used_zk_decode:
+                query[:num_decodes] = qk_decode[:, : self.latent_q_dim]
+                key[:num_decodes] = qk_decode[:, self.latent_q_dim :]
+            else:
+                query_decode, key_decode = self._finalize_qk(
+                    qk_decode, qk_packed0_d
+                )
+                query[:num_decodes] = query_decode
+                key[:num_decodes] = key_decode
+        if has_prefill:
+            assert qk_prefill is not None
+            prefill_slice = slice(num_decodes, num_actual_tokens)
+            if used_zk_prefill:
+                query[prefill_slice] = qk_prefill[:, : self.latent_q_dim]
+                key[prefill_slice] = qk_prefill[:, self.latent_q_dim :]
+            else:
+                query_prefill, key_prefill = self._finalize_qk(
+                    qk_prefill, qk_packed0_p
+                )
+                query[prefill_slice] = query_prefill
+                key[prefill_slice] = key_prefill
+        del qk_packed0_d
+        del qk_packed0_p
         del qk_packed0
-        del qk_result
 
-        if not use_zk_cca_prefill:
-            query, key = self._rms_normalize_qk(
-                query.contiguous(), key.contiguous()
-            )
-        # Flatten the singleton batch dimension without transpose/cat copies and
-        # write directly into the preallocated output buffer.
-        query = query.reshape(num_actual_tokens, self.latent_q_dim)
-        key = key.reshape(num_actual_tokens, self.latent_k_dim)
         value = value.reshape(num_actual_tokens, self.latent_k_dim)
         q_end = self.latent_q_dim
         k_end = q_end + self.latent_k_dim
@@ -796,9 +930,16 @@ class CCA(MambaBase, CustomOp):
                 decode_output.new_zeros(()),
                 decode_output,
             )
-        if self._zk_cca_decode_enabled:
+        if has_decode and not decode_roped:
             self._apply_rope_to_output(
-                position_ids, output, num_actual_tokens
+                position_ids[:num_decodes], output[:num_decodes], num_decodes
+            )
+        if has_prefill and not prefill_roped:
+            prefill_slice = slice(num_decodes, num_actual_tokens)
+            self._apply_rope_to_output(
+                position_ids[prefill_slice],
+                output[prefill_slice],
+                num_prefill_tokens,
             )
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:

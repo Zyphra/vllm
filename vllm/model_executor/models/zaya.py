@@ -147,9 +147,6 @@ class ZayaAttention(nn.Module):
             rotary_emb=rotary_emb,
             prefix=f"{prefix}.qkv_proj",
         )
-        self._cca_returns_rotated_qk = self.qkv_proj.returns_rotated_qk
-        if not self._cca_returns_rotated_qk:
-            self.rotary_emb = rotary_emb
         self.o_proj = ReplicatedLinear(
             self.num_attention_heads * self.head_dim,
             self.hidden_size,
@@ -186,8 +183,6 @@ class ZayaAttention(nn.Module):
         )
         self.qkv_proj(hidden_states, output_qkv, position_ids)
         q, k, v = output_qkv.split([self.q_dim, self.k_dim, self.v_dim], dim=-1)
-        if not self._cca_returns_rotated_qk:
-            q, k = self.rotary_emb(position_ids, q, k)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
 

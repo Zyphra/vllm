@@ -16,6 +16,28 @@ _EXPERT = re.compile(
 )
 
 
+def _consistent_layer_value(
+    config: dict[str, Any],
+    key: str,
+    layer_indices: range,
+) -> int:
+    """Read one scalar value from a scalar or source-layer-sized list."""
+    value = config[key]
+    if not isinstance(value, list):
+        return int(value)
+
+    source_layer_count = len(config["smoe_layers"])
+    if len(value) < source_layer_count:
+        raise ValueError(
+            f"{key} must be scalar or contain at least {source_layer_count} "
+            f"source-layer entries, got {len(value)}"
+        )
+    selected = {int(value[index]) for index in layer_indices}
+    if len(selected) != 1:
+        raise ValueError(f"converted layers must have one consistent {key}: {selected}")
+    return selected.pop()
+
+
 def convert_config(config: dict[str, Any]) -> dict[str, Any]:
     """Translate a 2N-layer attention/MoE config into N Zaya blocks."""
     layers = config["smoe_layers"]
@@ -28,19 +50,47 @@ def convert_config(config: dict[str, Any]) -> dict[str, Any]:
     if len(experts) != 1:
         raise ValueError("all converted MoE layers must have the same expert count")
 
-    q_heads = config["cca_num_q_heads"]
-    q_heads = q_heads[0] if isinstance(q_heads, list) else q_heads
-    ffn_sizes = config["ffn_hidden_size_list"][1::2]
-    if len(set(ffn_sizes)) != 1 or ffn_sizes[0] % 2:
+    attention_layers = range(0, len(layers), 2)
+    moe_layers = range(1, len(layers), 2)
+    q_heads = _consistent_layer_value(config, "cca_num_q_heads", attention_layers)
+    ffn_size = _consistent_layer_value(config, "ffn_hidden_size_list", moe_layers)
+    if ffn_size % 2:
         raise ValueError("all MoE layers must have one even fused gate/up size")
-    router_sizes = config["smoe_mlp_expansion"]
-    router_sizes = (
-        router_sizes[1::2] if isinstance(router_sizes, list) else [router_sizes]
-    )
-    if len(set(router_sizes)) != 1:
-        raise ValueError("all MoE layers must have one router hidden size")
+    router_size = _consistent_layer_value(config, "smoe_mlp_expansion", moe_layers)
 
-    swa = config.get("swa_layers", [0] * len(layers))[::2]
+    kv_heads_value = config.get("num_key_value_heads")
+    if kv_heads_value is None:
+        kv_heads = _consistent_layer_value(
+            config, "num_query_groups_list", attention_layers
+        )
+    elif isinstance(kv_heads_value, list):
+        kv_heads = _consistent_layer_value(
+            config, "num_key_value_heads", attention_layers
+        )
+    else:
+        kv_heads = int(kv_heads_value)
+    if "num_query_groups_list" in config:
+        listed_kv_heads = _consistent_layer_value(
+            config, "num_query_groups_list", attention_layers
+        )
+        if listed_kv_heads != kv_heads:
+            raise ValueError(
+                "num_key_value_heads disagrees with attention-layer "
+                f"num_query_groups_list: {kv_heads} != {listed_kv_heads}"
+            )
+
+    hidden_size = int(config["hidden_size"])
+    source_attention_heads = int(config["num_attention_heads"])
+    if hidden_size % source_attention_heads:
+        raise ValueError("hidden_size must be divisible by num_attention_heads")
+    head_dim = hidden_size // source_attention_heads
+
+    swa_values = config.get("swa_layers", [0] * len(layers))
+    if not isinstance(swa_values, list) or len(swa_values) != len(layers):
+        raise ValueError(
+            f"swa_layers must contain {len(layers)} source-layer entries"
+        )
+    swa = [int(swa_values[index]) for index in attention_layers]
     layer_types = ["hybrid_sliding" if window else "hybrid" for window in swa]
     partial_rotary_factor = config.get("rope_pct", 0.5)
     return {
@@ -52,15 +102,15 @@ def convert_config(config: dict[str, Any]) -> dict[str, Any]:
         "attention_dropout": config.get("attention_dropout", 0.0),
         "lm_head_bias": config.get("lm_head_bias", False),
         "vocab_size": config["vocab_size"],
-        "hidden_size": config["hidden_size"],
+        "hidden_size": hidden_size,
         "num_hidden_layers": len(layers) // 2,
         "num_experts": experts.pop(),
         "num_attention_heads": q_heads,
-        "num_key_value_heads": config["num_key_value_heads"],
-        "head_dim": config["hidden_size"] // config["num_attention_heads"],
+        "num_key_value_heads": kv_heads,
+        "head_dim": head_dim,
         "hidden_act": "silu",
-        "moe_intermediate_size": ffn_sizes[0] // 2,
-        "router_hidden_size": router_sizes[0],
+        "moe_intermediate_size": ffn_size // 2,
+        "router_hidden_size": router_size,
         "num_experts_per_tok": config["moe_router_topk"],
         "max_position_embeddings": config["max_position_embeddings"],
         "initializer_range": config.get("initializer_range", 0.02),
@@ -81,12 +131,14 @@ def convert_config(config: dict[str, Any]) -> dict[str, Any]:
             },
             "hybrid_sliding": {
                 "rope_type": "default",
-                "rope_theta": config["swa_rotary_base"],
+                "rope_theta": config.get(
+                    "swa_rotary_base", config["rotary_base"]
+                ),
                 "partial_rotary_factor": partial_rotary_factor,
             },
         },
-        "cca_time0": 2,
-        "cca_time1": 2,
+        "cca_time0": config.get("cca_time0", 2),
+        "cca_time1": config.get("cca_time1", 2),
         "transformers_version": config.get("transformers_version"),
     }
 

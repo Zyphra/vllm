@@ -40,6 +40,55 @@ def test_convert_config_collapses_attention_moe_pairs():
     assert converted["layer_types"] == ["hybrid_sliding", "hybrid"]
 
 
+def test_convert_config_supports_bmoe_256k_layout():
+    source_layers = 120
+    config = {
+        **_config(),
+        "smoe_layers": [item for _ in range(60) for item in ("a", 24)],
+        "cca_num_q_heads": [item for _ in range(60) for item in (16, 0)],
+        # The released BMoE config pads this 120-layer field to 160 entries.
+        "ffn_hidden_size_list": [
+            item for _ in range(80) for item in (0, 8192)
+        ],
+        "smoe_mlp_expansion": [
+            item for _ in range(60) for item in (0, 256)
+        ],
+        "swa_layers": [
+            item for block in range(60) for item in (4096 if block % 2 == 0 else 0, 0)
+        ],
+        "num_query_groups_list": [
+            item for _ in range(60) for item in (2, 0)
+        ],
+        "hidden_size": 4096,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 262144,
+        "vocab_size": 262272,
+        "eos_token_id": 1,
+    }
+    assert len(config["smoe_layers"]) == source_layers
+
+    converted = convert_config(config)
+    assert converted["num_hidden_layers"] == 60
+    assert converted["num_experts"] == 24
+    assert converted["num_attention_heads"] == 16
+    assert converted["num_key_value_heads"] == 2
+    assert converted["head_dim"] == 128
+    assert converted["moe_intermediate_size"] == 4096
+    assert converted["router_hidden_size"] == 256
+    assert converted["sliding_window"] == 4096
+    assert converted["layer_types"] == [
+        "hybrid_sliding" if block % 2 == 0 else "hybrid" for block in range(60)
+    ]
+
+
+def test_convert_config_rejects_inconsistent_bmoe_attention_heads():
+    config = _config()
+    config["cca_num_q_heads"] = [8, 0, 16, 0]
+    with pytest.raises(ValueError, match="consistent cca_num_q_heads"):
+        convert_config(config)
+
+
 @pytest.mark.parametrize(
     ("source", "target"),
     [

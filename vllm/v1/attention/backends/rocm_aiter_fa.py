@@ -1155,12 +1155,16 @@ class AiterFlashAttentionImpl(AttentionImpl):
             if num_decodes > 0:
                 assert attn_metadata.decode_metadata is not None
                 decode_max_query_len = attn_metadata.decode_metadata.max_query_len
+                # vLLM stores sliding_window as (W - 1, 0), while AITER's
+                # paged_attention_v1 expects the inclusive window W, or 0
+                # for full causal attention.
+                aiter_sliding_window = self.sliding_window[0] + 1
 
-                # Use unified_attention for speculative decoding (multi-token),
-                # sliding window, or sinks
-                # (pa_fwd_asm and paged_attention_v1 don't support sinks)
+                # Keep the generic path for modes not handled by the AITER
+                # assembly paged-attention kernel. Single-token causal SWA is
+                # supported through aiter_sliding_window below.
                 if (
-                    self.sliding_window[0] != -1
+                    not attn_metadata.causal
                     or decode_max_query_len > 1
                     or self.sinks is not None
                 ):
@@ -1237,11 +1241,24 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         )
                     return
 
+                if (
+                    aiter_sliding_window > 0
+                    and rocm_aiter_ops.is_shuffle_kv_cache_enabled()
+                ):
+                    raise NotImplementedError(
+                        "Sliding window with shuffle KV-cache layout is not "
+                        "supported by AITER paged_attention_v1."
+                    )
+                if aiter_sliding_window > 0:
+                    logger.info_once(
+                        "Using AITER ASM paged_attention_v1 for SWA decode "
+                        "(window=%d)",
+                        aiter_sliding_window,
+                    )
+
                 # The ll4mi kernel in paged_attention_v1 requires
                 # HEAD_SIZE >= 16 * NWARPS (= 64 on ROCm with NWARPS=4).
-                # For smaller head sizes or sliding window attention,
-                # fall back to the unified_attention triton kernel which
-                # handles both correctly.
+                # For smaller head sizes, fall back to unified_attention.
                 _MIN_HEAD_SIZE_FOR_LL4MI = 64
                 use_unified_attention = self.head_size < _MIN_HEAD_SIZE_FOR_LL4MI
 
@@ -1376,7 +1393,7 @@ class AiterFlashAttentionImpl(AttentionImpl):
                         None,
                         _PARTITION_SIZE_ROCM,
                         1,
-                        self.sliding_window[0] + 1,
+                        aiter_sliding_window,
                     )
         else:
             raise NotImplementedError(

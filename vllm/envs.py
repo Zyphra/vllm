@@ -121,7 +121,6 @@ if TYPE_CHECKING:
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
-    VLLM_CCA_ZK_DECODE: bool = False
     VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE: bool = True
     VLLM_DISABLE_PYNCCL: bool = False
     VLLM_USE_OINK_OPS: bool = False
@@ -1160,10 +1159,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
         []
         if "VLLM_DISABLED_KERNELS" not in os.environ
         else os.environ["VLLM_DISABLED_KERNELS"].split(",")
-    ),
-    # Opt in to the Zyphra-kernels fused CCA decode and RoPE path.
-    "VLLM_CCA_ZK_DECODE": lambda: bool(
-        int(os.getenv("VLLM_CCA_ZK_DECODE", "0"))
     ),
     "VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE": lambda: bool(
         int(os.getenv("VLLM_ENABLE_FLA_PACKED_RECURRENT_DECODE", "1"))

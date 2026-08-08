@@ -93,24 +93,28 @@ ZK_BUILD_FAMILIES=cca ZK_PYTORCH_ROCM_ARCH=gfx942 \
 ```
 
 ```bash
-export VLLM_CCA_ZK_DECODE=1
+export VLLM_USE_ZK_CCA=1
 vllm serve <zaya-checkpoint> \
   --dtype bfloat16 \
-  --mamba-cache-dtype float32 \
+  --mamba-cache-dtype bfloat16 \
   --compilation-config.cudagraph_mode FULL_AND_PIECEWISE
 ```
 
-The explicit cache dtype preserves recurrent CCA state in FP32 while the
-operator keeps BF16 projections and outputs; no per-step state cast is added.
+The fused kernels require the CCA cache, projections, and convolution weights
+to use the same dtype. The prefill kernel shifts Zaya's projected delayed-value
+stream and updates its recurrent cache directly; the per-request Python loop is
+used only by the fallback implementation.
 
 Required receipts are:
 
 - `Using Zyphra fused CCA decode and RoPE`;
-- `Using Zyphra fused CCA prefill` on prefill-only steps;
+- `Using Zyphra fused CCA prefill`;
 - FULL graph replay;
 - finite output;
 - the intended Zaya-8B DP1 or Zaya-74B EP8 topology.
 
-With `VLLM_CCA_ZK_DECODE=0` (the default), the official source path is
-unchanged. The model and converter are device-neutral. The optional fused CCA
-operator is currently qualified only on AMD MI300X/gfx942.
+With `VLLM_USE_ZK_CCA=0` (the default), the official source path is unchanged.
+When enabled, prefill and decode availability are checked independently and an
+unavailable kernel falls back to the official implementation. The model and
+converter are device-neutral. The optional fused CCA operators are currently
+qualified only on AMD MI300X/gfx942.
