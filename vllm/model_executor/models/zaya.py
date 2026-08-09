@@ -42,7 +42,7 @@ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.zaya import ZayaConfig
 
-from .interfaces import HasInnerState, IsHybrid, SupportsMambaPrefixCaching
+from .interfaces import HasInnerState, IsHybrid
 from .utils import make_empty_intermediate_tensors_factory, maybe_prefix
 
 logger = logging.getLogger(__name__)
@@ -497,7 +497,6 @@ class ZayaForCausalLM(
     nn.Module,
     HasInnerState,
     IsHybrid,
-    SupportsMambaPrefixCaching,
 ):
     @classmethod
     def get_mamba_state_dtype_from_config(

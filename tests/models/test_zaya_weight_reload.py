@@ -6,8 +6,12 @@ from vllm.model_executor.models import zaya
 from vllm.model_executor.models.interfaces import supports_mamba_prefix_caching
 
 
-def test_zaya_declares_native_cca_prefix_cache_contract():
-    assert supports_mamba_prefix_caching(zaya.ZayaForCausalLM)
+def test_zaya_uses_align_mode_cca_prefix_cache_contract():
+    # CCA exposes one running state per request. It cannot implement Mamba
+    # "all" mode, which requires a state at every cached block boundary.
+    # Leaving the all-state marker unset makes vLLM select align mode while
+    # retaining the explicit CCA state-copy functions below.
+    assert not supports_mamba_prefix_caching(zaya.ZayaForCausalLM)
     copy_functions = zaya.ZayaForCausalLM.get_mamba_state_copy_func()
     assert copy_functions == (
         zaya.MambaStateCopyFuncCalculator.cca_state_copy_func()
