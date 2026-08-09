@@ -3,6 +3,15 @@ from types import SimpleNamespace
 import torch
 
 from vllm.model_executor.models import zaya
+from vllm.model_executor.models.interfaces import supports_mamba_prefix_caching
+
+
+def test_zaya_declares_native_cca_prefix_cache_contract():
+    assert supports_mamba_prefix_caching(zaya.ZayaForCausalLM)
+    copy_functions = zaya.ZayaForCausalLM.get_mamba_state_copy_func()
+    assert copy_functions == (
+        zaya.MambaStateCopyFuncCalculator.cca_state_copy_func()
+    )
 
 
 def test_zaya_expert_weights_use_parameter_reload_wrapper(monkeypatch):
