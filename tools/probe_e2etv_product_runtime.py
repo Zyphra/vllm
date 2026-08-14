@@ -37,7 +37,6 @@ def _sha256_tensor(tensor: torch.Tensor) -> str:
 
 def _new_tidar_proposer() -> TiDARProposer:
     proposer = object.__new__(TiDARProposer)
-    torch.nn.Module.__init__(proposer)
     proposer.e2etv_event_inputs_enabled = False
     return proposer
 
