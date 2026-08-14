@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Sequence
 from dataclasses import replace
-import os
 
 import torch
 import torch.nn as nn
@@ -16,6 +16,7 @@ from vllm.v1.sample.ops.bad_words import apply_bad_words_with_drafts
 from vllm.v1.sample.ops.penalties import apply_all_penalties
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.e2etv_runtime import TiDARE2ETVRuntimeRecorder
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 logger = init_logger(__name__)
@@ -79,9 +80,33 @@ class RejectionSampler(nn.Module):
                 "TiDAR AR verifier logprob temperature must be positive; "
                 f"got {self.tidar_ar_temperature}."
             )
+        self.e2etv_runtime_recorder: TiDARE2ETVRuntimeRecorder | None = None
         logprobs_mode = self.sampler.logprobs_mode
         self.is_processed_logprobs_mode = logprobs_mode.startswith("processed")
         self.is_logits_logprobs_mode = logprobs_mode.endswith("logits")
+
+    @property
+    def e2etv_event_inputs_enabled(self) -> bool:
+        return self.e2etv_runtime_recorder is not None
+
+    def configure_e2etv_runtime(
+        self,
+        *,
+        partition_id: str,
+        max_events_per_group: int,
+        seed: int,
+        max_open_groups: int,
+        installed_policy_version: int,
+    ) -> None:
+        if self.e2etv_runtime_recorder is not None:
+            raise RuntimeError("E2E-TV runtime was configured more than once")
+        self.e2etv_runtime_recorder = TiDARE2ETVRuntimeRecorder(
+            partition_id=partition_id,
+            max_events_per_group=max_events_per_group,
+            seed=seed,
+            max_open_groups=max_open_groups,
+            installed_policy_version=installed_policy_version,
+        )
 
     def forward(
         self,
@@ -172,6 +197,24 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
+
+        if metadata.e2etv_event_batch is not None:
+            if not self.e2etv_event_inputs_enabled:
+                raise RuntimeError(
+                    "SpecDecodeMetadata carried E2E-TV event inputs without "
+                    "an enabled event consumer"
+                )
+            if metadata.draft_logits is None or metadata.draft_temperature is None:
+                raise RuntimeError(
+                    "E2E-TV runtime requires stochastic DSpARK draft "
+                    "logits and their temperature"
+                )
+            assert self.e2etv_runtime_recorder is not None
+            self.e2etv_runtime_recorder.record(
+                metadata.e2etv_event_batch,
+                target_logits=target_logits,
+                draft_temperature=metadata.draft_temperature,
+            )
 
         output_token_ids = rejection_sample(
             metadata.draft_token_ids,

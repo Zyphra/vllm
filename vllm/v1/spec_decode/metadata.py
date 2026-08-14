@@ -6,6 +6,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from vllm.v1.spec_decode.e2etv_event_inputs import TiDARE2ETVEventBatch
+
 
 @dataclass
 class SpecDecodeMetadata:
@@ -42,6 +44,10 @@ class SpecDecodeMetadata:
     draft_logsumexp: Optional[torch.Tensor] = None
     # Temperature used to sample the compact draft distribution.
     draft_temperature: Optional[float] = None
+    # Default-off qualification payload carrying the detached DSpARK head
+    # inputs that produced these draft tokens.  It is consumed only by the
+    # bounded E2E-TV event writer in the rejection sampler.
+    e2etv_event_batch: Optional[TiDARE2ETVEventBatch] = None
 
     def __post_init__(self):
         self.max_spec_len = max(self.num_draft_tokens)

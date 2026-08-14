@@ -159,6 +159,11 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.tidar import TiDARProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
+from vllm.v1.spec_decode.e2etv_event_inputs import (
+    discard_event_state as discard_e2etv_event_state,
+    stash_event_state as stash_e2etv_event_state,
+    take_event_state as take_e2etv_event_state,
+)
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
@@ -730,6 +735,9 @@ class GPUModelRunner(
         # a token-budget-delayed request retains the exact proposal state.
         self._draft_token_probs_by_req_id: dict[str, torch.Tensor] = {}
         self._draft_logsumexp_by_req_id: dict[str, torch.Tensor] = {}
+        # The mapping is allocated only by the explicit runtime configuration
+        # RPC.  Disabled serving therefore creates no E2E-TV event state.
+        self._e2etv_event_by_req_id: dict[str, object] | None = None
         # === end TiDAR Block 1 =====================================
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2278,6 +2286,33 @@ class GPUModelRunner(
 
                 xdrope_pos_ptr += completion_part_len
 
+    def _e2etv_event_inputs_enabled(self) -> bool:
+        """Return whether same-update runtime sampling is active."""
+
+        rejection_sampler = getattr(self, "rejection_sampler", None)
+        return bool(
+            rejection_sampler is not None
+            and rejection_sampler.e2etv_event_inputs_enabled
+        )
+
+    def enable_e2etv_event_inputs(self) -> None:
+        """Allocate transient event state after the explicit opt-in RPC."""
+
+        if self._e2etv_event_by_req_id is not None:
+            raise RuntimeError("E2E-TV event inputs were enabled more than once")
+        if not isinstance(self.drafter, TiDARProposer):
+            raise RuntimeError("E2E-TV runtime requires the TiDAR proposer")
+        if not self.rejection_sampler.e2etv_event_inputs_enabled:
+            raise RuntimeError("E2E-TV rejection recorder is not configured")
+        self._e2etv_event_by_req_id = {}
+        self.drafter.e2etv_event_inputs_enabled = True
+
+    def _require_e2etv_event_state(self) -> dict[str, object]:
+        state = self._e2etv_event_by_req_id
+        if state is None:
+            raise RuntimeError("E2E-TV runtime state was not enabled")
+        return state
+
     def _calc_spec_decode_metadata(
         self,
         num_draft_tokens: np.ndarray,
@@ -2362,6 +2397,12 @@ class GPUModelRunner(
         if draft_token_probs is not None:
             assert self.speculative_config is not None
             draft_temperature = self.speculative_config.tidar_diff_temperature
+        elif self._e2etv_event_inputs_enabled() and draft_logits is not None:
+            # Dense-q DSpARK still needs its sampling temperature in the
+            # frozen event receipt so the offline head objective reconstructs
+            # the exact proposal distribution.
+            assert self.speculative_config is not None
+            draft_temperature = self.speculative_config.tidar_diff_temperature
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
@@ -2375,6 +2416,15 @@ class GPUModelRunner(
             draft_logits=draft_logits,
             draft_logsumexp=draft_logsumexp,
             draft_temperature=draft_temperature,
+            e2etv_event_batch=(
+                take_e2etv_event_state(
+                    self._require_e2etv_event_state(),
+                    self.input_batch.req_ids,
+                    num_draft_tokens,
+                )
+                if self._e2etv_event_inputs_enabled()
+                else None
+            ),
         )
 
     # === TiDAR Block 2: per-request draft distribution lifetime =======
@@ -2382,6 +2432,7 @@ class GPUModelRunner(
         self,
         req_ids: Iterable[str],
     ) -> None:
+        req_ids = tuple(req_ids)
         discard_tidar_draft_state(
             self._draft_probs_by_req_id,
             self._draft_logits_by_req_id,
@@ -2389,6 +2440,10 @@ class GPUModelRunner(
             self._draft_logsumexp_by_req_id,
             req_ids,
         )
+        if self._e2etv_event_inputs_enabled():
+            discard_e2etv_event_state(
+                self._require_e2etv_event_state(), req_ids
+            )
 
     def _stash_tidar_draft_state(
         self,
@@ -4818,6 +4873,29 @@ class GPUModelRunner(
                     last_token_probs,
                     last_logsumexp,
                 )
+                if self._e2etv_event_inputs_enabled():
+                    hidden = getattr(
+                        tidar_drafter, "last_e2etv_draft_hidden", None
+                    )
+                    previous = getattr(
+                        tidar_drafter, "last_e2etv_previous_token_ids", None
+                    )
+                    positions = getattr(
+                        tidar_drafter, "last_e2etv_global_positions", None
+                    )
+                    if hidden is None or previous is None or positions is None:
+                        raise RuntimeError(
+                            "E2E-TV event capture is enabled but the TiDAR "
+                            "proposer did not expose exact DSpARK head inputs"
+                        )
+                    stash_e2etv_event_state(
+                        self._require_e2etv_event_state(),
+                        self.input_batch.req_ids,
+                        num_spec,
+                        hidden,
+                        previous,
+                        positions,
+                    )
             # === end TiDAR Block 7 =====================================
 
         return draft_token_ids

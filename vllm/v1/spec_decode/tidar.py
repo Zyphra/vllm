@@ -95,6 +95,13 @@ class TiDARProposer(EagleProposer):
         #   mixed = w*target_logits + (1-w)*draft_logits
         # without relying on the (None-at-Dirac) draft_probs.
         self.last_draft_logits: Optional[torch.Tensor] = None
+        # Populated only when qualification capture is explicitly enabled.
+        # These are detached inputs to the three DSpARK heads, not backbone
+        # activations retained for autograd.
+        self.last_e2etv_draft_hidden: Optional[torch.Tensor] = None
+        self.last_e2etv_previous_token_ids: Optional[torch.Tensor] = None
+        self.last_e2etv_global_positions: Optional[torch.Tensor] = None
+        self.e2etv_event_inputs_enabled = False
         # Tier 3: tracks whether the drafter-pass FULL cudagraph has been
         # captured for each (num_input_tokens) shape. The captured graph
         # has its CCA gather/scatter operands baked at *drafter* metadata
@@ -842,6 +849,12 @@ class TiDARProposer(EagleProposer):
         V = U.shape[-1]
         T = self.diff_temperature
         tokens = torch.empty(B, K, dtype=torch.long, device=U.device)
+        capture_events = self.e2etv_event_inputs_enabled
+        previous_token_ids = (
+            torch.empty(B, K, dtype=torch.long, device=U.device)
+            if capture_events
+            else None
+        )
         probs = (None if T == 0.0 else torch.empty(
             B, K, V, dtype=torch.float32, device=U.device))
         # Reset the Markov `prev` on the TRUE global block grid when we know
@@ -862,6 +875,8 @@ class TiDARProposer(EagleProposer):
                                    torch.zeros_like(prev), prev)
             elif k > 0 and k % block_len == 0:
                 prev.zero_()
+            if previous_token_ids is not None:
+                previous_token_ids[:, k] = prev
             bias = torch.matmul(w1.index_select(0, prev), w2)  # [B, V]
             if os.environ.get("VLLM_DSPARK_NO_MARKOV", "0") == "1":
                 bias = torch.zeros_like(bias)   # ablation: base head only
@@ -878,6 +893,30 @@ class TiDARProposer(EagleProposer):
         self.last_draft_logits = U.view(B * K, V).detach().contiguous()
         self.last_draft_probs = (None if probs is None else
                                  probs.view(B * K, V).contiguous())
+        if capture_events:
+            if not use_global or mask_positions is None:
+                raise RuntimeError(
+                    "E2E-TV runtime requires exact global mask positions "
+                    "and committed-token Markov conditioning"
+                )
+            assert previous_token_ids is not None
+            # These tensors cross an engine-step boundary before the target
+            # verifier consumes them.  Own their storage explicitly: hidden
+            # states and model-runner position buffers may otherwise be
+            # overwritten by the next CUDA-graph/input-buffer replay.
+            self.last_e2etv_draft_hidden = hidden.detach().clone(
+                memory_format=torch.contiguous_format
+            )
+            self.last_e2etv_previous_token_ids = (
+                previous_token_ids.detach().clone(
+                    memory_format=torch.contiguous_format
+                )
+            )
+            self.last_e2etv_global_positions = (
+                mask_positions.detach().clone(
+                    memory_format=torch.contiguous_format
+                )
+            )
         return tokens.view(-1)
 
     def load_model(self, target_model: nn.Module) -> None:
@@ -1496,4 +1535,3 @@ class TiDARProposer(EagleProposer):
     def validate_same_kv_cache_group(self,
                                      kv_cache_config: KVCacheConfig) -> None:
         super().validate_same_kv_cache_group(kv_cache_config)
-
