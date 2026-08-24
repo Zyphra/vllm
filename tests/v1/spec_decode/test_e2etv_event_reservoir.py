@@ -142,7 +142,7 @@ def test_restore_rejects_config_or_schema_drift() -> None:
     reservoir = TiDARE2ETVEventReservoir(max_events=2, seed=1)
     state = reservoir.state_dict()
     for key, value in (
-        ("schema_version", 2),
+        ("schema_version", int(state["schema_version"]) + 1),
         ("max_events", 3),
         ("seed", 2),
     ):
