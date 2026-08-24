@@ -633,6 +633,27 @@ class TiDARE2ETVEventDescriptor:
             raise ValueError("invalid E2E-TV descriptor tensor size")
 
 
+def event_descriptor_from_wire(
+    value: TiDARE2ETVEventDescriptor | Mapping[str, object],
+) -> TiDARE2ETVEventDescriptor:
+    """Decode and validate one descriptor after an RPC serialization boundary."""
+
+    if isinstance(value, TiDARE2ETVEventDescriptor):
+        descriptor = value
+    elif isinstance(value, Mapping):
+        descriptor = TiDARE2ETVEventDescriptor(
+            event_id=str(value["event_id"]),
+            priority_sha256=str(value["priority_sha256"]),
+            payload_sha256=str(value["payload_sha256"]),
+            installed_policy_version=int(value["installed_policy_version"]),
+            tensor_bytes=int(value["tensor_bytes"]),
+        )
+    else:
+        raise TypeError("invalid E2E-TV event descriptor wire value")
+    descriptor.validate()
+    return descriptor
+
+
 def _partition_manifest_sha256(
     *,
     group_id: str,
@@ -756,6 +777,37 @@ class TiDARE2ETVPartitionManifest:
             raise ValueError("E2E-TV partition manifest receipt mismatch")
 
 
+def partition_manifest_from_wire(
+    value: TiDARE2ETVPartitionManifest | Mapping[str, object],
+) -> TiDARE2ETVPartitionManifest:
+    """Decode and validate a tensor-free manifest returned by worker RPC."""
+
+    if isinstance(value, TiDARE2ETVPartitionManifest):
+        manifest = value
+    elif isinstance(value, Mapping):
+        raw_descriptors = value["descriptors"]
+        if not isinstance(raw_descriptors, Sequence):
+            raise TypeError("invalid E2E-TV descriptor sequence")
+        manifest = TiDARE2ETVPartitionManifest(
+            group_id=str(value["group_id"]),
+            partition_id=str(value["partition_id"]),
+            seed=int(value["seed"]),
+            selection_epoch=int(value["selection_epoch"]),
+            reservoir_capacity=int(value["reservoir_capacity"]),
+            observed_event_population=int(value["observed_event_population"]),
+            carrier_lineage_sha256=str(value["carrier_lineage_sha256"]),
+            descriptors=tuple(
+                event_descriptor_from_wire(descriptor)
+                for descriptor in raw_descriptors
+            ),
+            manifest_sha256=str(value["manifest_sha256"]),
+        )
+    else:
+        raise TypeError("invalid E2E-TV partition manifest wire value")
+    manifest.validate()
+    return manifest
+
+
 def _validate_group_and_partition(group_id: str, partition_id: str) -> None:
     if len(group_id) != 64 or any(
         character not in "0123456789abcdef" for character in group_id
@@ -803,6 +855,42 @@ class TiDARE2ETVSelectionPlan:
         expected = plan_event_selection(self.manifests, max_events=self.max_events)
         if self != expected:
             raise ValueError("E2E-TV selection plan receipt mismatch")
+
+
+def selection_plan_from_wire(
+    value: TiDARE2ETVSelectionPlan | Mapping[str, object],
+) -> TiDARE2ETVSelectionPlan:
+    """Decode and validate a global selection plan passed through worker RPC."""
+
+    if isinstance(value, TiDARE2ETVSelectionPlan):
+        plan = value
+    elif isinstance(value, Mapping):
+        raw_manifests = value["manifests"]
+        raw_selected = value["selected"]
+        if not isinstance(raw_manifests, Sequence) or not isinstance(
+            raw_selected, Sequence
+        ):
+            raise TypeError("invalid E2E-TV selection plan sequence")
+        plan = TiDARE2ETVSelectionPlan(
+            group_id=str(value["group_id"]),
+            seed=int(value["seed"]),
+            selection_epoch=int(value["selection_epoch"]),
+            max_events=int(value["max_events"]),
+            observed_event_population=int(value["observed_event_population"]),
+            manifests=tuple(
+                partition_manifest_from_wire(manifest)
+                for manifest in raw_manifests
+            ),
+            selected=tuple(
+                (str(selection[0]), str(selection[1]))
+                for selection in raw_selected
+            ),
+            plan_sha256=str(value["plan_sha256"]),
+        )
+    else:
+        raise TypeError("invalid E2E-TV selection plan wire value")
+    plan.validate()
+    return plan
 
 
 def plan_event_selection(
@@ -874,6 +962,68 @@ class TiDARE2ETVSelectedPartition:
     manifest_sha256: str
     observed_event_population: int
     events: tuple[TiDARE2ETVEventPayload, ...]
+
+
+def event_payload_from_wire(
+    value: TiDARE2ETVEventPayload | Mapping[str, object],
+    *,
+    seed: int,
+    selection_epoch: int,
+) -> TiDARE2ETVEventPayload:
+    """Decode and validate one selected tensor payload returned by worker RPC."""
+
+    if isinstance(value, TiDARE2ETVEventPayload):
+        event = value
+    elif isinstance(value, Mapping):
+        event = TiDARE2ETVEventPayload(
+            request_id=str(value["request_id"]),
+            event_id=str(value["event_id"]),
+            priority_sha256=str(value["priority_sha256"]),
+            installed_policy_version=int(value["installed_policy_version"]),
+            draft_temperature=float(value["draft_temperature"]),
+            draft_hidden=value["draft_hidden"],
+            target_hidden=value["target_hidden"],
+            previous_token_ids=value["previous_token_ids"],
+            global_positions=value["global_positions"],
+            target_logits=value["target_logits"],
+            payload_sha256=str(value["payload_sha256"]),
+        )
+    else:
+        raise TypeError("invalid E2E-TV event payload wire value")
+    event.validate(seed=seed, selection_epoch=selection_epoch)
+    return event
+
+
+def selected_partition_from_wire(
+    value: TiDARE2ETVSelectedPartition | Mapping[str, object],
+    *,
+    seed: int,
+    selection_epoch: int,
+) -> TiDARE2ETVSelectedPartition:
+    """Decode and validate one selected worker partition after RPC."""
+
+    if isinstance(value, TiDARE2ETVSelectedPartition):
+        partition = value
+    elif isinstance(value, Mapping):
+        raw_events = value["events"]
+        if not isinstance(raw_events, Sequence):
+            raise TypeError("invalid E2E-TV selected event sequence")
+        partition = TiDARE2ETVSelectedPartition(
+            partition_id=str(value["partition_id"]),
+            manifest_sha256=str(value["manifest_sha256"]),
+            observed_event_population=int(value["observed_event_population"]),
+            events=tuple(
+                event_payload_from_wire(
+                    event,
+                    seed=seed,
+                    selection_epoch=selection_epoch,
+                )
+                for event in raw_events
+            ),
+        )
+    else:
+        raise TypeError("invalid E2E-TV selected partition wire value")
+    return partition
 
 
 def select_partition_payloads(

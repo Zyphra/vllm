@@ -1,4 +1,5 @@
 import copy
+from dataclasses import asdict
 
 import pytest
 import torch
@@ -13,7 +14,10 @@ from vllm.v1.spec_decode.e2etv_event_reservoir import (
     event_identity,
     finalize_event_selection,
     merge_event_carriers,
+    partition_manifest_from_wire,
     plan_event_selection,
+    selected_partition_from_wire,
+    selection_plan_from_wire,
     select_partition_payloads,
 )
 
@@ -324,6 +328,39 @@ def test_two_phase_selection_transports_only_exact_global_winners() -> None:
         event.event_id for event in expected.events
     ]
     assert sum(len(partition.events) for partition in selected) == 3
+
+
+def test_two_phase_selection_survives_rpc_dataclass_to_mapping_conversion() -> None:
+    expected, carriers, manifests = _partitioned_selection_fixture()
+
+    # Collective RPC serializes nested dataclasses into ordinary mappings.
+    # Hydrate and validate each boundary explicitly rather than relying on
+    # in-process Python types surviving transport.
+    wire_manifests = tuple(asdict(manifest) for manifest in manifests)
+    hydrated_manifests = tuple(
+        partition_manifest_from_wire(manifest) for manifest in wire_manifests
+    )
+    plan = plan_event_selection(hydrated_manifests, max_events=3)
+    hydrated_plan = selection_plan_from_wire(asdict(plan))
+
+    selected = tuple(
+        select_partition_payloads(carrier, manifest, hydrated_plan)
+        for carrier, manifest in zip(carriers, manifests, strict=True)
+    )
+    hydrated_selected = tuple(
+        selected_partition_from_wire(
+            asdict(partition),
+            seed=hydrated_plan.seed,
+            selection_epoch=hydrated_plan.selection_epoch,
+        )
+        for partition in selected
+    )
+    result = finalize_event_selection(hydrated_plan, hydrated_selected)
+    assert result.observed_event_population == 24
+    assert [event.event_id for event in result.events] == [
+        event.event_id for event in expected.events
+    ]
+    assert result.lineage_sha256 == expected.lineage_sha256
 
 
 def test_two_phase_selection_supports_empty_partitions() -> None:

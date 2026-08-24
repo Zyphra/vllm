@@ -15,6 +15,7 @@ reservoir and performs no event work.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -26,6 +27,7 @@ from vllm.v1.spec_decode.e2etv_event_reservoir import (
     TiDARE2ETVPartitionManifest,
     TiDARE2ETVSelectedPartition,
     TiDARE2ETVSelectionPlan,
+    selection_plan_from_wire,
 )
 
 REQUEST_CONTEXT_PREFIX = "e2tv1."
@@ -256,12 +258,15 @@ class TiDARE2ETVWorkerExtension:
         )
 
     def e2etv_take_group(
-        self, *, group_id: str, plan: TiDARE2ETVSelectionPlan
+        self, *, group_id: str, plan: TiDARE2ETVSelectionPlan | Mapping[str, object]
     ) -> TiDARE2ETVSelectedPartition:
         recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
-        return recorder.take_group(group_id=group_id, plan=plan)
+        return recorder.take_group(
+            group_id=group_id,
+            plan=selection_plan_from_wire(plan),
+        )
 
     def e2etv_discard_group(self, group_id: str) -> bool:
         recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
