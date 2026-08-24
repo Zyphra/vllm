@@ -964,6 +964,92 @@ class TiDARE2ETVSelectedPartition:
     events: tuple[TiDARE2ETVEventPayload, ...]
 
 
+_WIRE_TORCH_DTYPES = {
+    "torch.bfloat16": torch.bfloat16,
+    "torch.float16": torch.float16,
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+    "torch.int32": torch.int32,
+    "torch.int64": torch.int64,
+}
+
+
+def _tensor_to_wire(tensor: torch.Tensor) -> dict[str, object]:
+    """Encode one CPU tensor into a primitive-only, byte-exact RPC envelope."""
+
+    tensor = tensor.detach().to(device="cpu").contiguous()
+    dtype = str(tensor.dtype)
+    if dtype not in _WIRE_TORCH_DTYPES:
+        raise ValueError(f"unsupported E2E-TV wire tensor dtype: {dtype}")
+    return {
+        "format": "tidar-e2etv-tensor-v1",
+        "dtype": dtype,
+        "shape": list(tensor.shape),
+        "data": tensor.view(torch.uint8).numpy().tobytes(),
+    }
+
+
+def _tensor_from_wire(value: object, *, field: str) -> torch.Tensor:
+    """Decode a byte-exact tensor envelope; reject lossy list conversion."""
+
+    if isinstance(value, torch.Tensor):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError(f"invalid E2E-TV {field} tensor wire value")
+    if value.get("format") != "tidar-e2etv-tensor-v1":
+        raise ValueError(f"invalid E2E-TV {field} tensor wire format")
+    dtype_name = str(value.get("dtype"))
+    dtype = _WIRE_TORCH_DTYPES.get(dtype_name)
+    if dtype is None:
+        raise ValueError(f"unsupported E2E-TV {field} tensor wire dtype")
+    raw_shape = value.get("shape")
+    raw_data = value.get("data")
+    if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, (str, bytes)):
+        raise TypeError(f"invalid E2E-TV {field} tensor wire shape")
+    if not isinstance(raw_data, bytes):
+        raise TypeError(f"invalid E2E-TV {field} tensor wire data")
+    shape = tuple(int(dimension) for dimension in raw_shape)
+    if any(dimension < 0 for dimension in shape):
+        raise ValueError(f"invalid E2E-TV {field} tensor wire dimension")
+    element_size = torch.empty((), dtype=dtype).element_size()
+    expected_bytes = math.prod(shape) * element_size
+    if len(raw_data) != expected_bytes:
+        raise ValueError(f"E2E-TV {field} tensor wire byte-count mismatch")
+    raw = torch.frombuffer(bytearray(raw_data), dtype=torch.uint8)
+    return raw.view(dtype).reshape(shape).clone().contiguous()
+
+
+def event_payload_to_wire(event: TiDARE2ETVEventPayload) -> dict[str, object]:
+    """Return a primitive-only payload that survives EngineCore msgpack RPC."""
+
+    return {
+        "request_id": event.request_id,
+        "event_id": event.event_id,
+        "priority_sha256": event.priority_sha256,
+        "installed_policy_version": event.installed_policy_version,
+        "draft_temperature": event.draft_temperature,
+        "draft_hidden": _tensor_to_wire(event.draft_hidden),
+        "target_hidden": _tensor_to_wire(event.target_hidden),
+        "previous_token_ids": _tensor_to_wire(event.previous_token_ids),
+        "global_positions": _tensor_to_wire(event.global_positions),
+        "target_logits": _tensor_to_wire(event.target_logits),
+        "payload_sha256": event.payload_sha256,
+    }
+
+
+def selected_partition_to_wire(
+    partition: TiDARE2ETVSelectedPartition,
+) -> dict[str, object]:
+    """Return the selected partition's explicit EngineCore wire envelope."""
+
+    return {
+        "partition_id": partition.partition_id,
+        "manifest_sha256": partition.manifest_sha256,
+        "observed_event_population": partition.observed_event_population,
+        "events": [event_payload_to_wire(event) for event in partition.events],
+    }
+
+
 def event_payload_from_wire(
     value: TiDARE2ETVEventPayload | Mapping[str, object],
     *,
@@ -981,11 +1067,19 @@ def event_payload_from_wire(
             priority_sha256=str(value["priority_sha256"]),
             installed_policy_version=int(value["installed_policy_version"]),
             draft_temperature=float(value["draft_temperature"]),
-            draft_hidden=value["draft_hidden"],
-            target_hidden=value["target_hidden"],
-            previous_token_ids=value["previous_token_ids"],
-            global_positions=value["global_positions"],
-            target_logits=value["target_logits"],
+            draft_hidden=_tensor_from_wire(value["draft_hidden"], field="draft_hidden"),
+            target_hidden=_tensor_from_wire(
+                value["target_hidden"], field="target_hidden"
+            ),
+            previous_token_ids=_tensor_from_wire(
+                value["previous_token_ids"], field="previous_token_ids"
+            ),
+            global_positions=_tensor_from_wire(
+                value["global_positions"], field="global_positions"
+            ),
+            target_logits=_tensor_from_wire(
+                value["target_logits"], field="target_logits"
+            ),
             payload_sha256=str(value["payload_sha256"]),
         )
     else:

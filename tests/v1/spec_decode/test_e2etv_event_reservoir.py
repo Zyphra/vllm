@@ -1,6 +1,7 @@
 import copy
 from dataclasses import asdict
 
+import msgspec
 import pytest
 import torch
 
@@ -17,6 +18,7 @@ from vllm.v1.spec_decode.e2etv_event_reservoir import (
     partition_manifest_from_wire,
     plan_event_selection,
     selected_partition_from_wire,
+    selected_partition_to_wire,
     selection_plan_from_wire,
     select_partition_payloads,
 )
@@ -361,6 +363,42 @@ def test_two_phase_selection_survives_rpc_dataclass_to_mapping_conversion() -> N
         event.event_id for event in expected.events
     ]
     assert result.lineage_sha256 == expected.lineage_sha256
+
+
+def test_selected_payload_survives_enginecore_msgpack_without_tensor_loss() -> None:
+    expected, carriers, manifests = _partitioned_selection_fixture()
+    plan = plan_event_selection(manifests, max_events=3)
+    selected = tuple(
+        select_partition_payloads(carrier, manifest, plan)
+        for carrier, manifest in zip(carriers, manifests, strict=True)
+    )
+    wire_selected = tuple(
+        msgspec.msgpack.decode(msgspec.msgpack.encode(selected_partition_to_wire(item)))
+        for item in selected
+    )
+    hydrated = tuple(
+        selected_partition_from_wire(
+            item,
+            seed=plan.seed,
+            selection_epoch=plan.selection_epoch,
+        )
+        for item in wire_selected
+    )
+    result = finalize_event_selection(plan, hydrated)
+    assert result.lineage_sha256 == expected.lineage_sha256
+    for actual, wanted in zip(result.events, expected.events, strict=True):
+        assert actual.payload_sha256 == wanted.payload_sha256
+        for field in (
+            "draft_hidden",
+            "target_hidden",
+            "previous_token_ids",
+            "global_positions",
+            "target_logits",
+        ):
+            actual_tensor = getattr(actual, field)
+            wanted_tensor = getattr(wanted, field)
+            assert actual_tensor.dtype == wanted_tensor.dtype
+            assert torch.equal(actual_tensor, wanted_tensor)
 
 
 def test_two_phase_selection_supports_empty_partitions() -> None:

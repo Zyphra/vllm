@@ -27,6 +27,7 @@ from vllm.v1.spec_decode.e2etv_event_reservoir import (
     TiDARE2ETVPartitionManifest,
     TiDARE2ETVSelectedPartition,
     TiDARE2ETVSelectionPlan,
+    selected_partition_to_wire,
     selection_plan_from_wire,
 )
 
@@ -259,13 +260,15 @@ class TiDARE2ETVWorkerExtension:
 
     def e2etv_take_group(
         self, *, group_id: str, plan: TiDARE2ETVSelectionPlan | Mapping[str, object]
-    ) -> TiDARE2ETVSelectedPartition:
+    ) -> dict[str, object]:
         recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
-        return recorder.take_group(
-            group_id=group_id,
-            plan=selection_plan_from_wire(plan),
+        return selected_partition_to_wire(
+            recorder.take_group(
+                group_id=group_id,
+                plan=selection_plan_from_wire(plan),
+            )
         )
 
     def e2etv_discard_group(self, group_id: str) -> bool:
