@@ -9,7 +9,7 @@ runtime is explicitly enabled.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
 import torch
@@ -24,6 +24,11 @@ class TiDARE2ETVEventBatch:
     draft_hidden: torch.Tensor
     previous_token_ids: torch.Tensor
     global_positions: torch.Tensor
+    # Exact verifier rows consumed by the target output projection.  Proposal
+    # inputs exist before the verifier forward, so the model runner attaches
+    # these rows after computing the target logits and before rejection
+    # sampling consumes the event.
+    target_hidden: torch.Tensor | None = None
 
 
 @dataclass
@@ -134,8 +139,45 @@ def take_event_state(
     return result
 
 
+def attach_target_hidden(
+    event_batch: TiDARE2ETVEventBatch,
+    *,
+    sample_hidden_states: torch.Tensor,
+    target_logits_indices: torch.Tensor,
+) -> TiDARE2ETVEventBatch:
+    """Attach the exact pre-projection verifier rows for this event batch."""
+
+    expected = sum(event_batch.num_draft_tokens)
+    if event_batch.target_hidden is not None:
+        raise RuntimeError("E2E-TV target hidden state was attached more than once")
+    if sample_hidden_states.ndim != 2:
+        raise ValueError(
+            "sample_hidden_states must be [num_sampled_positions, hidden], "
+            f"got {tuple(sample_hidden_states.shape)}"
+        )
+    if target_logits_indices.ndim != 1 or target_logits_indices.numel() != expected:
+        raise ValueError(
+            "target_logits_indices must contain one row per draft token; "
+            f"expected {expected}, got {tuple(target_logits_indices.shape)}"
+        )
+    indices = target_logits_indices.to(torch.long)
+    if indices.numel():
+        minimum = int(indices.min().item())
+        maximum = int(indices.max().item())
+        if minimum < 0 or maximum >= sample_hidden_states.shape[0]:
+            raise ValueError(
+                "target_logits_indices are outside sample_hidden_states: "
+                f"min={minimum}, max={maximum}, rows={sample_hidden_states.shape[0]}"
+            )
+    target_hidden = sample_hidden_states[indices]
+    if target_hidden.shape[0] != expected:
+        raise RuntimeError("attached E2E-TV target hidden state has wrong token count")
+    return replace(event_batch, target_hidden=target_hidden.detach())
+
+
 __all__ = (
     "TiDARE2ETVEventBatch",
+    "attach_target_hidden",
     "discard_event_state",
     "stash_event_state",
     "take_event_state",

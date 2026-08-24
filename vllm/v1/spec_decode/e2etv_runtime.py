@@ -124,8 +124,14 @@ class TiDARE2ETVRuntimeRecorder:
         """Observe exact verifier events, skipping requests without a context."""
 
         expected = sum(event_batch.num_draft_tokens)
+        if event_batch.target_hidden is None:
+            raise RuntimeError(
+                "E2E-TV event reached rejection sampling without exact target "
+                "hidden states"
+            )
         tensors = {
             "draft_hidden": event_batch.draft_hidden,
+            "target_hidden": event_batch.target_hidden,
             "previous_token_ids": event_batch.previous_token_ids,
             "global_positions": event_batch.global_positions,
             "target_logits": target_logits,
@@ -154,6 +160,7 @@ class TiDARE2ETVRuntimeRecorder:
                     installed_policy_version=self.installed_policy_version,
                     draft_temperature=draft_temperature,
                     draft_hidden=event_batch.draft_hidden[start:stop],
+                    target_hidden=event_batch.target_hidden[start:stop],
                     previous_token_ids=event_batch.previous_token_ids[start:stop],
                     global_positions=event_batch.global_positions[start:stop],
                     target_logits=target_logits[start:stop],

@@ -25,6 +25,7 @@ def _event(index: int, *, version: int = 7) -> dict[str, object]:
         "installed_policy_version": version,
         "draft_temperature": 0.8,
         "draft_hidden": torch.full((token_count, 4), float(index)),
+        "target_hidden": torch.full((token_count, 4), float(index + 100)),
         "previous_token_ids": torch.arange(token_count, dtype=torch.int64) + index,
         "global_positions": torch.arange(token_count, dtype=torch.int64) + 10 * index,
         "target_logits": torch.arange(
@@ -226,6 +227,7 @@ def test_tensor_byte_receipt_covers_all_transported_tensors() -> None:
         tensor.numel() * tensor.element_size()
         for tensor in (
             event.draft_hidden,
+            event.target_hidden,
             event.previous_token_ids,
             event.global_positions,
             event.target_logits,

@@ -160,6 +160,7 @@ from vllm.v1.spec_decode.tidar import TiDARProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.e2etv_event_inputs import (
+    attach_target_hidden as attach_e2etv_target_hidden,
     discard_event_state as discard_e2etv_event_state,
     stash_event_state as stash_e2etv_event_state,
     take_event_state as take_e2etv_event_state,
@@ -4263,12 +4264,41 @@ class GPUModelRunner(
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
                     model_output_broadcast_data["logits"] = logits.contiguous()
+                    if (
+                        spec_decode_metadata is not None
+                        and spec_decode_metadata.e2etv_event_batch is not None
+                    ):
+                        # Only the final pipeline rank owns the verifier rows
+                        # consumed by the output projection.  Broadcast those
+                        # exact rows with the logits when the default-off event
+                        # carrier is enabled; intermediate-rank hidden states
+                        # are not valid reconstruction inputs.
+                        model_output_broadcast_data[
+                            "e2etv_sample_hidden_states"
+                        ] = sample_hidden_states.contiguous()
 
                 broadcasted = get_pp_group().broadcast_tensor_dict(
                     model_output_broadcast_data, src=len(get_pp_group().ranks) - 1
                 )
                 assert broadcasted is not None
                 logits = broadcasted["logits"]
+                if "e2etv_sample_hidden_states" in broadcasted:
+                    sample_hidden_states = broadcasted[
+                        "e2etv_sample_hidden_states"
+                    ]
+
+        if (
+            spec_decode_metadata is not None
+            and spec_decode_metadata.e2etv_event_batch is not None
+        ):
+            # Use the same row indices as rejection sampling.  This path is
+            # default-off with the event carrier; ordinary inference does no
+            # extra indexing, allocation, or transport.
+            spec_decode_metadata.e2etv_event_batch = attach_e2etv_target_hidden(
+                spec_decode_metadata.e2etv_event_batch,
+                sample_hidden_states=sample_hidden_states,
+                target_logits_indices=spec_decode_metadata.target_logits_indices,
+            )
 
         if self.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _sha256(*parts: bytes) -> str:
@@ -92,6 +92,7 @@ def _event_payload_receipt(
     installed_policy_version: int,
     draft_temperature: float,
     draft_hidden: torch.Tensor,
+    target_hidden: torch.Tensor,
     previous_token_ids: torch.Tensor,
     global_positions: torch.Tensor,
     target_logits: torch.Tensor,
@@ -107,6 +108,7 @@ def _event_payload_receipt(
     digest.update(struct.pack("!d", float(draft_temperature)))
     for tensor in (
         draft_hidden,
+        target_hidden,
         previous_token_ids,
         global_positions,
         target_logits,
@@ -120,6 +122,7 @@ def _validate_event_tensors(
     installed_policy_version: int,
     draft_temperature: float,
     draft_hidden: torch.Tensor,
+    target_hidden: torch.Tensor,
     previous_token_ids: torch.Tensor,
     global_positions: torch.Tensor,
     target_logits: torch.Tensor,
@@ -136,6 +139,8 @@ def _validate_event_tensors(
         raise ValueError("previous_token_ids must use int64")
     if not draft_hidden.is_floating_point():
         raise ValueError("draft_hidden must use a floating dtype")
+    if not target_hidden.is_floating_point():
+        raise ValueError("target_hidden must use a floating dtype")
     if not target_logits.is_floating_point():
         raise ValueError("target_logits must use a floating dtype")
     token_count = int(global_positions.numel())
@@ -145,6 +150,8 @@ def _validate_event_tensors(
         raise ValueError("previous_token_ids do not align with global_positions")
     if draft_hidden.ndim != 2 or draft_hidden.shape[0] != token_count:
         raise ValueError("draft_hidden does not align with global_positions")
+    if target_hidden.ndim != 2 or target_hidden.shape[0] != token_count:
+        raise ValueError("target_hidden does not align with global_positions")
     if target_logits.ndim != 2 or target_logits.shape[0] != token_count:
         raise ValueError("target_logits do not align with global_positions")
     if target_logits.shape[1] <= 0:
@@ -161,6 +168,8 @@ def _validate_event_tensors(
     if validate_values:
         if not torch.isfinite(draft_hidden).all():
             raise ValueError("draft_hidden contains nonfinite values")
+        if not torch.isfinite(target_hidden).all():
+            raise ValueError("target_hidden contains nonfinite values")
         # Negative infinity is a valid sampling mask; NaN and +inf are not.
         if torch.isnan(target_logits).any() or torch.isposinf(target_logits).any():
             raise ValueError("target_logits contains invalid values")
@@ -169,6 +178,7 @@ def _validate_event_tensors(
     if require_detached_cpu:
         for tensor in (
             draft_hidden,
+            target_hidden,
             previous_token_ids,
             global_positions,
             target_logits,
@@ -189,6 +199,7 @@ class TiDARE2ETVEventPayload:
     installed_policy_version: int
     draft_temperature: float
     draft_hidden: torch.Tensor
+    target_hidden: torch.Tensor
     previous_token_ids: torch.Tensor
     global_positions: torch.Tensor
     target_logits: torch.Tensor
@@ -204,6 +215,7 @@ class TiDARE2ETVEventPayload:
             tensor.numel() * tensor.element_size()
             for tensor in (
                 self.draft_hidden,
+                self.target_hidden,
                 self.previous_token_ids,
                 self.global_positions,
                 self.target_logits,
@@ -215,6 +227,7 @@ class TiDARE2ETVEventPayload:
             installed_policy_version=self.installed_policy_version,
             draft_temperature=self.draft_temperature,
             draft_hidden=self.draft_hidden,
+            target_hidden=self.target_hidden,
             previous_token_ids=self.previous_token_ids,
             global_positions=self.global_positions,
             target_logits=self.target_logits,
@@ -235,6 +248,7 @@ class TiDARE2ETVEventPayload:
             installed_policy_version=self.installed_policy_version,
             draft_temperature=self.draft_temperature,
             draft_hidden=self.draft_hidden,
+            target_hidden=self.target_hidden,
             previous_token_ids=self.previous_token_ids,
             global_positions=self.global_positions,
             target_logits=self.target_logits,
@@ -419,6 +433,7 @@ class TiDARE2ETVEventReservoir:
         installed_policy_version: int,
         draft_temperature: float,
         draft_hidden: torch.Tensor,
+        target_hidden: torch.Tensor,
         previous_token_ids: torch.Tensor,
         global_positions: torch.Tensor,
         target_logits: torch.Tensor,
@@ -429,6 +444,7 @@ class TiDARE2ETVEventReservoir:
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
             draft_hidden=draft_hidden,
+            target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
             target_logits=target_logits,
@@ -456,6 +472,7 @@ class TiDARE2ETVEventReservoir:
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
             draft_hidden=draft_hidden,
+            target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
             target_logits=target_logits,
@@ -464,6 +481,7 @@ class TiDARE2ETVEventReservoir:
         )
 
         draft_hidden_cpu = _cpu_copy(draft_hidden)
+        target_hidden_cpu = _cpu_copy(target_hidden)
         previous_token_ids_cpu = _cpu_copy(previous_token_ids)
         global_positions_cpu = _cpu_copy(global_positions)
         target_logits_cpu = _cpu_copy(target_logits)
@@ -474,6 +492,7 @@ class TiDARE2ETVEventReservoir:
             installed_policy_version=installed_policy_version,
             draft_temperature=float(draft_temperature),
             draft_hidden=draft_hidden_cpu,
+            target_hidden=target_hidden_cpu,
             previous_token_ids=previous_token_ids_cpu,
             global_positions=global_positions_cpu,
             target_logits=target_logits_cpu,
@@ -484,6 +503,7 @@ class TiDARE2ETVEventReservoir:
                 installed_policy_version=installed_policy_version,
                 draft_temperature=draft_temperature,
                 draft_hidden=draft_hidden_cpu,
+                target_hidden=target_hidden_cpu,
                 previous_token_ids=previous_token_ids_cpu,
                 global_positions=global_positions_cpu,
                 target_logits=target_logits_cpu,
@@ -1025,6 +1045,7 @@ class TiDARE2ETVGroupWindowManager:
         installed_policy_version: int,
         draft_temperature: float,
         draft_hidden: torch.Tensor,
+        target_hidden: torch.Tensor,
         previous_token_ids: torch.Tensor,
         global_positions: torch.Tensor,
         target_logits: torch.Tensor,
@@ -1034,6 +1055,7 @@ class TiDARE2ETVGroupWindowManager:
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
             draft_hidden=draft_hidden,
+            target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
             target_logits=target_logits,

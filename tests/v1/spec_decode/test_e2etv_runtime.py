@@ -3,7 +3,10 @@ import types
 import pytest
 import torch
 
-from vllm.v1.spec_decode.e2etv_event_inputs import TiDARE2ETVEventBatch
+from vllm.v1.spec_decode.e2etv_event_inputs import (
+    TiDARE2ETVEventBatch,
+    attach_target_hidden,
+)
 from vllm.v1.spec_decode.e2etv_event_reservoir import (
     finalize_event_selection,
     plan_event_selection,
@@ -32,6 +35,8 @@ def _batch(request_ids: tuple[str, ...]) -> tuple[TiDARE2ETVEventBatch, torch.Te
         global_positions=torch.cat(
             [torch.arange(10 * i, 10 * i + 2) for i in range(len(request_ids))]
         ).to(torch.int64),
+        target_hidden=torch.arange(total * 4, dtype=torch.bfloat16).reshape(total, 4)
+        + 100,
     )
     logits = torch.arange(total * 5, dtype=torch.float32).reshape(total, 5)
     return batch, logits
@@ -85,7 +90,35 @@ def test_recorder_skips_unscoped_requests_and_preserves_exact_float32_logits():
     assert carrier.events[0].installed_policy_version == 3
     assert carrier.events[0].target_logits.dtype == torch.float32
     assert torch.equal(carrier.events[0].target_logits, logits[:2])
+    assert torch.equal(carrier.events[0].target_hidden, batch.target_hidden[:2])
     assert recorder.window_manager.open_group_count == 0
+
+
+def test_attach_target_hidden_uses_exact_rejection_rows() -> None:
+    batch, _ = _batch((_request(),))
+    batch.target_hidden = None
+    sample_hidden = torch.arange(6 * 4, dtype=torch.bfloat16).view(6, 4)
+    attached = attach_target_hidden(
+        batch,
+        sample_hidden_states=sample_hidden,
+        target_logits_indices=torch.tensor([1, 4], dtype=torch.int32),
+    )
+    assert batch.target_hidden is None
+    torch.testing.assert_close(attached.target_hidden, sample_hidden[[1, 4]])
+    with pytest.raises(RuntimeError, match="more than once"):
+        attach_target_hidden(
+            attached,
+            sample_hidden_states=sample_hidden,
+            target_logits_indices=torch.tensor([1, 4]),
+        )
+
+
+def test_recorder_requires_target_hidden() -> None:
+    recorder = _recorder(max_events=1)
+    batch, logits = _batch((_request(),))
+    batch.target_hidden = None
+    with pytest.raises(RuntimeError, match="target hidden"):
+        recorder.record(batch, target_logits=logits, draft_temperature=0.8)
 
 
 def test_policy_version_is_sampled_at_the_verifier_event_boundary():
