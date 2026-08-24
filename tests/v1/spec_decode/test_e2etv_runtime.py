@@ -74,10 +74,10 @@ def test_request_context_rejects_malformed_values(request_id):
         TiDARE2ETVRequestContext.decode(request_id)
 
 
-def test_recorder_skips_unscoped_requests_and_preserves_exact_float32_logits():
+def test_recorder_skips_unscoped_requests_and_preserves_compact_event_state():
     recorder = _recorder(max_events=1)
     batch, logits = _batch((_request(), "ordinary-request"))
-    recorder.record(batch, target_logits=logits, draft_temperature=0.8)
+    recorder.record(batch, draft_temperature=0.8, target_temperature=1.0)
 
     manifest = recorder.seal_group(group_id=GROUP, selection_epoch=7)
     assert manifest.observed_event_population == 1
@@ -88,8 +88,7 @@ def test_recorder_skips_unscoped_requests_and_preserves_exact_float32_logits():
     assert carrier.observed_event_population == 1
     assert len(carrier.events) == 1
     assert carrier.events[0].installed_policy_version == 3
-    assert carrier.events[0].target_logits.dtype == torch.float32
-    assert torch.equal(carrier.events[0].target_logits, logits[:2])
+    assert carrier.events[0].target_temperature == 1.0
     assert torch.equal(carrier.events[0].target_hidden, batch.target_hidden[:2])
     assert recorder.window_manager.open_group_count == 0
 
@@ -118,19 +117,19 @@ def test_recorder_requires_target_hidden() -> None:
     batch, logits = _batch((_request(),))
     batch.target_hidden = None
     with pytest.raises(RuntimeError, match="target hidden"):
-        recorder.record(batch, target_logits=logits, draft_temperature=0.8)
+        recorder.record(batch, draft_temperature=0.8, target_temperature=1.0)
 
 
 def test_policy_version_is_sampled_at_the_verifier_event_boundary():
     recorder = _recorder(version=4)
     first_batch, first_logits = _batch((_request(epoch=7, opaque="first"),))
-    recorder.record(first_batch, target_logits=first_logits, draft_temperature=0.8)
+    recorder.record(first_batch, draft_temperature=0.8, target_temperature=1.0)
     recorder.set_installed_policy_version(5)
     second_group = "b" * 64
     second_batch, second_logits = _batch(
         (_request(group=second_group, epoch=8, opaque="second"),)
     )
-    recorder.record(second_batch, target_logits=second_logits, draft_temperature=0.8)
+    recorder.record(second_batch, draft_temperature=0.8, target_temperature=1.0)
 
     versions = []
     for group, epoch in ((GROUP, 7), (second_group, 8)):
@@ -145,7 +144,7 @@ def test_policy_version_is_sampled_at_the_verifier_event_boundary():
 def test_discard_destroys_group_and_checkpoint_requires_no_open_windows():
     recorder = _recorder()
     batch, logits = _batch((_request(),))
-    recorder.record(batch, target_logits=logits, draft_temperature=0.8)
+    recorder.record(batch, draft_temperature=0.8, target_temperature=1.0)
     with pytest.raises(RuntimeError, match="open E2E-TV groups"):
         recorder.state_dict()
     assert recorder.discard_group(GROUP)
@@ -197,7 +196,7 @@ def test_mixed_group_batch_keeps_windows_isolated():
             _request(group=second_group, epoch=8, opaque="second"),
         )
     )
-    recorder.record(batch, target_logits=logits, draft_temperature=0.8)
+    recorder.record(batch, draft_temperature=0.8, target_temperature=1.0)
     assert recorder.window_manager.open_group_count == 2
     first = recorder.seal_group(group_id=GROUP, selection_epoch=7)
     second = recorder.seal_group(group_id=second_group, selection_epoch=8)

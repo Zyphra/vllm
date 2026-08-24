@@ -125,6 +125,66 @@ def create_sampling_metadata(
     )
 
 
+def test_e2etv_compact_capture_accepts_exact_scalar_temperature_contract():
+    metadata = create_sampling_metadata(
+        all_greedy=False,
+        temperature=torch.full((3,), 0.8, device=DEVICE),
+        top_p=torch.ones(3, device=DEVICE),
+        top_k=torch.full((3,), -1, device=DEVICE),
+    )
+    assert RejectionSampler._e2etv_exact_target_temperature(metadata) == pytest.approx(
+        0.8
+    )
+
+
+@pytest.mark.parametrize(
+    ("metadata_kwargs", "message"),
+    [
+        ({"all_greedy": True}, "stochastic"),
+        (
+            {
+                "all_greedy": False,
+                "temperature": torch.tensor([0.8, 1.0], device=DEVICE),
+            },
+            "one target temperature",
+        ),
+        (
+            {
+                "all_greedy": False,
+                "temperature": torch.ones(2, device=DEVICE),
+                "top_p": torch.tensor([1.0, 0.9], device=DEVICE),
+            },
+            "top-p",
+        ),
+        (
+            {
+                "all_greedy": False,
+                "temperature": torch.ones(2, device=DEVICE),
+                "top_k": torch.tensor([-1, 8], device=DEVICE),
+            },
+            "top-k",
+        ),
+        (
+            {
+                "all_greedy": False,
+                "temperature": torch.ones(2, device=DEVICE),
+                "frequency_penalties": [0.1, 0.1],
+                "presence_penalties": [0.0, 0.0],
+                "repetition_penalties": [1.0, 1.0],
+                "output_token_ids": [[1], [2]],
+            },
+            "penalties",
+        ),
+    ],
+)
+def test_e2etv_compact_capture_rejects_inexact_sampling_contract(
+    metadata_kwargs, message
+):
+    metadata = create_sampling_metadata(**metadata_kwargs)
+    with pytest.raises(RuntimeError, match=message):
+        RejectionSampler._e2etv_exact_target_temperature(metadata)
+
+
 ########################### Tests for Greedy Sampling ###################
 def test_perfect_match(rejection_sampler):
     """Test when output tokens perfectly match speculated tokens"""

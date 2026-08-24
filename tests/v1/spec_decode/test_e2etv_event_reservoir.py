@@ -30,14 +30,11 @@ def _event(index: int, *, version: int = 7) -> dict[str, object]:
         "request_id": f"request-{index}",
         "installed_policy_version": version,
         "draft_temperature": 0.8,
+        "target_temperature": 1.0,
         "draft_hidden": torch.full((token_count, 4), float(index)),
         "target_hidden": torch.full((token_count, 4), float(index + 100)),
         "previous_token_ids": torch.arange(token_count, dtype=torch.int64) + index,
         "global_positions": torch.arange(token_count, dtype=torch.int64) + 10 * index,
-        "target_logits": torch.arange(
-            token_count * 5, dtype=torch.float32
-        ).reshape(token_count, 5)
-        + index,
     }
 
 
@@ -175,16 +172,14 @@ def test_duplicate_event_identity_fails_closed() -> None:
             "installed_policy_version",
         ),
         (lambda event: event.update(draft_temperature=0.0), "draft_temperature"),
+        (lambda event: event.update(target_temperature=0.0), "target_temperature"),
         (
             lambda event: event.update(
                 global_positions=torch.tensor([1, 3, 4], dtype=torch.int64)
             ),
             "consecutive",
         ),
-        (
-            lambda event: event["target_logits"].fill_(float("nan")),
-            "target_logits",
-        ),
+        (lambda event: event["target_hidden"].fill_(float("nan")), "target_hidden"),
     ],
 )
 def test_malformed_events_fail_closed(mutation, message: str) -> None:
@@ -236,7 +231,6 @@ def test_tensor_byte_receipt_covers_all_transported_tensors() -> None:
             event.target_hidden,
             event.previous_token_ids,
             event.global_positions,
-            event.target_logits,
         )
     )
     assert event.tensor_bytes == expected
@@ -246,9 +240,9 @@ def test_tensor_byte_receipt_covers_all_transported_tensors() -> None:
 def test_carrier_detects_tensor_payload_tampering() -> None:
     carrier = _sample([1])
     event = copy.copy(carrier.events[0])
-    target_logits = event.target_logits.clone()
-    target_logits[0, 0] += 1.0
-    object.__setattr__(event, "target_logits", target_logits)
+    target_hidden = event.target_hidden.clone()
+    target_hidden[0, 0] += 1.0
+    object.__setattr__(event, "target_hidden", target_hidden)
     tampered = copy.copy(carrier)
     object.__setattr__(tampered, "events", (event,))
     with pytest.raises(ValueError, match="payload receipt"):
@@ -393,7 +387,6 @@ def test_selected_payload_survives_enginecore_msgpack_without_tensor_loss() -> N
             "target_hidden",
             "previous_token_ids",
             "global_positions",
-            "target_logits",
         ):
             actual_tensor = getattr(actual, field)
             wanted_tensor = getattr(wanted, field)

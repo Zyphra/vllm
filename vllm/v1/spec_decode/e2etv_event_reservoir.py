@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _sha256(*parts: bytes) -> str:
@@ -91,14 +91,14 @@ def _event_payload_receipt(
     priority_sha256: str,
     installed_policy_version: int,
     draft_temperature: float,
+    target_temperature: float,
     draft_hidden: torch.Tensor,
     target_hidden: torch.Tensor,
     previous_token_ids: torch.Tensor,
     global_positions: torch.Tensor,
-    target_logits: torch.Tensor,
 ) -> str:
     digest = hashlib.sha256()
-    digest.update(b"tidar-e2etv-event-payload-v1\0")
+    digest.update(b"tidar-e2etv-event-payload-v2\0")
     encoded_request_id = request_id.encode("utf-8")
     digest.update(len(encoded_request_id).to_bytes(8, "big"))
     digest.update(encoded_request_id)
@@ -106,12 +106,12 @@ def _event_payload_receipt(
     digest.update(bytes.fromhex(priority_sha256))
     digest.update(installed_policy_version.to_bytes(8, "big", signed=True))
     digest.update(struct.pack("!d", float(draft_temperature)))
+    digest.update(struct.pack("!d", float(target_temperature)))
     for tensor in (
         draft_hidden,
         target_hidden,
         previous_token_ids,
         global_positions,
-        target_logits,
     ):
         _update_tensor_receipt(digest, tensor)
     return digest.hexdigest()
@@ -121,11 +121,11 @@ def _validate_event_tensors(
     *,
     installed_policy_version: int,
     draft_temperature: float,
+    target_temperature: float,
     draft_hidden: torch.Tensor,
     target_hidden: torch.Tensor,
     previous_token_ids: torch.Tensor,
     global_positions: torch.Tensor,
-    target_logits: torch.Tensor,
     require_detached_cpu: bool,
     validate_values: bool = True,
 ) -> None:
@@ -133,6 +133,8 @@ def _validate_event_tensors(
         raise ValueError("installed_policy_version must fit nonnegative int64")
     if not math.isfinite(draft_temperature) or draft_temperature <= 0.0:
         raise ValueError("draft_temperature must be finite and positive")
+    if not math.isfinite(target_temperature) or target_temperature <= 0.0:
+        raise ValueError("target_temperature must be finite and positive")
     if global_positions.dtype != torch.int64:
         raise ValueError("global_positions must use int64")
     if previous_token_ids.dtype != torch.int64:
@@ -141,8 +143,6 @@ def _validate_event_tensors(
         raise ValueError("draft_hidden must use a floating dtype")
     if not target_hidden.is_floating_point():
         raise ValueError("target_hidden must use a floating dtype")
-    if not target_logits.is_floating_point():
-        raise ValueError("target_logits must use a floating dtype")
     token_count = int(global_positions.numel())
     if global_positions.ndim != 1 or token_count <= 0:
         raise ValueError("global_positions must be a nonempty vector")
@@ -152,10 +152,6 @@ def _validate_event_tensors(
         raise ValueError("draft_hidden does not align with global_positions")
     if target_hidden.ndim != 2 or target_hidden.shape[0] != token_count:
         raise ValueError("target_hidden does not align with global_positions")
-    if target_logits.ndim != 2 or target_logits.shape[0] != token_count:
-        raise ValueError("target_logits do not align with global_positions")
-    if target_logits.shape[1] <= 0:
-        raise ValueError("target_logits has an empty vocabulary axis")
     if token_count > 1 and not torch.equal(
         global_positions[1:] - global_positions[:-1],
         torch.ones(
@@ -170,18 +166,12 @@ def _validate_event_tensors(
             raise ValueError("draft_hidden contains nonfinite values")
         if not torch.isfinite(target_hidden).all():
             raise ValueError("target_hidden contains nonfinite values")
-        # Negative infinity is a valid sampling mask; NaN and +inf are not.
-        if torch.isnan(target_logits).any() or torch.isposinf(target_logits).any():
-            raise ValueError("target_logits contains invalid values")
-        if not torch.isfinite(target_logits).any(dim=-1).all():
-            raise ValueError("target_logits contains an all-masked row")
     if require_detached_cpu:
         for tensor in (
             draft_hidden,
             target_hidden,
             previous_token_ids,
             global_positions,
-            target_logits,
         ):
             if tensor.device.type != "cpu" or tensor.requires_grad:
                 raise ValueError(
@@ -198,11 +188,11 @@ class TiDARE2ETVEventPayload:
     priority_sha256: str
     installed_policy_version: int
     draft_temperature: float
+    target_temperature: float
     draft_hidden: torch.Tensor
     target_hidden: torch.Tensor
     previous_token_ids: torch.Tensor
     global_positions: torch.Tensor
-    target_logits: torch.Tensor
     payload_sha256: str
 
     @property
@@ -218,7 +208,6 @@ class TiDARE2ETVEventPayload:
                 self.target_hidden,
                 self.previous_token_ids,
                 self.global_positions,
-                self.target_logits,
             )
         )
 
@@ -226,11 +215,11 @@ class TiDARE2ETVEventPayload:
         _validate_event_tensors(
             installed_policy_version=self.installed_policy_version,
             draft_temperature=self.draft_temperature,
+            target_temperature=self.target_temperature,
             draft_hidden=self.draft_hidden,
             target_hidden=self.target_hidden,
             previous_token_ids=self.previous_token_ids,
             global_positions=self.global_positions,
-            target_logits=self.target_logits,
             require_detached_cpu=True,
         )
         if self.event_id != event_identity(self.request_id, self.global_positions):
@@ -247,11 +236,11 @@ class TiDARE2ETVEventPayload:
             priority_sha256=self.priority_sha256,
             installed_policy_version=self.installed_policy_version,
             draft_temperature=self.draft_temperature,
+            target_temperature=self.target_temperature,
             draft_hidden=self.draft_hidden,
             target_hidden=self.target_hidden,
             previous_token_ids=self.previous_token_ids,
             global_positions=self.global_positions,
-            target_logits=self.target_logits,
         )
         if self.payload_sha256 != expected:
             raise ValueError("E2E-TV event payload receipt mismatch")
@@ -432,22 +421,22 @@ class TiDARE2ETVEventReservoir:
         request_id: str,
         installed_policy_version: int,
         draft_temperature: float,
+        target_temperature: float,
         draft_hidden: torch.Tensor,
         target_hidden: torch.Tensor,
         previous_token_ids: torch.Tensor,
         global_positions: torch.Tensor,
-        target_logits: torch.Tensor,
     ) -> bool:
         """Observe one event and copy its tensors only when it is selected."""
 
         _validate_event_tensors(
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
+            target_temperature=target_temperature,
             draft_hidden=draft_hidden,
             target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
-            target_logits=target_logits,
             require_detached_cpu=False,
             validate_values=False,
         )
@@ -465,17 +454,17 @@ class TiDARE2ETVEventReservoir:
         if len(self._events) >= self.max_events and priority >= max(self._events):
             return False
 
-        # Full value scans synchronize large logits tensors.  Perform them
-        # only for actual local reservoir winners; rejected events still get
+        # Full value scans synchronize hidden-state tensors. Perform them only
+        # for actual local reservoir winners; rejected events still get
         # structural validation and exact population accounting above.
         _validate_event_tensors(
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
+            target_temperature=target_temperature,
             draft_hidden=draft_hidden,
             target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
-            target_logits=target_logits,
             require_detached_cpu=False,
             validate_values=True,
         )
@@ -484,29 +473,28 @@ class TiDARE2ETVEventReservoir:
         target_hidden_cpu = _cpu_copy(target_hidden)
         previous_token_ids_cpu = _cpu_copy(previous_token_ids)
         global_positions_cpu = _cpu_copy(global_positions)
-        target_logits_cpu = _cpu_copy(target_logits)
         payload = TiDARE2ETVEventPayload(
             request_id=request_id,
             event_id=event_id,
             priority_sha256=priority,
             installed_policy_version=installed_policy_version,
             draft_temperature=float(draft_temperature),
+            target_temperature=float(target_temperature),
             draft_hidden=draft_hidden_cpu,
             target_hidden=target_hidden_cpu,
             previous_token_ids=previous_token_ids_cpu,
             global_positions=global_positions_cpu,
-            target_logits=target_logits_cpu,
             payload_sha256=_event_payload_receipt(
                 request_id=request_id,
                 event_id=event_id,
                 priority_sha256=priority,
                 installed_policy_version=installed_policy_version,
                 draft_temperature=draft_temperature,
+                target_temperature=target_temperature,
                 draft_hidden=draft_hidden_cpu,
                 target_hidden=target_hidden_cpu,
                 previous_token_ids=previous_token_ids_cpu,
                 global_positions=global_positions_cpu,
-                target_logits=target_logits_cpu,
             ),
         )
         if len(self._events) >= self.max_events:
@@ -1028,11 +1016,11 @@ def event_payload_to_wire(event: TiDARE2ETVEventPayload) -> dict[str, object]:
         "priority_sha256": event.priority_sha256,
         "installed_policy_version": event.installed_policy_version,
         "draft_temperature": event.draft_temperature,
+        "target_temperature": event.target_temperature,
         "draft_hidden": _tensor_to_wire(event.draft_hidden),
         "target_hidden": _tensor_to_wire(event.target_hidden),
         "previous_token_ids": _tensor_to_wire(event.previous_token_ids),
         "global_positions": _tensor_to_wire(event.global_positions),
-        "target_logits": _tensor_to_wire(event.target_logits),
         "payload_sha256": event.payload_sha256,
     }
 
@@ -1067,6 +1055,7 @@ def event_payload_from_wire(
             priority_sha256=str(value["priority_sha256"]),
             installed_policy_version=int(value["installed_policy_version"]),
             draft_temperature=float(value["draft_temperature"]),
+            target_temperature=float(value["target_temperature"]),
             draft_hidden=_tensor_from_wire(value["draft_hidden"], field="draft_hidden"),
             target_hidden=_tensor_from_wire(
                 value["target_hidden"], field="target_hidden"
@@ -1076,9 +1065,6 @@ def event_payload_from_wire(
             ),
             global_positions=_tensor_from_wire(
                 value["global_positions"], field="global_positions"
-            ),
-            target_logits=_tensor_from_wire(
-                value["target_logits"], field="target_logits"
             ),
             payload_sha256=str(value["payload_sha256"]),
         )
@@ -1288,21 +1274,21 @@ class TiDARE2ETVGroupWindowManager:
         request_id: str,
         installed_policy_version: int,
         draft_temperature: float,
+        target_temperature: float,
         draft_hidden: torch.Tensor,
         target_hidden: torch.Tensor,
         previous_token_ids: torch.Tensor,
         global_positions: torch.Tensor,
-        target_logits: torch.Tensor,
     ) -> bool:
         return self._window(group_id, selection_epoch).offer(
             request_id=request_id,
             installed_policy_version=installed_policy_version,
             draft_temperature=draft_temperature,
+            target_temperature=target_temperature,
             draft_hidden=draft_hidden,
             target_hidden=target_hidden,
             previous_token_ids=previous_token_ids,
             global_positions=global_positions,
-            target_logits=target_logits,
         )
 
     def seal(

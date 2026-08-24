@@ -210,10 +210,13 @@ class RejectionSampler(nn.Module):
                     "logits and their temperature"
                 )
             assert self.e2etv_runtime_recorder is not None
+            target_temperature = self._e2etv_exact_target_temperature(
+                sampling_metadata
+            )
             self.e2etv_runtime_recorder.record(
                 metadata.e2etv_event_batch,
-                target_logits=target_logits,
                 draft_temperature=metadata.draft_temperature,
+                target_temperature=target_temperature,
             )
 
         output_token_ids = rejection_sample(
@@ -275,6 +278,51 @@ class RejectionSampler(nn.Module):
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
         )
+
+    @staticmethod
+    def _e2etv_exact_target_temperature(
+        sampling_metadata: SamplingMetadata,
+    ) -> float:
+        """Validate the compact carrier's exact reconstruction contract.
+
+        The carrier intentionally transports hidden states rather than a
+        full-vocabulary target distribution.  The trainer can reconstruct the
+        exact distribution only when sampling applies a single scalar
+        temperature and no token-dependent transforms or truncation.
+        """
+
+        if not sampling_metadata.all_random or sampling_metadata.all_greedy:
+            raise RuntimeError("E2E-TV capture requires stochastic sampling")
+        if not sampling_metadata.no_penalties:
+            raise RuntimeError("E2E-TV capture does not support token penalties")
+        if sampling_metadata.allowed_token_ids_mask is not None:
+            raise RuntimeError("E2E-TV capture does not support allowed-token masks")
+        if sampling_metadata.bad_words_token_ids:
+            raise RuntimeError("E2E-TV capture does not support bad-word masks")
+        if any(True for _ in sampling_metadata.logitsprocs.all):
+            raise RuntimeError("E2E-TV capture does not support logits processors")
+
+        temperature = sampling_metadata.temperature
+        if temperature is None or temperature.numel() == 0:
+            raise RuntimeError("E2E-TV capture requires an explicit temperature")
+        temperature = temperature.detach().to(device="cpu", dtype=torch.float64)
+        first = temperature.flatten()[0]
+        if not torch.isfinite(temperature).all() or bool((temperature <= 0).any()):
+            raise RuntimeError("E2E-TV target temperature must be finite and positive")
+        if not torch.equal(temperature, torch.full_like(temperature, first)):
+            raise RuntimeError(
+                "E2E-TV capture requires one target temperature per batch"
+            )
+
+        if sampling_metadata.top_p is not None:
+            top_p = sampling_metadata.top_p.detach().to(device="cpu")
+            if bool((top_p < 1.0).any()):
+                raise RuntimeError("E2E-TV capture does not support top-p truncation")
+        if sampling_metadata.top_k is not None:
+            top_k = sampling_metadata.top_k.detach().to(device="cpu")
+            if bool((top_k > 0).any()):
+                raise RuntimeError("E2E-TV capture does not support top-k truncation")
+        return float(first.item())
 
     def _get_ar_logprob_logits(
         self,

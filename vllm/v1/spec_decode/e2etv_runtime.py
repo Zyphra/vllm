@@ -121,8 +121,8 @@ class TiDARE2ETVRuntimeRecorder:
         self,
         event_batch: TiDARE2ETVEventBatch,
         *,
-        target_logits: torch.Tensor,
         draft_temperature: float,
+        target_temperature: float,
     ) -> None:
         """Observe exact verifier events, skipping requests without a context."""
 
@@ -137,7 +137,6 @@ class TiDARE2ETVRuntimeRecorder:
             "target_hidden": event_batch.target_hidden,
             "previous_token_ids": event_batch.previous_token_ids,
             "global_positions": event_batch.global_positions,
-            "target_logits": target_logits,
         }
         bad = {
             name: tuple(tensor.shape)
@@ -162,11 +161,11 @@ class TiDARE2ETVRuntimeRecorder:
                     request_id=request_id,
                     installed_policy_version=self.installed_policy_version,
                     draft_temperature=draft_temperature,
+                    target_temperature=target_temperature,
                     draft_hidden=event_batch.draft_hidden[start:stop],
                     target_hidden=event_batch.target_hidden[start:stop],
                     previous_token_ids=event_batch.previous_token_ids[start:stop],
                     global_positions=event_batch.global_positions[start:stop],
-                    target_logits=target_logits[start:stop],
                 )
                 self.observed_events += 1
                 self.selected_events += int(selected)
