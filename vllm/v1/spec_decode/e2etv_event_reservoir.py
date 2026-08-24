@@ -882,12 +882,21 @@ def selection_plan_from_wire(
 
 
 def plan_event_selection(
-    manifests: Sequence[TiDARE2ETVPartitionManifest],
+    manifests: Sequence[
+        TiDARE2ETVPartitionManifest | Mapping[str, object]
+    ],
     *,
     max_events: int,
 ) -> TiDARE2ETVSelectionPlan:
     """Select the exact global bottom-k using descriptor-only manifests."""
 
+    # Ray's collective RPC boundary converts nested dataclasses to ordinary
+    # mappings. Hydrate and validate that public wire form before inspecting
+    # manifest fields; callers must not depend on in-process Python types
+    # surviving transport.
+    manifests = tuple(
+        partition_manifest_from_wire(manifest) for manifest in manifests
+    )
     manifests = tuple(sorted(manifests, key=lambda item: item.partition_id))
     if not manifests:
         raise ValueError("at least one E2E-TV partition manifest is required")

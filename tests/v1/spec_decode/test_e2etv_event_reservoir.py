@@ -359,6 +359,20 @@ def test_two_phase_selection_survives_rpc_dataclass_to_mapping_conversion() -> N
     assert result.lineage_sha256 == expected.lineage_sha256
 
 
+def test_plan_event_selection_accepts_rpc_wire_manifests() -> None:
+    expected, _, manifests = _partitioned_selection_fixture()
+
+    plan = plan_event_selection(
+        tuple(asdict(manifest) for manifest in reversed(manifests)),
+        max_events=3,
+    )
+
+    assert plan.observed_event_population == 24
+    assert [event_id for _, event_id in plan.selected] == [
+        event.event_id for event in expected.events
+    ]
+
+
 def test_selected_payload_survives_enginecore_msgpack_without_tensor_loss() -> None:
     expected, carriers, manifests = _partitioned_selection_fixture()
     plan = plan_event_selection(manifests, max_events=3)
