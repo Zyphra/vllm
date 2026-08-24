@@ -4,6 +4,7 @@ import torch
 from vllm.v1.spec_decode.e2etv_event_inputs import (
     discard_event_state,
     stash_event_state,
+    target_logits_indices_from_cu_num_logits,
     take_event_state,
 )
 
@@ -48,3 +49,17 @@ def test_discard_event_state_removes_only_named_requests() -> None:
     )
     discard_event_state(state, ["b", "unknown"])
     assert set(state) == {"a"}
+
+
+def test_v2_target_rows_exclude_each_request_bonus_row() -> None:
+    indices = target_logits_indices_from_cu_num_logits([0, 4, 5, 8])
+    torch.testing.assert_close(indices, torch.tensor([0, 1, 2, 5, 6]))
+
+
+@pytest.mark.parametrize(
+    "cumulative",
+    ([1, 2], [0], [0, 2, 1], [0, 0, 1]),
+)
+def test_v2_target_rows_reject_invalid_prefix_sums(cumulative) -> None:
+    with pytest.raises(ValueError):
+        target_logits_indices_from_cu_num_logits(cumulative)

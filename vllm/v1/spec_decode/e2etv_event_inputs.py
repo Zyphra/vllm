@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Iterable, Sequence
 
+import numpy as np
+
 import torch
 
 
@@ -175,10 +177,38 @@ def attach_target_hidden(
     return replace(event_batch, target_hidden=target_hidden.detach())
 
 
+def target_logits_indices_from_cu_num_logits(
+    cu_num_logits: Sequence[int] | np.ndarray,
+) -> torch.Tensor:
+    """Return verifier rows, excluding each request's bonus-token row.
+
+    V2 lays sampled hidden states out request-by-request as
+    ``[draft verifier rows..., bonus row]``.  This helper derives the exact
+    rows consumed by rejection sampling without relying on the V1 metadata
+    builder.  It intentionally returns a CPU tensor; callers move the tiny
+    index vector to the hidden-state device only when capture is enabled.
+    """
+
+    cumulative = np.asarray(cu_num_logits, dtype=np.int64)
+    if cumulative.ndim != 1 or cumulative.size < 2:
+        raise ValueError("cu_num_logits must be a one-dimensional prefix sum")
+    if cumulative[0] != 0 or np.any(cumulative[1:] < cumulative[:-1]):
+        raise ValueError("cu_num_logits must be a nondecreasing prefix sum from 0")
+
+    indices: list[int] = []
+    for start, stop in zip(cumulative[:-1], cumulative[1:], strict=True):
+        width = int(stop - start)
+        if width < 1:
+            raise ValueError("each request must own at least one bonus-token row")
+        indices.extend(range(int(start), int(stop) - 1))
+    return torch.tensor(indices, dtype=torch.int64)
+
+
 __all__ = (
     "TiDARE2ETVEventBatch",
     "attach_target_hidden",
     "discard_event_state",
     "stash_event_state",
+    "target_logits_indices_from_cu_num_logits",
     "take_event_state",
 )

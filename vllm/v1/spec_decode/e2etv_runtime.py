@@ -15,7 +15,7 @@ reservoir and performs no event work.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -121,8 +121,8 @@ class TiDARE2ETVRuntimeRecorder:
         self,
         event_batch: TiDARE2ETVEventBatch,
         *,
-        draft_temperature: float,
-        target_temperature: float,
+        draft_temperature: float | Sequence[float],
+        target_temperature: float | Sequence[float],
     ) -> None:
         """Observe exact verifier events, skipping requests without a context."""
 
@@ -148,10 +148,40 @@ class TiDARE2ETVRuntimeRecorder:
                 f"E2E-TV runtime tensors do not align to {expected} draft tokens: {bad}"
             )
 
+        def temperatures_by_request(
+            value: float | Sequence[float], name: str
+        ) -> tuple[float, ...]:
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                values = tuple(float(item) for item in value)
+                if len(values) != len(event_batch.req_ids):
+                    raise ValueError(
+                        f"{name} must contain one value per request; "
+                        f"expected {len(event_batch.req_ids)}, got {len(values)}"
+                    )
+                return values
+            return (float(value),) * len(event_batch.req_ids)
+
+        draft_temperatures = temperatures_by_request(
+            draft_temperature, "draft_temperature"
+        )
+        target_temperatures = temperatures_by_request(
+            target_temperature, "target_temperature"
+        )
+
         start = 0
-        for request_id, count in zip(
-            event_batch.req_ids, event_batch.num_draft_tokens, strict=True
-        ):
+        temperatures = zip(
+            event_batch.req_ids,
+            event_batch.num_draft_tokens,
+            draft_temperatures,
+            target_temperatures,
+            strict=True,
+        )
+        for (
+            request_id,
+            count,
+            request_draft_temperature,
+            request_target_temperature,
+        ) in temperatures:
             stop = start + count
             context = TiDARE2ETVRequestContext.decode(request_id)
             if context is not None:
@@ -160,8 +190,8 @@ class TiDARE2ETVRuntimeRecorder:
                     selection_epoch=context.selection_epoch,
                     request_id=request_id,
                     installed_policy_version=self.installed_policy_version,
-                    draft_temperature=draft_temperature,
-                    target_temperature=target_temperature,
+                    draft_temperature=request_draft_temperature,
+                    target_temperature=request_target_temperature,
                     draft_hidden=event_batch.draft_hidden[start:stop],
                     target_hidden=event_batch.target_hidden[start:stop],
                     previous_token_ids=event_batch.previous_token_ids[start:stop],
@@ -199,12 +229,19 @@ class TiDARE2ETVRuntimeRecorder:
 class TiDARE2ETVWorkerExtension:
     """Opt-in worker RPC surface for descriptor/payload carrier lifecycle."""
 
-    def _e2etv_rejection_sampler(self):
+    def _e2etv_runtime_owner(self):
         model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            raise RuntimeError("E2E-TV runtime requires a GPU model runner")
         rejection_sampler = getattr(model_runner, "rejection_sampler", None)
-        if rejection_sampler is None:
-            raise RuntimeError("E2E-TV runtime requires the TiDAR rejection sampler")
-        return rejection_sampler
+        if rejection_sampler is not None:
+            return rejection_sampler
+        if callable(getattr(model_runner, "configure_e2etv_runtime", None)):
+            return model_runner
+        raise RuntimeError(
+            "E2E-TV runtime requires a TiDAR V1 rejection sampler or V2 "
+            "model-runner recorder"
+        )
 
     def e2etv_configure_runtime(
         self,
@@ -220,8 +257,8 @@ class TiDARE2ETVWorkerExtension:
         model_runner = getattr(self, "model_runner", None)
         if model_runner is None:
             raise RuntimeError("E2E-TV runtime requires a GPU model runner")
-        sampler = self._e2etv_rejection_sampler()
-        sampler.configure_e2etv_runtime(
+        owner = self._e2etv_runtime_owner()
+        owner.configure_e2etv_runtime(
             partition_id=partition_id,
             max_events_per_group=max_events_per_group,
             seed=seed,
@@ -239,8 +276,7 @@ class TiDARE2ETVWorkerExtension:
         }
 
     def e2etv_set_installed_policy_version(self, version: int) -> int:
-        sampler = self._e2etv_rejection_sampler()
-        recorder = sampler.e2etv_runtime_recorder
+        recorder = self._e2etv_runtime_owner().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
         recorder.set_installed_policy_version(version)
@@ -249,7 +285,7 @@ class TiDARE2ETVWorkerExtension:
     def e2etv_seal_group(
         self, *, group_id: str, selection_epoch: int
     ) -> TiDARE2ETVPartitionManifest:
-        recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
+        recorder = self._e2etv_runtime_owner().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
         return recorder.seal_group(
@@ -260,7 +296,7 @@ class TiDARE2ETVWorkerExtension:
     def e2etv_take_group(
         self, *, group_id: str, plan: TiDARE2ETVSelectionPlan | Mapping[str, object]
     ) -> dict[str, object]:
-        recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
+        recorder = self._e2etv_runtime_owner().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
         return selected_partition_to_wire(
@@ -271,13 +307,13 @@ class TiDARE2ETVWorkerExtension:
         )
 
     def e2etv_discard_group(self, group_id: str) -> bool:
-        recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
+        recorder = self._e2etv_runtime_owner().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
         return recorder.discard_group(group_id)
 
     def e2etv_runtime_state_dict(self) -> dict[str, Any]:
-        recorder = self._e2etv_rejection_sampler().e2etv_runtime_recorder
+        recorder = self._e2etv_runtime_owner().e2etv_runtime_recorder
         if recorder is None:
             raise RuntimeError("E2E-TV runtime is not configured")
         return recorder.state_dict()

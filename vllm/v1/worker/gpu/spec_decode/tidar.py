@@ -93,6 +93,12 @@ class TiDARSpeculator:
         self.draft_graph_pool = torch.cuda.graph_pool_handle()
         self.draft_hidden_states: torch.Tensor | None = None
         self.last_draft_hidden_states: torch.Tensor | None = None
+        # Default-off exact-event inputs.  Disabled mode creates no request
+        # state and performs no additional tensor copies.
+        self.e2etv_event_inputs_enabled = False
+        self.last_e2etv_draft_hidden: torch.Tensor | None = None
+        self.last_e2etv_previous_token_ids: torch.Tensor | None = None
+        self.last_e2etv_global_positions: torch.Tensor | None = None
         self.last_draft_logits: torch.Tensor | None = None
         self.last_draft_probs: torch.Tensor | None = None
         self.last_draft_token_probs: torch.Tensor | None = None
@@ -246,6 +252,8 @@ class TiDARSpeculator:
         token_steps: list[torch.Tensor] = []
         prob_steps: list[torch.Tensor] = []
         logsumexp_steps: list[torch.Tensor] = []
+        capture_events = self.e2etv_event_inputs_enabled
+        previous_steps: list[torch.Tensor] | None = [] if capture_events else None
         row_indices = torch.arange(
             batch_size, dtype=torch.int64, device=base_logits.device
         )
@@ -290,6 +298,8 @@ class TiDARSpeculator:
                 prev = torch.where(reset_mask[:, k], 0, prev)
             elif k > 0 and k % block_len == 0:
                 prev = torch.zeros_like(prev)
+            if previous_steps is not None:
+                previous_steps.append(prev.clone())
             if use_markov:
                 assert markov_rows is not None and markov_bias is not None
                 torch.index_select(markov_w1, 0, prev, out=markov_rows)
@@ -334,6 +344,17 @@ class TiDARSpeculator:
         self.last_draft_logsumexp = (
             None if logsumexp is None else logsumexp.view(-1).contiguous()
         )
+        if capture_events:
+            assert previous_steps is not None
+            self.last_e2etv_draft_hidden = hidden_states.detach().clone(
+                memory_format=torch.contiguous_format
+            )
+            self.last_e2etv_previous_token_ids = torch.stack(
+                previous_steps, dim=1
+            ).detach()
+            self.last_e2etv_global_positions = mask_positions.detach().clone(
+                memory_format=torch.contiguous_format
+            )
         return tokens.view(-1)
 
     def _cache_compact_draft_state(

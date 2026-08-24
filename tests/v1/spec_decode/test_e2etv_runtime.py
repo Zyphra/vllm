@@ -120,6 +120,37 @@ def test_recorder_requires_target_hidden() -> None:
         recorder.record(batch, draft_temperature=0.8, target_temperature=1.0)
 
 
+def test_recorder_preserves_per_request_temperatures() -> None:
+    recorder = _recorder(max_events=2)
+    batch, _ = _batch(
+        (_request(opaque="first"), _request(opaque="second"))
+    )
+    recorder.record(
+        batch,
+        draft_temperature=[0.7, 0.8],
+        target_temperature=[0.9, 1.0],
+    )
+    manifest = recorder.seal_group(group_id=GROUP, selection_epoch=7)
+    plan = plan_event_selection((manifest,), max_events=2)
+    selected = recorder.take_group(group_id=GROUP, plan=plan)
+    events = finalize_event_selection(plan, (selected,)).events
+    observed = {
+        event.request_id: (event.draft_temperature, event.target_temperature)
+        for event in events
+    }
+    assert observed == {
+        _request(opaque="first"): (0.7, 0.9),
+        _request(opaque="second"): (0.8, 1.0),
+    }
+
+    with pytest.raises(ValueError, match="one value per request"):
+        recorder.record(
+            batch,
+            draft_temperature=[0.8],
+            target_temperature=[1.0, 1.0],
+        )
+
+
 def test_policy_version_is_sampled_at_the_verifier_event_boundary():
     recorder = _recorder(version=4)
     first_batch, first_logits = _batch((_request(epoch=7, opaque="first"),))
@@ -185,6 +216,34 @@ def test_worker_extension_is_explicit_and_receipt_bound():
     }
     assert enabled == [True]
     assert worker.e2etv_set_installed_policy_version(7) == 7
+
+
+def test_worker_extension_supports_v2_model_runner_owner():
+    class FakeV2ModelRunner:
+        e2etv_runtime_recorder = None
+
+        def __init__(self):
+            self.enabled = False
+
+        def configure_e2etv_runtime(self, **kwargs):
+            self.e2etv_runtime_recorder = TiDARE2ETVRuntimeRecorder(**kwargs)
+
+        def enable_e2etv_event_inputs(self):
+            self.enabled = True
+
+    worker = TiDARE2ETVWorkerExtension()
+    worker.rank = 3
+    worker.model_runner = FakeV2ModelRunner()
+    receipt = worker.e2etv_configure_runtime(
+        partition_prefix="replica-4.server-2",
+        max_events_per_group=3,
+        seed=23,
+        max_open_groups=5,
+        installed_policy_version=8,
+    )
+    assert receipt["partition_id"] == "replica-4.server-2.rank-00003"
+    assert worker.model_runner.enabled
+    assert worker.e2etv_set_installed_policy_version(9) == 9
 
 
 def test_mixed_group_batch_keeps_windows_isolated():

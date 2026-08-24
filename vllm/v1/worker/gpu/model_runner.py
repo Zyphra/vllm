@@ -33,6 +33,14 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm.v1.spec_decode.e2etv_event_inputs import (
+    attach_target_hidden as attach_e2etv_target_hidden,
+    discard_event_state as discard_e2etv_event_state,
+    stash_event_state as stash_e2etv_event_state,
+    take_event_state as take_e2etv_event_state,
+    target_logits_indices_from_cu_num_logits,
+)
+from vllm.v1.spec_decode.e2etv_runtime import TiDARE2ETVRuntimeRecorder
 from vllm.v1.worker.gpu.async_utils import AsyncOutput
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -180,6 +188,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.do_spec_decode = False
             self.num_speculative_steps = 0
             self.speculator = None
+
+        # Exact TiDAR event capture is opt-in.  Keep only inert sentinels in
+        # ordinary inference; the request map and reservoir are allocated by
+        # the explicit runtime RPC.
+        self.e2etv_runtime_recorder: TiDARE2ETVRuntimeRecorder | None = None
+        self._e2etv_event_by_req_id: dict[str, Any] | None = None
 
         self.req_states = RequestState(
             max_num_reqs=self.max_num_reqs,
@@ -605,6 +619,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         preempted_req_ids = scheduler_output.preempted_req_ids
         if preempted_req_ids:
             finished_req_ids = finished_req_ids.union(preempted_req_ids)
+        if self._e2etv_event_inputs_enabled():
+            discard_e2etv_event_state(
+                self._require_e2etv_event_state(), finished_req_ids
+            )
         for req_id in finished_req_ids:
             req_idx = self.req_states.req_id_to_index.get(req_id)
             if req_idx is not None and self._tidar_cca_state_slots is not None:
@@ -942,6 +960,53 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             defer_logprobs=use_stochastic_tidar,
         )
 
+        if self._e2etv_event_inputs_enabled() and input_batch.num_draft_tokens > 0:
+            num_draft_tokens = tuple(
+                int(width - 1) for width in np.diff(input_batch.cu_num_logits_np)
+            )
+            event_batch = take_e2etv_event_state(
+                self._require_e2etv_event_state(),
+                input_batch.req_ids,
+                num_draft_tokens,
+            )
+            if event_batch is None:
+                raise RuntimeError(
+                    "E2E-TV capture is enabled but TiDAR verification had no "
+                    "request-aligned proposal state"
+                )
+            target_indices = target_logits_indices_from_cu_num_logits(
+                input_batch.cu_num_logits_np
+            ).to(sample_hidden_states.device)
+            event_batch = attach_e2etv_target_hidden(
+                event_batch,
+                sample_hidden_states=sample_hidden_states,
+                target_logits_indices=target_indices,
+            )
+            draft_req_indices = [
+                index for index, count in enumerate(num_draft_tokens) if count > 0
+            ]
+            draft_req_indices_gpu = torch.tensor(
+                draft_req_indices, dtype=torch.long, device=self.device
+            )
+            state_indices = input_batch.idx_mapping[
+                draft_req_indices_gpu
+            ].to(torch.long)
+            target_temperatures = (
+                self.sampler.sampling_states.temperature.gpu.index_select(
+                    0, state_indices
+                )
+                .to(torch.float32)
+                .cpu()
+                .tolist()
+            )
+            assert self.speculator is not None
+            assert self.e2etv_runtime_recorder is not None
+            self.e2etv_runtime_recorder.record(
+                event_batch,
+                draft_temperature=float(self.speculator.diff_temperature),
+                target_temperature=target_temperatures,
+            )
+
         if input_batch.num_draft_tokens == 0:
             # No draft tokens (common case).
             num_sampled = torch.ones(
@@ -1071,6 +1136,48 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _use_tidar(self) -> bool:
         return (self.speculative_config is not None
                 and self.speculative_config.use_tidar())
+
+    def configure_e2etv_runtime(
+        self,
+        *,
+        partition_id: str,
+        max_events_per_group: int,
+        seed: int,
+        max_open_groups: int,
+        installed_policy_version: int,
+    ) -> None:
+        if self.e2etv_runtime_recorder is not None:
+            raise RuntimeError("E2E-TV runtime was configured more than once")
+        if not self._use_tidar():
+            raise RuntimeError("E2E-TV runtime requires the V2 TiDAR speculator")
+        self.e2etv_runtime_recorder = TiDARE2ETVRuntimeRecorder(
+            partition_id=partition_id,
+            max_events_per_group=max_events_per_group,
+            seed=seed,
+            max_open_groups=max_open_groups,
+            installed_policy_version=installed_policy_version,
+        )
+
+    def _e2etv_event_inputs_enabled(self) -> bool:
+        return self._e2etv_event_by_req_id is not None
+
+    def enable_e2etv_event_inputs(self) -> None:
+        if self._e2etv_event_by_req_id is not None:
+            raise RuntimeError("E2E-TV event inputs were enabled more than once")
+        if self.e2etv_runtime_recorder is None:
+            raise RuntimeError("E2E-TV runtime recorder is not configured")
+        if self.speculator is None or not hasattr(
+            self.speculator, "e2etv_event_inputs_enabled"
+        ):
+            raise RuntimeError("E2E-TV runtime requires the V2 TiDAR speculator")
+        self._e2etv_event_by_req_id = {}
+        self.speculator.e2etv_event_inputs_enabled = True
+
+    def _require_e2etv_event_state(self) -> dict[str, Any]:
+        state = self._e2etv_event_by_req_id
+        if state is None:
+            raise RuntimeError("E2E-TV runtime state was not enabled")
+        return state
 
     def _tidar_step_draft_tokens(self, num_reqs: int, dummy_run: bool) -> int:
         if (dummy_run
@@ -1341,6 +1448,27 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 len(self.req_states.req_id_to_index) > input_batch.num_reqs
             ),
         )
+        if self._e2etv_event_inputs_enabled():
+            hidden = getattr(self.speculator, "last_e2etv_draft_hidden", None)
+            previous = getattr(
+                self.speculator, "last_e2etv_previous_token_ids", None
+            )
+            positions = getattr(
+                self.speculator, "last_e2etv_global_positions", None
+            )
+            if hidden is None or previous is None or positions is None:
+                raise RuntimeError(
+                    "E2E-TV capture is enabled but the V2 TiDAR speculator "
+                    "did not expose exact DSpARK head inputs"
+                )
+            stash_e2etv_event_state(
+                self._require_e2etv_event_state(),
+                input_batch.req_ids,
+                self.num_speculative_steps,
+                hidden,
+                previous,
+                positions,
+            )
         if draft_num_tokens_across_dp is not None:
             self._tidar_draft_coordinate_ran = True
         return draft_tokens
