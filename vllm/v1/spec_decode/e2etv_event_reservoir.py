@@ -1151,12 +1151,22 @@ def select_partition_payloads(
 
 
 def finalize_event_selection(
-    plan: TiDARE2ETVSelectionPlan,
-    partitions: Sequence[TiDARE2ETVSelectedPartition],
+    plan: TiDARE2ETVSelectionPlan | Mapping[str, object],
+    partitions: Sequence[
+        TiDARE2ETVSelectedPartition | Mapping[str, object]
+    ],
 ) -> TiDARE2ETVEventCarrier:
     """Verify second-phase replies and build the globally sampled carrier."""
 
-    plan.validate()
+    plan = selection_plan_from_wire(plan)
+    partitions = tuple(
+        selected_partition_from_wire(
+            partition,
+            seed=plan.seed,
+            selection_epoch=plan.selection_epoch,
+        )
+        for partition in partitions
+    )
     partitions = tuple(sorted(partitions, key=lambda item: item.partition_id))
     if [item.partition_id for item in partitions] != [
         item.partition_id for item in plan.manifests

@@ -339,19 +339,14 @@ def test_two_phase_selection_survives_rpc_dataclass_to_mapping_conversion() -> N
     plan = plan_event_selection(hydrated_manifests, max_events=3)
     hydrated_plan = selection_plan_from_wire(asdict(plan))
 
-    selected = tuple(
+    wire_selected = tuple(
+        asdict(partition)
+        for partition in (
         select_partition_payloads(carrier, manifest, hydrated_plan)
         for carrier, manifest in zip(carriers, manifests, strict=True)
-    )
-    hydrated_selected = tuple(
-        selected_partition_from_wire(
-            asdict(partition),
-            seed=hydrated_plan.seed,
-            selection_epoch=hydrated_plan.selection_epoch,
         )
-        for partition in selected
     )
-    result = finalize_event_selection(hydrated_plan, hydrated_selected)
+    result = finalize_event_selection(asdict(hydrated_plan), wire_selected)
     assert result.observed_event_population == 24
     assert [event.event_id for event in result.events] == [
         event.event_id for event in expected.events
